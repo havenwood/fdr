@@ -201,9 +201,7 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let fdr_module = ruby.define_module("Fdr")?;
 
-    fdr_module.define_singleton_method("search", function!(fdr_search, -1))?;
-    fdr_module.define_singleton_method("entries", function!(fdr_search, -1))?;
-    fdr_module.define_singleton_method("scan", function!(fdr_search, -1))?;
+    fdr_module.define_singleton_method("native_search", function!(fdr_search, -1))?;
 
     Ok(())
 }
