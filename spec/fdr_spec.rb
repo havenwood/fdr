@@ -15,6 +15,11 @@ describe Fdr do
     it 'responds to .scan alias' do
       assert Fdr.respond_to?(:scan), 'Fdr.scan method should exist'
     end
+
+    it 'keeps .native_search private' do
+      refute Fdr.respond_to?(:native_search), 'Fdr.native_search should be private'
+      assert_raises(NoMethodError) { Fdr.native_search }
+    end
   end
 
   describe '.search' do
