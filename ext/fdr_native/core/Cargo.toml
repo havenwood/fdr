@@ -1,0 +1,30 @@
+[package]
+name = "fdr-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core fd-style file search library for the fdr gem"
+license = "MIT"
+repository = "https://github.com/havenwood/fdr"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# For walking directories in parallel (same as fd uses)
+ignore = "0.4"
+
+# For regex support
+regex = "1.12"
+
+# For glob pattern support
+globset = "0.4"
+
+# For parallel result collection
+crossbeam-channel = "0.5"
+
+# For error handling
+anyhow = "1.0"
+
+[dev-dependencies]
+tempfile = "3.14"

@@ -1,0 +1,23 @@
+[package]
+name = "fdr-native"
+version = "0.1.0"
+edition = "2024"
+description = "Native Ruby extension for the Fdr gem that provides Ruby FFI bindings via Magnus"
+license = "MIT"
+repository = "https://github.com/havenwood/fdr"
+publish = false
+
+[package.metadata.cargo-machete]
+ignored = ["rb-sys"]
+
+[lints]
+workspace = true
+
+[lib]
+name = "fdr_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+fdr-core = { workspace = true }
+magnus = "0.8"
+rb-sys = { version = "0.9", features = ["stable-api-compiled-fallback"] }
