@@ -52,6 +52,26 @@ Fdr.search(
   paths: %w[logs]
 )
 
+Fdr.search(
+  pattern: 'thought.*snow|garret.*auction|foul.*thing',
+  paths: %w[~/garret ~/vault],
+  extension: 'txt',
+  type: 'f',
+  hidden: true,
+  no_ignore: true,
+  case_sensitive: false,
+  glob: false,
+  full_path: true,
+  max_depth: 7,
+  min_depth: 1,
+  exclude: %w[publication creator],
+  follow: true,
+  min_size: 1,
+  max_size: 1_048_576,
+  changed_within: 31_536_000,
+  changed_before: 604_800
+)
+
 # Aliases for `Fdr.search`, if you prefer:
 Fdr.entries(extension: 'rb')
 Fdr.scan(extension: 'rb')
