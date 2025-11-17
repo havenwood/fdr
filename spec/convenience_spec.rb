@@ -5,7 +5,7 @@ require_relative 'spec_helper'
 describe 'Fdr.search' do
   describe 'basic searches' do
     it 'finds files with pattern' do
-      results = Fdr.search(pattern: 'version', paths: ['lib'], max_depth: 2)
+      results = Fdr.search(pattern: /version/, paths: ['lib'], max_depth: 2)
 
       refute_empty results, 'should find files matching pattern'
       assert(results.any? { |p| p.include?('version') },
@@ -13,7 +13,7 @@ describe 'Fdr.search' do
     end
 
     it 'supports type filter' do
-      results = Fdr.search(pattern: 'lib', paths: ['.'], type: 'd', max_depth: 2)
+      results = Fdr.search(pattern: /lib/, paths: ['.'], type: 'd', max_depth: 2)
 
       refute_empty results, 'should find directories'
       assert(results.all? { |p| File.directory?(p) },
@@ -21,7 +21,7 @@ describe 'Fdr.search' do
     end
 
     it 'finds with single path' do
-      results = Fdr.search(pattern: 'fdr', paths: ['lib'])
+      results = Fdr.search(pattern: /fdr/, paths: ['lib'])
 
       refute_empty results, 'should find matches in single path'
       assert(results.all? { |p| p.start_with?('lib') },
@@ -29,7 +29,7 @@ describe 'Fdr.search' do
     end
 
     it 'finds with multiple paths' do
-      results = Fdr.search(pattern: 'spec', paths: %w[lib spec], max_depth: 2)
+      results = Fdr.search(pattern: /spec/, paths: %w[lib spec], max_depth: 2)
 
       assert(results.any? { |p| p.start_with?('spec') } ||
              results.any? { |p| p.include?('spec') },
@@ -63,7 +63,7 @@ describe 'Fdr.search' do
 
     it 'returns empty array for impossible filter combination' do
       results = Fdr.search(
-        pattern: 'nonexistent_file_xyz_123',
+        pattern: /nonexistent_file_xyz_123/,
         extension: 'xyz',
         paths: ['.']
       )
@@ -76,7 +76,7 @@ describe 'Fdr.search' do
   describe 'combining filters' do
     it 'combines pattern and extension filters' do
       results = Fdr.search(
-        pattern: 'lib',
+        pattern: /lib/,
         extension: 'rs',
         paths: ['ext'],
         type: 'f',
@@ -109,7 +109,7 @@ describe 'Fdr.search' do
 
     it 'combines pattern, extension and depth filters' do
       results = Fdr.search(
-        pattern: 'test',
+        pattern: /test/,
         extension: 'rb',
         paths: ['spec'],
         max_depth: 2,

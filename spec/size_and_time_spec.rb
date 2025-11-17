@@ -167,7 +167,7 @@ describe 'Size and time filtering' do
       it 'combines time filtering with pattern matching' do
         results = Fdr.search(
           paths: [@tmpdir],
-          pattern: 'recent',
+          pattern: /recent/,
           changed_within: 604_800,
           type: 'f'
         )

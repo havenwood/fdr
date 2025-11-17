@@ -43,7 +43,7 @@ describe Fdr do
     end
 
     it 'accepts pattern as keyword argument and uses it' do
-      with_pattern = Fdr.search(pattern: 'fdr', paths: ['lib'], max_depth: 1)
+      with_pattern = Fdr.search(pattern: /fdr/, paths: ['lib'], max_depth: 1)
       without_pattern = Fdr.search(paths: ['lib'], max_depth: 1)
 
       assert_operator with_pattern.size, '<=', without_pattern.size,
@@ -53,7 +53,7 @@ describe Fdr do
     end
 
     it 'accepts multiple paths and searches all of them' do
-      results = Fdr.search(pattern: 'spec', paths: %w[lib spec], max_depth: 2)
+      results = Fdr.search(pattern: /spec/, paths: %w[lib spec], max_depth: 2)
 
       refute_empty results, 'should find spec matches'
       assert(results.any? { |p| p.start_with?('spec') },
@@ -61,16 +61,15 @@ describe Fdr do
     end
 
     it 'accepts options with pattern and paths' do
-      results = Fdr.search(pattern: 'test', paths: ['.'], type: 'd', max_depth: 2)
+      results = Fdr.search(pattern: /test/, paths: ['.'], type: 'd', max_depth: 2)
 
       assert_kind_of Array, results
-      # Verify type filter is applied
       assert(results.none? { |p| File.file?(p) && !File.directory?(p) },
              'should only include directories with type: d')
     end
 
     it 'returns empty array when pattern matches nothing' do
-      results = Fdr.search(pattern: 'nonexistent_xyz_123_abc', paths: ['.'])
+      results = Fdr.search(pattern: /nonexistent_xyz_123_abc/, paths: ['.'])
 
       assert_kind_of Array, results
       assert_empty results, 'should return empty array for non-matching pattern'

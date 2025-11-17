@@ -64,7 +64,7 @@ describe 'Symlink behavior' do
     end
 
     it 'does not follow symlinked files' do
-      results = Fdr.search(paths: [@tmpdir], pattern: 'link_to_file', follow: false)
+      results = Fdr.search(paths: [@tmpdir], pattern: /link_to_file/, follow: false)
 
       refute_empty results
       assert(results.all? { |path| File.symlink?(path) })
@@ -82,7 +82,7 @@ describe 'Symlink behavior' do
     end
 
     it 'follows symlinks to files' do
-      results = Fdr.search(paths: [@tmpdir], pattern: 'real_file', follow: true)
+      results = Fdr.search(paths: [@tmpdir], pattern: /real_file/, follow: true)
 
       refute_empty results
     end
@@ -103,7 +103,7 @@ describe 'Symlink behavior' do
     end
 
     it 'finds directory symlinks' do
-      results = Fdr.search(paths: [@tmpdir], type: 'l', pattern: 'link_to_dir', max_depth: 1)
+      results = Fdr.search(paths: [@tmpdir], type: 'l', pattern: /link_to_dir/, max_depth: 1)
 
       refute_empty results
       assert(results.any? do |path|
@@ -114,7 +114,7 @@ describe 'Symlink behavior' do
     end
 
     it 'finds file symlinks' do
-      results = Fdr.search(paths: [@tmpdir], type: 'l', pattern: 'link_to_file', max_depth: 1)
+      results = Fdr.search(paths: [@tmpdir], type: 'l', pattern: /link_to_file/, max_depth: 1)
 
       refute_empty results
       assert(results.all? { |path| File.symlink?(path) })
@@ -158,7 +158,7 @@ describe 'Symlink behavior' do
 
   describe 'pattern matching on symlinks' do
     it 'matches pattern on symlink names' do
-      results = Fdr.search(paths: [@tmpdir], pattern: 'link_to', max_depth: 1)
+      results = Fdr.search(paths: [@tmpdir], pattern: /link_to/, max_depth: 1)
 
       assert results.size >= 2, "should find at least 2 symlinks matching 'link_to'"
       assert(results.any? { |path| path.include?('link_to_dir') })

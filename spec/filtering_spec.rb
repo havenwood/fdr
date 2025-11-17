@@ -83,7 +83,7 @@ describe 'Fdr filtering' do
     end
 
     it 'finds dotfiles with hidden option' do
-      results = Fdr.search(pattern: 'gitignore', paths: ['.'], hidden: true, max_depth: 1)
+      results = Fdr.search(pattern: /gitignore/, paths: ['.'], hidden: true, max_depth: 1)
       assert(results.any? { |result| result.include?('.gitignore') })
     end
   end

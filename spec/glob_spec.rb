@@ -3,12 +3,11 @@
 require_relative 'spec_helper'
 
 describe 'Fdr glob patterns' do
-  describe 'glob option' do
-    it 'supports glob patterns when glob option is enabled' do
+  describe 'string patterns as glob patterns' do
+    it 'supports glob patterns with string patterns' do
       results = Fdr.search(
         pattern: '*.rb',
         paths: ['lib'],
-        glob: true,
         max_depth: 1
       )
       assert_kind_of Array, results
@@ -21,7 +20,6 @@ describe 'Fdr glob patterns' do
       results = Fdr.search(
         pattern: 'Cargo.*',
         paths: ['ext'],
-        glob: true,
         max_depth: 2
       )
       assert(results.any? { |result| result.include?('Cargo.toml') },
@@ -34,7 +32,6 @@ describe 'Fdr glob patterns' do
       results = Fdr.search(
         pattern: 'fdr.rb',
         paths: ['lib'],
-        glob: true,
         max_depth: 1
       )
       assert(results.any? { |result| result.include?('fdr.rb') },
@@ -45,7 +42,6 @@ describe 'Fdr glob patterns' do
       results = Fdr.search(
         pattern: '*.[rt][bs]',
         paths: ['ext'],
-        glob: true,
         max_depth: 2
       )
       assert(results.all? { |result| result.match?(/\.[rt][bs]$/) },
@@ -54,22 +50,20 @@ describe 'Fdr glob patterns' do
   end
 
   describe 'glob vs regex' do
-    it 'treats pattern as regex by default (not glob)' do
+    it 'treats Regexp objects as regex patterns' do
       regex_results = Fdr.search(
-        pattern: '.*\.rb$',
+        pattern: /.*\.rb$/,
         paths: ['lib'],
-        glob: false,
         max_depth: 1
       )
       assert(regex_results.all? { |result| result.end_with?('.rb') },
              'regex pattern should match .rb files')
     end
 
-    it 'treats pattern as glob when glob option is true' do
+    it 'treats strings as glob patterns' do
       glob_results = Fdr.search(
         pattern: '*.toml',
         paths: ['ext'],
-        glob: true,
         max_depth: 3
       )
       refute_empty glob_results, 'should find .toml files with glob'
@@ -82,7 +76,6 @@ describe 'Fdr glob patterns' do
       glob_star = Fdr.search(
         pattern: 'fdr*.rb',
         paths: ['lib'],
-        glob: true,
         max_depth: 1
       )
       assert(glob_star.any? { |p| p.include?('fdr') },
@@ -94,8 +87,7 @@ describe 'Fdr glob patterns' do
     it 'supports nested wildcards with **' do
       results = Fdr.search(
         pattern: '**/Cargo.toml',
-        paths: ['ext'],
-        glob: true
+        paths: ['ext']
       )
       assert(results.any? { |result| result.include?('Cargo.toml') },
              'should find Cargo.toml with **/ pattern')
@@ -107,7 +99,6 @@ describe 'Fdr glob patterns' do
       results = Fdr.search(
         pattern: '*.{toml,lock}',
         paths: ['ext'],
-        glob: true,
         max_depth: 2
       )
       assert(results.all? do |result|
@@ -118,8 +109,7 @@ describe 'Fdr glob patterns' do
     it 'finds files matching nested glob patterns' do
       results = Fdr.search(
         pattern: '**/Cargo.toml',
-        paths: ['ext'],
-        glob: true
+        paths: ['ext']
       )
       assert(results.any? { |result| result.include?('Cargo.toml') },
              'should find nested Cargo.toml files')
@@ -133,7 +123,6 @@ describe 'Fdr glob patterns' do
       results = Fdr.search(
         pattern: '**/fdr_native*',
         paths: ['.'],
-        glob: true,
         full_path: true
       )
       assert(results.any? { |result| result.include?('fdr_native') },
@@ -144,7 +133,6 @@ describe 'Fdr glob patterns' do
       results = Fdr.search(
         pattern: '**/Cargo.toml',
         paths: ['.'],
-        glob: true,
         full_path: true
       )
       assert(results.any? { |p| p.include?('Cargo.toml') },

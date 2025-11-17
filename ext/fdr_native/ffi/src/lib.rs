@@ -17,12 +17,11 @@ fn extract_optional_arg<T: TryConvert>(ruby: &Ruby, hash: RHash, key: &str) -> O
 }
 
 struct SearchParams {
-    pattern: Option<String>,
+    pattern: Option<Value>,
     paths: Option<RArray>,
     hidden: Option<bool>,
     no_ignore: Option<bool>,
     case_sensitive: Option<bool>,
-    glob: Option<bool>,
     full_path: Option<bool>,
     follow: Option<bool>,
     max_depth: Option<i64>,
@@ -43,7 +42,6 @@ fn extract_search_params(ruby: &Ruby, kwargs: RHash) -> SearchParams {
         hidden: extract_optional_arg(ruby, kwargs, "hidden"),
         no_ignore: extract_optional_arg(ruby, kwargs, "no_ignore"),
         case_sensitive: extract_optional_arg(ruby, kwargs, "case_sensitive"),
-        glob: extract_optional_arg(ruby, kwargs, "glob"),
         full_path: extract_optional_arg(ruby, kwargs, "full_path"),
         follow: extract_optional_arg(ruby, kwargs, "follow"),
         max_depth: extract_optional_arg(ruby, kwargs, "max_depth"),
@@ -61,8 +59,23 @@ fn extract_search_params(ruby: &Ruby, kwargs: RHash) -> SearchParams {
 fn build_search_config(ruby: &Ruby, params: SearchParams) -> Result<SearchConfig, Error> {
     let mut config = SearchConfig::default();
 
-    if let Some(pattern) = params.pattern {
-        config.pattern = Some(pattern);
+    if let Some(pattern_val) = params.pattern {
+        // Detect if pattern is a Regexp or String
+        let regexp_class = ruby.class_regexp();
+        let is_regexp = pattern_val.is_kind_of(regexp_class);
+
+        if is_regexp {
+            // Extract source from Regexp object
+            let pattern_str = pattern_val
+                .funcall::<_, _, String>("source", ())?;
+            config.pattern = Some(pattern_str);
+            config.glob = false;
+        } else {
+            // Treat as String (glob pattern)
+            let pattern_str: String = TryConvert::try_convert(pattern_val)?;
+            config.pattern = Some(pattern_str);
+            config.glob = true;
+        }
     }
 
     if let Some(paths_array) = params.paths {
@@ -82,9 +95,6 @@ fn build_search_config(ruby: &Ruby, params: SearchParams) -> Result<SearchConfig
     }
     if let Some(case_sensitive) = params.case_sensitive {
         config.case_sensitive = case_sensitive;
-    }
-    if let Some(glob) = params.glob {
-        config.glob = glob;
     }
     if let Some(full_path) = params.full_path {
         config.full_path = full_path;

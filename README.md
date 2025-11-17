@@ -16,19 +16,21 @@ gem install fdr
 
 ## Usage
 
+### Basic Examples
+
 ```ruby
 require 'fdr'
 
 Fdr.search(extension: 'rb')
 
 Fdr.search(
-  pattern: 'test',
+  pattern: /test/,
   paths: %w[lib spec],
   type: 'f'
 )
 
 Fdr.search(
-  pattern: 'config',
+  pattern: '*.yml',
   paths: %w[app config],
   extension: 'yml',
   type: 'f',
@@ -37,13 +39,13 @@ Fdr.search(
 )
 
 Fdr.search(
-  pattern: '\.test\.js$',
+  pattern: /\.test\.js$/,
   paths: %w[src test],
   exclude: %w[node_modules vendor],
   case_sensitive: true
 )
 
-Fdr.search(pattern: '**/*.{rb,rake}', glob: true)
+Fdr.search(pattern: '**/*.{rb,rake}')
 
 Fdr.search(
   extension: 'log',
@@ -53,14 +55,13 @@ Fdr.search(
 )
 
 Fdr.search(
-  pattern: 'thought.*snow|garret.*auction|foul.*thing',
+  pattern: /thought.*snow|garret.*auction|foul.*thing/,
   paths: %w[~/garret ~/vault],
   extension: 'txt',
   type: 'f',
   hidden: true,
   no_ignore: true,
-  case_sensitive: false,
-  glob: false,
+  case_sensitive: true,
   full_path: true,
   max_depth: 7,
   min_depth: 1,
@@ -72,10 +73,24 @@ Fdr.search(
   changed_before: 604_800
 )
 
-# Aliases for `Fdr.search`, if you prefer:
+# Aliases for `Fdr.search`
 Fdr.entries(extension: 'rb')
-Fdr.scan(extension: 'rb')
+Fdr.scan(pattern: /spec\.rb$/)
 ```
+
+### Pattern Behavior
+
+The `pattern` parameter determines search type based on its class:
+
+- Regexp patterns
+  - `Fdr.search(pattern: /\.rb$/)`
+  - `Fdr.search(pattern: /test.*\.txt/)`
+
+- String globs
+  - `Fdr.search(pattern: '*.rb')`
+  - `Fdr.search(pattern: '**/*.{yml,yaml}')`
+
+**Note**: Regexp patterns must be compatible with Rust's `regex` crate (same as `fd`). Inline flags like `/i` are lost—use the `case_sensitive` parameter instead. Some Ruby regex features (variable-length lookbehind, Oniguruma-specific syntax) aren't supported.
 
 ### Gaps
 
