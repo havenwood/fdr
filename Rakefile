@@ -3,21 +3,15 @@
 require "bundler/gem_tasks"
 require "fileutils"
 require "minitest/test_task"
+require "tmpdir"
+require_relative "rakelib/native_packaging"
+
 require "standard/rake"
 
+GEMSPEC = Gem::Specification.load("fdr.gemspec") || abort("Could not load fdr.gemspec")
+NativePackaging.configure(GEMSPEC)
+
 task default: :check
-
-desc "Compile native extension"
-task :compile do
-  Dir.chdir("ext/fdr_native") do
-    ruby "extconf.rb"
-    sh "make"
-
-    FileUtils.mkdir_p "../../lib/fdr"
-    ext = RUBY_PLATFORM.include?("darwin") ? "bundle" : "so"
-    FileUtils.cp "fdr_native.#{ext}", "../../lib/fdr/fdr_native.#{ext}"
-  end
-end
 
 Minitest::TestTask.create do |test|
   test.framework = %(require_relative "./spec/spec_helper.rb")
@@ -46,14 +40,14 @@ namespace :rust do
   desc "Run Rust tests"
   task :test do
     Dir.chdir("ext/fdr_native") do
-      sh "cargo test --all-targets --all-features"
+      sh "cargo test --locked --all-targets --all-features"
     end
   end
 
   desc "Lint Rust code with clippy"
   task :lint do
     Dir.chdir("ext/fdr_native") do
-      sh "cargo clippy --all-targets --all-features -- -D warnings"
+      sh "cargo clippy --locked --all-targets --all-features -- -D warnings"
     end
   end
 
@@ -73,3 +67,35 @@ task check: %i[rust:format rust:lint rust:test test standard]
 
 desc "Build gem after compiling extension"
 task build: :compile
+
+desc "Build, install, and smoke-test the packaged gem"
+task "gem:verify" => :build do
+  gemspec = Gem::Specification.load("fdr.gemspec")
+  gem_path = File.expand_path("pkg/#{gemspec.file_name}", __dir__)
+  NativePackaging.verify_source!(gem_path)
+
+  Dir.mktmpdir("fdr-gem-verify") do |directory|
+    gem_home = File.join(directory, "gem-home")
+    smoke_test = <<~'RUBY'
+      gem_home, expected_version = ARGV
+      Gem.use_paths(gem_home)
+      require 'fdr'
+
+      raise "Expected Fdr #{expected_version}, got #{Fdr::VERSION}" unless Fdr::VERSION == expected_version
+      raise 'Fdr.search returned no Ruby files' if Fdr.search(paths: [gem_home], extension: 'rb').empty?
+
+      puts "Verified installed Fdr #{Fdr::VERSION}"
+    RUBY
+
+    Bundler.with_unbundled_env do
+      sh Gem.ruby, "-S", "gem", "install", gem_path, "--install-dir", gem_home, "--no-document"
+
+      Dir.chdir(directory) do
+        sh Gem.ruby, "-e", smoke_test, gem_home, gemspec.version.to_s
+      end
+    end
+  end
+end
+
+desc "Verify the packaged gem before pushing the release source"
+task "release:source_control_push" => "gem:verify"

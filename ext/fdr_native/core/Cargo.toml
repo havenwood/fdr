@@ -2,6 +2,7 @@
 name = "fdr-core"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Core fd-style file search library for the fdr gem"
 license = "MIT"
 repository = "https://github.com/havenwood/fdr"
