@@ -1,6 +1,6 @@
 # Fdr
 
-`Fdr` is a fast file search gem for Ruby, implemented with a Rust native extension inspired directly by [fd](https://github.com/sharkdp/fd). `Fdr` uses core crates from `fd` and `ripgrep`, including [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore), [regex](https://github.com/rust-lang/regex), [globset](https://github.com/BurntSushi/ripgrep/tree/master/crates/globset), [grep-searcher](https://github.com/BurntSushi/ripgrep/tree/master/crates/searcher) and [crossbeam-channel](https://github.com/crossbeam-rs/crossbeam).
+`Fdr` is a fast file search gem for Ruby, implemented with a Rust native extension based on [fd](https://github.com/sharkdp/fd). Its Rust dependencies include ripgrep's [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore), [globset](https://github.com/BurntSushi/ripgrep/tree/master/crates/globset), [grep-regex](https://github.com/BurntSushi/ripgrep/tree/master/crates/regex) and [grep-searcher](https://github.com/BurntSushi/ripgrep/tree/master/crates/searcher) crates, plus [regex](https://github.com/rust-lang/regex) and [crossbeam-channel](https://github.com/crossbeam-rs/crossbeam).
 
 `Fdr` intentionally lacks an `fdr` executable, since `fd` is perfect for that job. If you need fast file searching in a CLI, use `fd`. If you need it from your Ruby code, use `Fdr`.
 
@@ -117,3 +117,7 @@ Search is case-sensitive by default and works one line at a time, so patterns ca
 ### Gaps
 
 Some non-CLI `fd` features `Fdr` lacks: owner filters, nonfile types, smart case switching and `.fdignore` support.
+
+## Attribution
+
+`Fdr` directly borrows code from `fd`, under an MIT license.
