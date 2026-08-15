@@ -26,6 +26,32 @@ pub struct SearchConfig {
     pub changed_before: Option<i64>,
 }
 
+#[derive(Debug)]
+pub struct GrepConfig {
+    pub pattern: String,
+    /// File filters, with `SearchConfig::pattern` matching names.
+    pub search: SearchConfig,
+}
+
+impl Default for GrepConfig {
+    fn default() -> Self {
+        Self {
+            pattern: String::new(),
+            search: SearchConfig {
+                case_sensitive: true,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct GrepResult {
+    pub path: String,
+    /// Matching lines as `(one-based number, text without its terminator)`.
+    pub lines: Vec<(u64, Vec<u8>)>,
+}
+
 fn build_pattern_regex(config: &SearchConfig) -> Result<Option<regex::bytes::Regex>> {
     use regex::bytes::RegexBuilder;
 
@@ -59,6 +85,78 @@ fn build_extension_regex(config: &SearchConfig) -> Result<Option<regex::bytes::R
     }
 }
 
+struct EntryFilters {
+    pattern: Option<regex::bytes::Regex>,
+    extension: Option<regex::bytes::Regex>,
+    file_type: Option<String>,
+    full_path: bool,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    changed_within: Option<i64>,
+    changed_before: Option<i64>,
+}
+
+impl EntryFilters {
+    fn new(config: &SearchConfig) -> Result<Self> {
+        Ok(Self {
+            pattern: build_pattern_regex(config)?,
+            extension: build_extension_regex(config)?,
+            file_type: config.file_type.clone(),
+            full_path: config.full_path,
+            min_size: config.min_size,
+            max_size: config.max_size,
+            changed_within: config.changed_within,
+            changed_before: config.changed_before,
+        })
+    }
+
+    fn matches(&self, entry: &ignore::DirEntry) -> bool {
+        let path = entry.path();
+        let search_str = if self.full_path {
+            path.to_string_lossy()
+        } else {
+            path.file_name().unwrap_or_default().to_string_lossy()
+        };
+
+        if let Some(regex) = self.pattern.as_ref()
+            && !regex.is_match(search_str.as_bytes())
+        {
+            return false;
+        }
+
+        if let Some(ext_regex) = self.extension.as_ref()
+            && !ext_regex.is_match(search_str.as_bytes())
+        {
+            return false;
+        }
+
+        if let Some(ref file_type) = self.file_type
+            && !matches_file_type(entry, file_type)
+        {
+            return false;
+        }
+
+        matches_metadata_filters(
+            entry,
+            self.min_size,
+            self.max_size,
+            self.changed_within,
+            self.changed_before,
+        )
+    }
+}
+
+fn matches_file_type(entry: &ignore::DirEntry, file_type: &str) -> bool {
+    let entry_file_type = entry.file_type();
+
+    match file_type {
+        "f" | "file" => entry_file_type.is_some_and(|t| t.is_file()),
+        "d" | "dir" | "directory" => entry_file_type.is_some_and(|t| t.is_dir()),
+        "l" | "symlink" => entry_file_type.is_some_and(|t| t.is_symlink()),
+        _ => true,
+    }
+}
+
 fn configure_walker(builder: &mut ignore::WalkBuilder, config: &SearchConfig) -> Result<()> {
     builder
         .hidden(!config.hidden)
@@ -77,6 +175,29 @@ fn configure_walker(builder: &mut ignore::WalkBuilder, config: &SearchConfig) ->
     }
 
     Ok(())
+}
+
+fn build_walker(config: &SearchConfig) -> Result<ignore::WalkBuilder> {
+    use ignore::WalkBuilder;
+
+    let search_paths: Vec<PathBuf> = if config.paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        config.paths.clone()
+    };
+
+    let (first_path, rest) = search_paths
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("No paths to search"))?;
+    let mut builder = WalkBuilder::new(first_path);
+
+    for path in rest {
+        builder.add(path);
+    }
+
+    configure_walker(&mut builder, config)?;
+
+    Ok(builder)
 }
 
 /// Batch size for result collection (same as fd's default).
@@ -176,37 +297,11 @@ fn matches_metadata_filters(
 
 pub fn search(config: &SearchConfig) -> Result<Vec<String>> {
     use crossbeam_channel::unbounded;
-    use ignore::{WalkBuilder, WalkState};
+    use ignore::WalkState;
     use std::sync::Arc;
 
-    let pattern = build_pattern_regex(config)?;
-    let extension = build_extension_regex(config)?;
-
-    let search_paths: Vec<PathBuf> = if config.paths.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        config.paths.clone()
-    };
-
-    let (first_path, rest) = search_paths
-        .split_first()
-        .ok_or_else(|| anyhow::anyhow!("No paths to search"))?;
-    let mut builder = WalkBuilder::new(first_path);
-
-    for path in rest {
-        builder.add(path);
-    }
-
-    configure_walker(&mut builder, config)?;
-
-    let pattern = Arc::new(pattern);
-    let extension = Arc::new(extension);
-    let full_path = config.full_path;
-    let file_type = Arc::new(config.file_type.clone());
-    let min_size = config.min_size;
-    let max_size = config.max_size;
-    let changed_within = config.changed_within;
-    let changed_before = config.changed_before;
+    let filters = Arc::new(EntryFilters::new(config)?);
+    let builder = build_walker(config)?;
 
     let (tx, rx) = unbounded();
 
@@ -214,9 +309,7 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>> {
 
     walker.run(|| {
         let tx = tx.clone();
-        let pattern = Arc::clone(&pattern);
-        let extension = Arc::clone(&extension);
-        let file_type = Arc::clone(&file_type);
+        let filters = Arc::clone(&filters);
 
         let mut batch = ResultBatch::new(tx);
 
@@ -229,46 +322,11 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>> {
                 return WalkState::Continue;
             }
 
-            let path = entry.path();
-
-            let search_str = if full_path {
-                path.to_string_lossy()
-            } else {
-                path.file_name().unwrap_or_default().to_string_lossy()
-            };
-
-            if let Some(regex) = pattern.as_ref()
-                && !regex.is_match(search_str.as_bytes())
-            {
+            if !filters.matches(&entry) {
                 return WalkState::Continue;
             }
 
-            if let Some(ext_regex) = extension.as_ref()
-                && !ext_regex.is_match(search_str.as_bytes())
-            {
-                return WalkState::Continue;
-            }
-
-            if let Some(ref ft) = *file_type {
-                let entry_file_type = entry.file_type();
-                let matches = match ft.as_str() {
-                    "f" | "file" => entry_file_type.is_some_and(|t| t.is_file()),
-                    "d" | "dir" | "directory" => entry_file_type.is_some_and(|t| t.is_dir()),
-                    "l" | "symlink" => entry_file_type.is_some_and(|t| t.is_symlink()),
-                    _ => true,
-                };
-
-                if !matches {
-                    return WalkState::Continue;
-                }
-            }
-
-            if !matches_metadata_filters(&entry, min_size, max_size, changed_within, changed_before)
-            {
-                return WalkState::Continue;
-            }
-
-            if let Some(path_str) = path.to_str() {
+            if let Some(path_str) = entry.path().to_str() {
                 batch.push(path_str.to_string());
             }
 
@@ -284,6 +342,123 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>> {
     for batch in batches {
         results.extend(batch);
     }
+
+    Ok(results)
+}
+
+struct LineCollector {
+    lines: Vec<(u64, Vec<u8>)>,
+    binary: bool,
+}
+
+impl grep_searcher::Sink for LineCollector {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        matched: &grep_searcher::SinkMatch<'_>,
+    ) -> std::io::Result<bool> {
+        if let Some(line_number) = matched.line_number() {
+            let text = matched.bytes();
+            // Only a CR that precedes the LF is a terminator; a trailing CR on
+            // an unterminated final line is content.
+            let text = text
+                .strip_suffix(b"\n")
+                .map_or(text, |line| line.strip_suffix(b"\r").unwrap_or(line));
+            self.lines.push((line_number, text.to_vec()));
+        }
+        Ok(true)
+    }
+
+    fn binary_data(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        _binary_byte_offset: u64,
+    ) -> std::io::Result<bool> {
+        self.binary = true;
+        Ok(false)
+    }
+}
+
+pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>> {
+    use crossbeam_channel::unbounded;
+    use grep_matcher::LineTerminator;
+    use grep_regex::RegexMatcherBuilder;
+    use grep_searcher::{BinaryDetection, SearcherBuilder};
+    use ignore::WalkState;
+    use std::sync::Arc;
+
+    let mut matcher_builder = RegexMatcherBuilder::new();
+    matcher_builder
+        .case_insensitive(!config.search.case_sensitive)
+        .unicode(true)
+        .octal(false)
+        .multi_line(true)
+        .dot_matches_new_line(false)
+        .crlf(true);
+    let matcher = Arc::new(matcher_builder.build(&config.pattern)?);
+    let filters = Arc::new(EntryFilters::new(&config.search)?);
+    let builder = build_walker(&config.search)?;
+
+    let (tx, rx) = unbounded();
+    let walker = builder.build_parallel();
+
+    walker.run(|| {
+        let matcher = Arc::clone(&matcher);
+        let filters = Arc::clone(&filters);
+        let tx = tx.clone();
+        let mut searcher = SearcherBuilder::new()
+            .line_number(true)
+            .line_terminator(LineTerminator::crlf())
+            .binary_detection(BinaryDetection::quit(b'\0'))
+            // Keep the file's own bytes: sniffing strips a BOM and transcodes UTF-16.
+            .bom_sniffing(false)
+            .build();
+
+        Box::new(move |entry| {
+            let Ok(entry) = entry else {
+                return WalkState::Continue;
+            };
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
+                return WalkState::Continue;
+            }
+
+            if !filters.matches(&entry) {
+                return WalkState::Continue;
+            }
+
+            let path = entry.path();
+            let Some(path_str) = path.to_str() else {
+                return WalkState::Continue;
+            };
+            let mut collector = LineCollector {
+                lines: Vec::new(),
+                binary: false,
+            };
+
+            if searcher
+                .search_path(matcher.as_ref(), path, &mut collector)
+                .is_ok()
+                && !collector.binary
+                && !collector.lines.is_empty()
+            {
+                drop(tx.send(GrepResult {
+                    path: path_str.to_string(),
+                    lines: collector.lines,
+                }));
+            }
+
+            WalkState::Continue
+        })
+    });
+
+    drop(tx);
+    let mut results: Vec<GrepResult> = rx.iter().collect();
+    results.sort_unstable_by(|a, b| a.path.cmp(&b.path));
 
     Ok(results)
 }

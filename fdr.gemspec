@@ -9,8 +9,8 @@ Gem::Specification.new do |spec|
   spec.version = Fdr::VERSION
   spec.authors = ["Shannon Skipper"]
   spec.email = %w[shannonskipper@gmail.com]
-  spec.description = "Fdr is a fast fd-inspired file search library for Ruby with Rust native extensions."
-  spec.summary = "Fast fd-like file search from Ruby"
+  spec.description = "Fast `fd`-style file search and `rg`-style content search for Ruby."
+  spec.summary = "Fast file and content search for Ruby"
   spec.homepage = "https://github.com/havenwood/fdr"
   spec.licenses = %w[MIT]
   spec.required_ruby_version = ">= 3.2"

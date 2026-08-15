@@ -8,6 +8,10 @@ describe Fdr do
       assert Fdr.respond_to?(:search), "Fdr.search method should exist"
     end
 
+    it "responds to .grep" do
+      assert Fdr.respond_to?(:grep), "Fdr.grep method should exist"
+    end
+
     it "responds to .entries alias" do
       assert Fdr.respond_to?(:entries), "Fdr.entries method should exist"
     end
@@ -19,6 +23,11 @@ describe Fdr do
     it "keeps .native_search private" do
       refute Fdr.respond_to?(:native_search), "Fdr.native_search should be private"
       assert_raises(NoMethodError) { Fdr.native_search }
+    end
+
+    it "keeps .native_grep private" do
+      refute Fdr.respond_to?(:native_grep), "Fdr.native_grep should be private"
+      assert_raises(NoMethodError) { Fdr.native_grep }
     end
   end
 

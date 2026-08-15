@@ -6,8 +6,13 @@
 
 ## Installation
 
+`Fdr` isn't published to RubyGems yet, so install it from a checkout. Have Rust on hand, since the native extension is compiled during install.
+
 ```bash
-gem install fdr
+git clone --depth=1 https://github.com/havenwood/fdr.git
+cd fdr
+bundle install
+bundle exec rake install
 ```
 
 ### Requirements
@@ -72,10 +77,37 @@ Fdr.search(
   changed_before: 604_800
 )
 
-# Aliases for `Fdr.search`, if you prefer:
+# Aliases for `Fdr.search`:
 Fdr.entries(extension: 'rb')
 Fdr.scan(extension: 'rb')
 ```
+
+### Grep
+
+`Fdr.grep` returns a path-sorted `Hash` whose values map one-based line numbers to matching text. A line appears once regardless of how many times it matches.
+
+```ruby
+Fdr.grep(pattern: 'module Fdr', paths: %w[lib])
+#=> {"lib/fdr.rb" => {13 => "module Fdr"}, "lib/fdr/version.rb" => {3 => "module Fdr"}}
+
+Fdr.grep(pattern: 'TODO').keys                     # files that match
+Fdr.grep(pattern: 'TODO').transform_values(&:size) # match counts per file
+```
+
+`pattern` searches file contents. Use `name` and the usual `Fdr.search` options to narrow down the files.
+
+```ruby
+Fdr.grep(
+  pattern: 'TODO',
+  name: '_spec\.rb$',
+  paths: %w[spec],
+  extension: 'rb',
+  max_depth: 3,
+  hidden: true
+)
+```
+
+Search is case-sensitive by default and works one line at a time, so patterns can't span lines. Binary files are skipped.
 
 ### Gaps
 

@@ -1,9 +1,9 @@
 //! Ruby FFI bindings for the fdr-core search library.
 #![allow(unsafe_code, reason = "FFI requires unsafe for Ruby interop")]
 
-use fdr_core::{SearchConfig, search};
+use fdr_core::{GrepConfig, SearchConfig, grep, search};
 use magnus::scan_args::scan_args;
-use magnus::{Error, RArray, RHash, Ruby, TryConvert, Value, function, prelude::*};
+use magnus::{Error, RArray, RHash, RString, Ruby, TryConvert, Value, function, prelude::*};
 use std::path::PathBuf;
 
 fn extract_optional_arg<T: TryConvert>(ruby: &Ruby, hash: RHash, key: &str) -> Option<T> {
@@ -172,14 +172,24 @@ fn build_search_config(ruby: &Ruby, params: SearchParams) -> Result<SearchConfig
     Ok(config)
 }
 
+fn depth_range_is_empty(config: &SearchConfig) -> bool {
+    matches!((config.min_depth, config.max_depth), (Some(min), Some(max)) if min > max)
+}
+
+/// Raw line bytes tagged with the external encoding, as `File.readlines` does.
+fn line_string(ruby: &Ruby, line: &[u8]) -> Result<RString, Error> {
+    let string = ruby.str_from_slice(line);
+    string.enc_associate(ruby.default_external_encoding())?;
+
+    Ok(string)
+}
+
 fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
     let params = extract_search_params(ruby, args_scan.keywords);
     let config = build_search_config(ruby, params)?;
 
-    if let (Some(min), Some(max)) = (config.min_depth, config.max_depth)
-        && min > max
-    {
+    if depth_range_is_empty(&config) {
         return Ok(ruby.ary_new());
     }
 
@@ -197,11 +207,47 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
     Ok(ruby_array)
 }
 
+fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
+    let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
+    let kwargs = args_scan.keywords;
+    let pattern: String = extract_optional_arg(ruby, kwargs, "pattern")
+        .ok_or_else(|| Error::new(ruby.exception_arg_error(), "missing keyword: pattern"))?;
+    let mut params = extract_search_params(ruby, kwargs);
+    params.pattern = extract_optional_arg(ruby, kwargs, "name");
+    let search = build_search_config(ruby, params)?;
+
+    if depth_range_is_empty(&search) {
+        return Ok(ruby.hash_new());
+    }
+
+    let config = GrepConfig { pattern, search };
+    let results = grep(&config).map_err(|err| {
+        Error::new(
+            ruby.exception_runtime_error(),
+            format!("Grep failed: {err}"),
+        )
+    })?;
+    let ruby_results = ruby.hash_new_capa(results.len());
+
+    for result in results {
+        let lines = ruby.hash_new_capa(result.lines.len());
+
+        for (number, text) in &result.lines {
+            lines.aset(*number, line_string(ruby, text)?)?;
+        }
+
+        ruby_results.aset(ruby.str_new(&result.path), lines)?;
+    }
+
+    Ok(ruby_results)
+}
+
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let fdr_module = ruby.define_module("Fdr")?;
 
     fdr_module.define_singleton_method("native_search", function!(fdr_search, -1))?;
+    fdr_module.define_singleton_method("native_grep", function!(fdr_grep, -1))?;
 
     Ok(())
 }
