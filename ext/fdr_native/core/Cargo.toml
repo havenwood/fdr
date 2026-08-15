@@ -16,6 +16,8 @@ ignore = "0.4"
 
 # For regex support
 regex = "1.12"
+grep-regex = "0.1"
+grep-searcher = "0.1"
 
 # For glob pattern support
 globset = "0.4"

@@ -46,9 +46,51 @@ module Fdr
       )
     end
 
+    def grep(
+      pattern:,
+      name: nil,
+      paths: ["."],
+      hidden: false,
+      no_ignore: false,
+      case_sensitive: true,
+      glob: false,
+      full_path: false,
+      follow: false,
+      max_depth: nil,
+      min_depth: nil,
+      type: nil,
+      extension: nil,
+      exclude: [],
+      min_size: nil,
+      max_size: nil,
+      changed_within: nil,
+      changed_before: nil
+    )
+      native_grep(
+        pattern:,
+        name:,
+        paths:,
+        hidden:,
+        no_ignore:,
+        case_sensitive:,
+        glob:,
+        full_path:,
+        follow:,
+        max_depth:,
+        min_depth:,
+        type:,
+        extension:,
+        exclude:,
+        min_size:,
+        max_size:,
+        changed_within:,
+        changed_before:
+      )
+    end
+
     alias_method :entries, :search
     alias_method :scan, :search
 
-    private :native_search
+    private :native_search, :native_grep
   end
 end
