@@ -3,13 +3,14 @@
 require "mkmf"
 require "rb_sys/mkmf"
 
-unless system("cargo", "--version", out: File::NULL, err: File::NULL)
-  warn "WARNING: Cargo not found!"
-  warn "fdr requires Cargo to build the native extension"
-  abort
+abort "fdr does not support Windows" if Gem.win_platform?
+
+cargo = ENV.fetch("CARGO", "cargo")
+unless system(cargo, "--version", out: File::NULL, err: File::NULL)
+  abort "fdr requires Cargo to build the native extension"
 end
 
 create_rust_makefile("fdr/fdr_native") do |r|
   r.ext_dir = "ffi"
-  r.profile = ENV.fetch("RB_SYS_CARGO_PROFILE", :release).to_sym
+  r.extra_cargo_args << "--locked"
 end

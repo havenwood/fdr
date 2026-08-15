@@ -6,26 +6,32 @@
 
 ## Installation
 
-`Fdr` isn't published to RubyGems yet. You'll need Rust installed so the native extension can compile.
-
-Add it to your application's `Gemfile`, then run `bundle install`:
-
-```ruby
-gem 'fdr', github: 'havenwood/fdr'
-```
-
-Or install it from a checkout:
+Install `Fdr` from RubyGems:
 
 ```bash
-git clone --depth=1 https://github.com/havenwood/fdr.git
-cd fdr
-bundle install
-bundle exec rake install
+gem install fdr
 ```
 
+Or add it to your application's `Gemfile`, then run `bundle install`:
+
+```ruby
+gem 'fdr'
+```
+
+The extension is built from source at install time, which takes a few seconds.
+
 ### Requirements
+
 - Ruby 3.2+
-- Rust
+- Rust 1.88+
+
+Install Rust with [rustup](https://rustup.rs) if it isn't already available:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Distribution packages are often older than 1.88, so `rustup` is usually the way to go.
 
 ## Usage
 
@@ -120,6 +126,13 @@ Search is case-sensitive by default and works one line at a time, so patterns ca
 ### Gaps
 
 Missing: `fd`'s owner filters, executable/empty/socket/pipe/device types, smart case and `.fdignore`, plus `rg`'s context lines, fixed-string and multiline matching, inverted matches and replacements. No `--crlf` either, so `needle$` won't match before a CRLF.
+
+## Releasing
+
+1. Bump `lib/fdr/version.rb`, commit and tag.
+2. `git push && git push --tags`
+3. `bundle exec rake gem:verify`
+4. `gem push pkg/fdr-$(ruby -Ilib -rfdr/version -e 'print Fdr::VERSION').gem`
 
 ## Attribution
 

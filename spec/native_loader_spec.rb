@@ -1,0 +1,44 @@
+# frozen_string_literal: true
+
+require "fileutils"
+require "open3"
+require "tmpdir"
+require_relative "spec_helper"
+
+class NativeLoaderSpec < Minitest::Test
+  def test_loads_the_native_extension
+    extension = compiled_extension
+    skip "Native extension is not compiled" unless extension
+
+    Dir.mktmpdir("fdr-native-loader") do |directory|
+      lib = build_library(directory, extension)
+      stderr, status = load_fdr(lib)
+
+      assert status.success?, stderr
+    end
+  end
+
+  private
+
+  def compiled_extension
+    Dir[File.expand_path("../lib/fdr/fdr_native.{bundle,so}", __dir__)].first
+  end
+
+  def build_library(directory, extension)
+    lib = File.join(directory, "lib")
+    fdr = File.join(lib, "fdr")
+    FileUtils.mkdir_p(fdr)
+    FileUtils.cp(File.expand_path("../lib/fdr.rb", __dir__), lib)
+    FileUtils.cp(File.expand_path("../lib/fdr/version.rb", __dir__), fdr)
+    FileUtils.cp(extension, File.join(fdr, File.basename(extension)))
+    lib
+  end
+
+  def load_fdr(lib)
+    script = "require 'fdr'; abort unless Fdr.search(paths: [#{lib.inspect}]).is_a?(Array)"
+    _, stderr, status = Open3.capture3(
+      {"RUBYOPT" => nil, "RUBYLIB" => nil}, Gem.ruby, "--disable-gems", "-I#{lib}", "-e", script
+    )
+    [stderr, status]
+  end
+end
