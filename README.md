@@ -120,3 +120,7 @@ Search is case-sensitive by default and works one line at a time, so patterns ca
 ### Gaps
 
 Missing: `fd`'s owner filters, executable/empty/socket/pipe/device types, smart case and `.fdignore`, plus `rg`'s context lines, fixed-string and multiline matching, inverted matches and replacements. No `--crlf` either, so `needle$` won't match before a CRLF.
+
+## Attribution
+
+`Fdr` directly borrows code from `fd`, under an MIT license.

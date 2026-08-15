@@ -1,10 +1,7 @@
-Fdr is a clone of fd, using the same core libraries and sharing some
-implementation details and code. Both are MIT license.
-
-Copyright (c) Shannon Skipper
-Copyright (c) 2017-present The fd developers
-
 MIT License
+
+Copyright (c) 2025-present Shannon Skipper
+Copyright (c) 2017-present The fd developers
 
 Permission is hereby granted, free of charge, to any person obtaining
 a copy of this software and associated documentation files (the
