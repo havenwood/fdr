@@ -59,7 +59,7 @@ Fdr.search(
 
 Fdr.search(
   pattern: 'thought.*snow|garret.*auction|foul.*thing',
-  paths: %w[~/garret ~/vault],
+  paths: [File.expand_path('~/garret'), File.expand_path('~/vault')],
   extension: 'txt',
   type: 'f',
   hidden: true,

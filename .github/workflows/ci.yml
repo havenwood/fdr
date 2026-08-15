@@ -6,18 +6,21 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        ruby-version: ['3.2', '3.3', '3.4']
+        ruby-version: ['3.2', '3.3', '3.4', '4.0']
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: ruby/setup-ruby@v1
         with:
