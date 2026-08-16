@@ -52,12 +52,32 @@ pub struct GrepResult {
     pub lines: Vec<(u64, Vec<u8>)>,
 }
 
-fn build_pattern_regex(config: &SearchConfig) -> Result<Option<regex::bytes::Regex>> {
+#[derive(Debug)]
+pub enum SearchError {
+    InvalidRegex(anyhow::Error),
+    InvalidInput(anyhow::Error),
+    Io(std::io::Error),
+    Cancelled,
+}
+
+impl std::fmt::Display for SearchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRegex(error) | Self::InvalidInput(error) => error.fmt(formatter),
+            Self::Io(error) => error.fmt(formatter),
+            Self::Cancelled => formatter.write_str("interrupted"),
+        }
+    }
+}
+
+impl std::error::Error for SearchError {}
+
+fn build_pattern_regex(config: &SearchConfig) -> Result<Option<regex::bytes::Regex>, SearchError> {
     use regex::bytes::RegexBuilder;
 
     if let Some(ref pat) = config.pattern {
         let regex_pattern = if config.glob {
-            glob_to_regex(pat)?
+            glob_to_regex(pat).map_err(SearchError::InvalidInput)?
         } else {
             pat.clone()
         };
@@ -65,20 +85,32 @@ fn build_pattern_regex(config: &SearchConfig) -> Result<Option<regex::bytes::Reg
         Ok(Some(
             RegexBuilder::new(&regex_pattern)
                 .case_insensitive(!config.case_sensitive)
-                .build()?,
+                .build()
+                .map_err(|error| {
+                    if config.glob {
+                        SearchError::InvalidInput(error.into())
+                    } else {
+                        SearchError::InvalidRegex(error.into())
+                    }
+                })?,
         ))
     } else {
         Ok(None)
     }
 }
 
-fn build_extension_regex(config: &SearchConfig) -> Result<Option<regex::bytes::Regex>> {
+fn build_extension_regex(
+    config: &SearchConfig,
+) -> Result<Option<regex::bytes::Regex>, SearchError> {
     use regex::bytes::RegexBuilder;
 
     if let Some(ref ext) = config.extension {
         let pattern = format!(r"\.{}$", regex::escape(ext));
         Ok(Some(
-            RegexBuilder::new(&pattern).case_insensitive(true).build()?,
+            RegexBuilder::new(&pattern)
+                .case_insensitive(true)
+                .build()
+                .map_err(|error| SearchError::InvalidInput(error.into()))?,
         ))
     } else {
         Ok(None)
@@ -97,7 +129,7 @@ struct EntryFilters {
 }
 
 impl EntryFilters {
-    fn new(config: &SearchConfig) -> Result<Self> {
+    fn new(config: &SearchConfig) -> Result<Self, SearchError> {
         Ok(Self {
             pattern: build_pattern_regex(config)?,
             extension: build_extension_regex(config)?,
@@ -157,7 +189,10 @@ fn matches_file_type(entry: &ignore::DirEntry, file_type: &str) -> bool {
     }
 }
 
-fn configure_walker(builder: &mut ignore::WalkBuilder, config: &SearchConfig) -> Result<()> {
+fn configure_walker(
+    builder: &mut ignore::WalkBuilder,
+    config: &SearchConfig,
+) -> Result<(), SearchError> {
     builder
         .hidden(!config.hidden)
         .ignore(!config.no_ignore)
@@ -169,15 +204,21 @@ fn configure_walker(builder: &mut ignore::WalkBuilder, config: &SearchConfig) ->
     if !config.exclude.is_empty() {
         let mut overrides = ignore::overrides::OverrideBuilder::new(".");
         for pattern in &config.exclude {
-            overrides.add(&format!("!{pattern}"))?;
+            overrides
+                .add(&format!("!{pattern}"))
+                .map_err(|error| SearchError::InvalidInput(error.into()))?;
         }
-        builder.overrides(overrides.build()?);
+        builder.overrides(
+            overrides
+                .build()
+                .map_err(|error| SearchError::InvalidInput(error.into()))?,
+        );
     }
 
     Ok(())
 }
 
-fn build_walker(config: &SearchConfig) -> Result<ignore::WalkBuilder> {
+fn build_walker(config: &SearchConfig) -> Result<ignore::WalkBuilder, SearchError> {
     use ignore::WalkBuilder;
 
     let search_paths: Vec<PathBuf> = if config.paths.is_empty() {
@@ -188,7 +229,7 @@ fn build_walker(config: &SearchConfig) -> Result<ignore::WalkBuilder> {
 
     let (first_path, rest) = search_paths
         .split_first()
-        .ok_or_else(|| anyhow::anyhow!("No paths to search"))?;
+        .ok_or_else(|| SearchError::InvalidInput(anyhow::anyhow!("No paths to search")))?;
     let mut builder = WalkBuilder::new(first_path);
 
     for path in rest {
@@ -295,7 +336,7 @@ fn matches_metadata_filters(
     true
 }
 
-pub fn search(config: &SearchConfig) -> Result<Vec<String>> {
+pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
     use crossbeam_channel::unbounded;
     use ignore::WalkState;
     use std::sync::Arc;
@@ -381,7 +422,7 @@ impl grep_searcher::Sink for LineCollector {
     }
 }
 
-pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>> {
+pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
     use crossbeam_channel::unbounded;
     use grep_matcher::LineTerminator;
     use grep_regex::RegexMatcherBuilder;
@@ -397,7 +438,11 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>> {
         .multi_line(true)
         .dot_matches_new_line(false)
         .crlf(true);
-    let matcher = Arc::new(matcher_builder.build(&config.pattern)?);
+    let matcher = Arc::new(
+        matcher_builder
+            .build(&config.pattern)
+            .map_err(|error| SearchError::InvalidRegex(error.into()))?,
+    );
     let filters = Arc::new(EntryFilters::new(&config.search)?);
     let builder = build_walker(&config.search)?;
 
