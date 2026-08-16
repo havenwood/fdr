@@ -39,6 +39,7 @@ module NativePackaging
 
   def assert_source_files!(spec)
     raise "Source gem does not contain Cargo.lock" unless spec.files.include?("ext/fdr_native/Cargo.lock")
+    raise "Source gem does not contain the native build script" unless spec.files.include?("ext/fdr_native/ffi/build.rs")
     raise "Source gem contains a compiled extension" if spec.files.any? { |file| file.match?(/\.(?:bundle|so)\z/) }
 
     generated = spec.files.grep(%r{\Aext/fdr_native/(?:target|tmp)/})
