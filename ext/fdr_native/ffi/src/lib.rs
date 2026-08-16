@@ -1,7 +1,7 @@
 //! Ruby FFI bindings for the fdr-core search library.
 #![allow(unsafe_code, reason = "FFI requires unsafe for Ruby interop")]
 
-use fdr_core::{GrepConfig, SearchConfig, grep, search};
+use fdr_core::{GrepConfig, SearchConfig, SearchError, grep, search};
 use magnus::scan_args::scan_args;
 use magnus::{Error, RArray, RHash, Ruby, TryConvert, Value, function, prelude::*};
 use std::ffi::c_void;
@@ -216,6 +216,27 @@ fn build_search_config(ruby: &Ruby, params: SearchParams) -> Result<SearchConfig
     Ok(config)
 }
 
+fn core_error(ruby: &Ruby, operation: &str, error: &SearchError) -> Error {
+    match error {
+        SearchError::Cancelled => Error::new(
+            ruby.exception_runtime_error(),
+            format!("{operation} interrupted"),
+        ),
+        SearchError::InvalidRegex(_) => Error::new(
+            ruby.exception_regexp_error(),
+            format!("{operation} failed: {error}"),
+        ),
+        SearchError::Io(_) => Error::new(
+            ruby.exception_io_error(),
+            format!("{operation} failed: {error}"),
+        ),
+        SearchError::InvalidInput(_) => Error::new(
+            ruby.exception_arg_error(),
+            format!("{operation} failed: {error}"),
+        ),
+    }
+}
+
 fn depth_range_is_empty(config: &SearchConfig) -> bool {
     matches!((config.min_depth, config.max_depth), (Some(min), Some(max)) if min > max)
 }
@@ -229,8 +250,8 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
         return Ok(ruby.ary_new());
     }
 
-    let results = without_gvl(|| search(&config))
-        .map_err(|err| Error::new(ruby.exception_arg_error(), format!("Search failed: {err}")))?;
+    let results =
+        without_gvl(|| search(&config)).map_err(|err| core_error(ruby, "Search", &err))?;
     let ruby_array = ruby.ary_new();
     for result in results {
         ruby_array.push(ruby.str_new(&result))?;
@@ -253,8 +274,7 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
     }
 
     let config = GrepConfig { pattern, search };
-    let results = without_gvl(|| grep(&config))
-        .map_err(|err| Error::new(ruby.exception_arg_error(), format!("Grep failed: {err}")))?;
+    let results = without_gvl(|| grep(&config)).map_err(|err| core_error(ruby, "Grep", &err))?;
     let ruby_results = ruby.hash_new();
 
     for result in results {
