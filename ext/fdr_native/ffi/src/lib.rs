@@ -1,7 +1,9 @@
 //! Ruby FFI bindings for the fdr-core search library.
 #![allow(unsafe_code, reason = "FFI requires unsafe for Ruby interop")]
 
-use fdr_core::{GrepConfig, SearchConfig, SearchError, grep_with_cancel, search_with_cancel};
+use fdr_core::{
+    FILE_TYPES, GrepConfig, SearchConfig, SearchError, grep_with_cancel, search_with_cancel,
+};
 use magnus::scan_args::scan_args;
 use magnus::value::LazyId;
 use magnus::{Error, RArray, RHash, Ruby, TryConvert, Value, function, prelude::*};
@@ -159,8 +161,6 @@ fn extract_search_params(kwargs: RHash) -> Result<SearchParams, Error> {
 }
 
 fn validate_file_type(ruby: &Ruby, file_type: &str) -> Result<(), Error> {
-    const FILE_TYPES: [&str; 7] = ["f", "file", "d", "dir", "directory", "l", "symlink"];
-
     if FILE_TYPES.contains(&file_type) {
         return Ok(());
     }

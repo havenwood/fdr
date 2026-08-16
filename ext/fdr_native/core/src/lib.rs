@@ -183,6 +183,9 @@ impl EntryFilters {
     }
 }
 
+/// File type names accepted by `SearchConfig::file_type`.
+pub const FILE_TYPES: [&str; 7] = ["f", "file", "d", "dir", "directory", "l", "symlink"];
+
 fn matches_file_type(entry: &ignore::DirEntry, file_type: &str) -> bool {
     let entry_file_type = entry.file_type();
 
@@ -248,6 +251,12 @@ fn build_walker(config: &SearchConfig) -> Result<ignore::WalkBuilder, SearchErro
 
 /// Batch size for result collection (same as fd's default).
 const BATCH_SIZE: usize = 256;
+
+/// Small trees avoid the parallel walker's polling overhead.
+const PARALLEL_THRESHOLD: usize = 1024;
+
+/// Grep switches earlier because each entry scans file contents.
+const GREP_PARALLEL_THRESHOLD: usize = 64;
 
 /// Wrapper for batched result sending with automatic flush on drop.
 struct ResultBatch {
@@ -345,6 +354,47 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
     search_with_cancel(config, &std::sync::atomic::AtomicBool::new(false))
 }
 
+fn serial_search(
+    builder: &ignore::WalkBuilder,
+    filters: &EntryFilters,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Option<Vec<String>>, SearchError> {
+    use std::sync::atomic::Ordering;
+
+    let mut results = Vec::new();
+
+    for (visited, entry) in builder.build().enumerate() {
+        if visited >= PARALLEL_THRESHOLD {
+            return Ok(None);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(SearchError::Cancelled);
+        }
+
+        let Ok(entry) = entry else {
+            continue;
+        };
+
+        if entry.depth() == 0 && entry.file_type().is_some_and(|t| t.is_dir()) {
+            continue;
+        }
+
+        if !filters.matches(&entry) {
+            continue;
+        }
+
+        results.push(path_to_string(entry.path()));
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(SearchError::Cancelled);
+    }
+
+    results.sort_unstable();
+
+    Ok(Some(results))
+}
+
 pub fn search_with_cancel(
     config: &SearchConfig,
     cancel: &std::sync::atomic::AtomicBool,
@@ -354,9 +404,14 @@ pub fn search_with_cancel(
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    let filters = Arc::new(EntryFilters::new(config)?);
+    let filters = EntryFilters::new(config)?;
     let builder = build_walker(config)?;
 
+    if let Some(results) = serial_search(&builder, &filters, cancel)? {
+        return Ok(results);
+    }
+
+    let filters = Arc::new(filters);
     let (tx, rx) = unbounded();
 
     let walker = builder.build_parallel();
@@ -456,6 +511,71 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
     grep_with_cancel(config, &std::sync::atomic::AtomicBool::new(false))
 }
 
+fn serial_grep(
+    builder: &ignore::WalkBuilder,
+    matcher: &grep_regex::RegexMatcher,
+    filters: &EntryFilters,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Option<Vec<GrepResult>>, SearchError> {
+    use grep_searcher::{BinaryDetection, SearcherBuilder};
+    use std::sync::atomic::Ordering;
+
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(b'\0'))
+        .build();
+    let mut results = Vec::new();
+
+    for (visited, entry) in builder.build().enumerate() {
+        if visited >= GREP_PARALLEL_THRESHOLD {
+            return Ok(None);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(SearchError::Cancelled);
+        }
+
+        let Ok(entry) = entry else {
+            continue;
+        };
+
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+
+        if !filters.matches(&entry) {
+            continue;
+        }
+
+        let path = entry.path();
+        let mut collector = LineCollector {
+            line_numbers: Vec::new(),
+            binary: false,
+        };
+
+        if searcher.search_path(matcher, path, &mut collector).is_ok()
+            && !collector.binary
+            && !collector.line_numbers.is_empty()
+        {
+            results.push(GrepResult {
+                path: path_to_string(path),
+                line_numbers: collector.line_numbers,
+            });
+        }
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(SearchError::Cancelled);
+    }
+
+    results.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    merge_colliding_paths(&mut results);
+
+    Ok(Some(results))
+}
+
 pub fn grep_with_cancel(
     config: &GrepConfig,
     cancel: &std::sync::atomic::AtomicBool,
@@ -471,14 +591,18 @@ pub fn grep_with_cancel(
     matcher_builder
         .case_insensitive(!config.search.case_sensitive)
         .line_terminator(Some(b'\n'));
-    let matcher = Arc::new(
-        matcher_builder
-            .build(&config.pattern)
-            .map_err(|error| SearchError::InvalidRegex(error.into()))?,
-    );
-    let filters = Arc::new(EntryFilters::new(&config.search)?);
+    let matcher = matcher_builder
+        .build(&config.pattern)
+        .map_err(|error| SearchError::InvalidRegex(error.into()))?;
+    let filters = EntryFilters::new(&config.search)?;
     let builder = build_walker(&config.search)?;
 
+    if let Some(results) = serial_grep(&builder, &matcher, &filters, cancel)? {
+        return Ok(results);
+    }
+
+    let matcher = Arc::new(matcher);
+    let filters = Arc::new(filters);
     let (tx, rx) = unbounded();
     let walker = builder.build_parallel();
 
