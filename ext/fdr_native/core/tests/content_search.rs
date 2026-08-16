@@ -319,6 +319,29 @@ fn grep_returns_results_sorted_by_path() {
 }
 
 #[test]
+fn grep_matches_across_the_serial_byte_limit() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+    for index in 0..5 {
+        let path = temp_path.join(format!("file_{index}.txt"));
+        let contents = format!("{}needle\n", "x\n".repeat(1_050_000));
+        fs::write(&path, contents).expect("should write fixture");
+    }
+
+    let results = grep(&needle_in(search_under(temp_path))).expect("grep should succeed");
+    let paths: Vec<&str> = results.iter().map(|result| result.path.as_str()).collect();
+    let mut deduplicated = paths.clone();
+    deduplicated.dedup();
+
+    assert_eq!(
+        results.len(),
+        5,
+        "bailing to the parallel walker should not drop results"
+    );
+    assert_eq!(paths, deduplicated, "no path should be reported twice");
+}
+
+#[test]
 fn grep_rejects_invalid_patterns() {
     let result = grep(&GrepConfig {
         pattern: "[invalid".to_string(),

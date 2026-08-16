@@ -81,4 +81,19 @@ describe "Fdr concurrency" do
 
     assert_kind_of Array, thread.value, "spurious wakeups should not abort the search"
   end
+
+  it "completes grep despite spurious thread wakeups" do
+    thread = Thread.new do
+      Fdr.grep(pattern: "needle", paths: [@dir])
+    rescue => e
+      e
+    end
+
+    begin
+      thread.wakeup while thread.alive?
+    rescue ThreadError
+    end
+
+    assert_kind_of Hash, thread.value, "spurious wakeups should not abort the grep"
+  end
 end
