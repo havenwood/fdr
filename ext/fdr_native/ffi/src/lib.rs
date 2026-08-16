@@ -1,13 +1,14 @@
 //! Ruby FFI bindings for the fdr-core search library.
 #![allow(unsafe_code, reason = "FFI requires unsafe for Ruby interop")]
 
-use fdr_core::{GrepConfig, SearchConfig, SearchError, grep, search};
+use fdr_core::{GrepConfig, SearchConfig, SearchError, grep_with_cancel, search_with_cancel};
 use magnus::scan_args::scan_args;
 use magnus::{Error, RArray, RHash, Ruby, TryConvert, Value, function, prelude::*};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn extract_optional_arg<T: TryConvert>(
     ruby: &Ruby,
@@ -21,7 +22,9 @@ fn extract_optional_arg<T: TryConvert>(
 }
 
 /// Runs `func` with the GVL released, so it must not touch any Ruby API.
-fn without_gvl<F, R>(func: F) -> R
+/// Ruby sets `cancel` when the calling thread is interrupted. Returns `None`
+/// without running `func` when an interrupt is already pending.
+fn without_gvl<F, R>(func: F, cancel: &AtomicBool) -> Option<R>
 where
     F: FnOnce() -> R,
 {
@@ -39,25 +42,62 @@ where
         ptr::null_mut()
     }
 
+    unsafe extern "C" fn interrupt(cancel: *mut c_void) {
+        // SAFETY: `cancel` is the `AtomicBool` passed below, alive for the whole call.
+        let cancel = unsafe { &*cancel.cast::<AtomicBool>() };
+        cancel.store(true, Ordering::Relaxed);
+    }
+
     let mut state = CallState::<F, R> {
         func: Some(func),
         result: None,
     };
-    // SAFETY: `call` runs synchronously while `state` is alive. No unblock
-    // function, so Ruby just waits for it to return.
+    // SAFETY: `call` runs synchronously while `state` is alive, and Ruby may
+    // invoke `interrupt` with `cancel` from another thread while it runs.
     unsafe {
-        rb_sys::rb_thread_call_without_gvl(
+        rb_sys::rb_thread_call_without_gvl2(
             Some(call::<F, R>),
             (&raw mut state).cast(),
-            None,
-            ptr::null_mut(),
+            Some(interrupt),
+            ptr::from_ref(cancel).cast_mut().cast(),
         );
     }
     match state.result {
-        Some(Ok(result)) => result,
+        Some(Ok(result)) => Some(result),
         Some(Err(panic)) => resume_unwind(panic),
-        None => unreachable!("rb_thread_call_without_gvl did not invoke its callback"),
+        None => None,
     }
+}
+
+/// Raises any pending interrupt, such as `Timeout::Error` or `Interrupt`.
+fn check_interrupts() -> Result<(), Error> {
+    magnus::rb_sys::protect(|| {
+        // SAFETY: called on a Ruby thread with the GVL held.
+        unsafe { rb_sys::rb_thread_check_ints() };
+        rb_sys::Qnil as rb_sys::VALUE
+    })?;
+    Ok(())
+}
+
+/// Retries transiently interrupted calls, then finishes while holding the GVL
+/// rather than raising for a handled signal or retrying forever.
+fn interruptible<R>(
+    run: impl Fn(&AtomicBool) -> Result<R, SearchError>,
+) -> Result<Result<R, SearchError>, Error> {
+    const SPURIOUS_RETRIES: usize = 3;
+
+    let cancel = AtomicBool::new(false);
+    for _ in 0..SPURIOUS_RETRIES {
+        cancel.store(false, Ordering::Relaxed);
+        let outcome = without_gvl(|| run(&cancel), &cancel);
+        check_interrupts()?;
+        match outcome {
+            None | Some(Err(SearchError::Cancelled)) => {}
+            Some(result) => return Ok(result),
+        }
+    }
+
+    Ok(run(&AtomicBool::new(false)))
 }
 
 struct SearchParams {
@@ -250,8 +290,8 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
         return Ok(ruby.ary_new());
     }
 
-    let results =
-        without_gvl(|| search(&config)).map_err(|err| core_error(ruby, "Search", &err))?;
+    let results = interruptible(|cancel| search_with_cancel(&config, cancel))?
+        .map_err(|err| core_error(ruby, "Search", &err))?;
     let ruby_array = ruby.ary_new();
     for result in results {
         ruby_array.push(ruby.str_new(&result))?;
@@ -274,7 +314,8 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
     }
 
     let config = GrepConfig { pattern, search };
-    let results = without_gvl(|| grep(&config)).map_err(|err| core_error(ruby, "Grep", &err))?;
+    let results = interruptible(|cancel| grep_with_cancel(&config, cancel))?
+        .map_err(|err| core_error(ruby, "Grep", &err))?;
     let ruby_results = ruby.hash_new();
 
     for result in results {

@@ -2,6 +2,7 @@
 
 require_relative "spec_helper"
 require "fileutils"
+require "timeout"
 require "tmpdir"
 
 describe "Fdr concurrency" do
@@ -44,5 +45,42 @@ describe "Fdr concurrency" do
   it "releases the GVL so other threads run during grep" do
     during = ticks_during { Fdr.grep(pattern: "needle", paths: [@dir]) }
     assert_predicate during, :positive?, "other threads should run during Fdr.grep"
+  end
+
+  it "can be interrupted by Timeout during search" do
+    assert_raises(Timeout::Error) do
+      Timeout.timeout(0.001) { 50.times { Fdr.search(paths: [@dir], hidden: true) } }
+    end
+  end
+
+  it "can be interrupted by Timeout while grepping a large file" do
+    path = File.join(@dir, "large.txt")
+    chunk = "haystack\n" * (1024 * 1024 / 9)
+    File.open(path, "wb") { |file| 256.times { file.write(chunk) } }
+    slow_no_match = "(?i:(?:ha|hay|hays|haystac)+z)"
+
+    started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    assert_raises(Timeout::Error) do
+      Timeout.timeout(0.01) { Fdr.grep(pattern: slow_no_match, paths: [path]) }
+    end
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+
+    assert_operator elapsed, :<, 0.25, "grep cancellation should return promptly"
+  end
+
+  it "completes despite spurious thread wakeups" do
+    thread = Thread.new do
+      Fdr.search(paths: [@dir], hidden: true)
+    rescue => e
+      e
+    end
+
+    begin
+      thread.wakeup while thread.alive?
+    rescue ThreadError
+      # The thread finished between the alive? check and the wakeup.
+    end
+
+    assert_kind_of Array, thread.value, "spurious wakeups should not abort the search"
   end
 end
