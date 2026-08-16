@@ -102,6 +102,44 @@ describe "Fdr error handling" do
     end
   end
 
+  describe "invalid argument types" do
+    it "raises TypeError when paths is not an Array" do
+      assert_raises(TypeError) do
+        Fdr.search(paths: "lib")
+      end
+    end
+
+    it "raises TypeError when extension is not a String" do
+      assert_raises(TypeError) do
+        Fdr.search(paths: ["lib"], extension: :rb)
+      end
+    end
+
+    it "raises TypeError when max_depth is not an Integer" do
+      assert_raises(TypeError) do
+        Fdr.search(paths: ["lib"], max_depth: "1")
+      end
+    end
+
+    it "raises TypeError when exclude is not an Array" do
+      assert_raises(TypeError) do
+        Fdr.search(paths: ["lib"], exclude: "vendor")
+      end
+    end
+
+    it "raises RangeError when min_size exceeds the native integer range" do
+      assert_raises(RangeError) do
+        Fdr.search(paths: ["lib"], min_size: 2**70)
+      end
+    end
+
+    it "raises TypeError when grep pattern is not a String" do
+      assert_raises(TypeError) do
+        Fdr.grep(pattern: 42, paths: ["lib"])
+      end
+    end
+  end
+
   describe "invalid options" do
     it "handles unknown file types by ignoring the filter" do
       results = Fdr.search(type: "invalid", paths: ["."], max_depth: 1)
