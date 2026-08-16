@@ -3,6 +3,7 @@
 
 use fdr_core::{GrepConfig, SearchConfig, SearchError, grep_with_cancel, search_with_cancel};
 use magnus::scan_args::scan_args;
+use magnus::value::LazyId;
 use magnus::{Error, RArray, RHash, RString, Ruby, TryConvert, Value, function, prelude::*};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -10,12 +11,27 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-fn extract_optional_arg<T: TryConvert>(
-    ruby: &Ruby,
-    hash: RHash,
-    key: &str,
-) -> Result<Option<T>, Error> {
-    hash.get(ruby.to_symbol(key))
+static PATTERN: LazyId = LazyId::new("pattern");
+static PATHS: LazyId = LazyId::new("paths");
+static HIDDEN: LazyId = LazyId::new("hidden");
+static NO_IGNORE: LazyId = LazyId::new("no_ignore");
+static CASE_SENSITIVE: LazyId = LazyId::new("case_sensitive");
+static GLOB: LazyId = LazyId::new("glob");
+static FULL_PATH: LazyId = LazyId::new("full_path");
+static FOLLOW: LazyId = LazyId::new("follow");
+static MAX_DEPTH: LazyId = LazyId::new("max_depth");
+static MIN_DEPTH: LazyId = LazyId::new("min_depth");
+static TYPE: LazyId = LazyId::new("type");
+static EXTENSION: LazyId = LazyId::new("extension");
+static EXCLUDE: LazyId = LazyId::new("exclude");
+static MIN_SIZE: LazyId = LazyId::new("min_size");
+static MAX_SIZE: LazyId = LazyId::new("max_size");
+static CHANGED_WITHIN: LazyId = LazyId::new("changed_within");
+static CHANGED_BEFORE: LazyId = LazyId::new("changed_before");
+static NAME: LazyId = LazyId::new("name");
+
+fn extract_optional_arg<T: TryConvert>(hash: RHash, key: &LazyId) -> Result<Option<T>, Error> {
+    hash.get(**key)
         .filter(|val| !val.is_nil())
         .map(TryConvert::try_convert)
         .transpose()
@@ -120,25 +136,25 @@ struct SearchParams {
     changed_before: Option<i64>,
 }
 
-fn extract_search_params(ruby: &Ruby, kwargs: RHash) -> Result<SearchParams, Error> {
+fn extract_search_params(kwargs: RHash) -> Result<SearchParams, Error> {
     Ok(SearchParams {
-        pattern: extract_optional_arg(ruby, kwargs, "pattern")?,
-        paths: extract_optional_arg(ruby, kwargs, "paths")?,
-        hidden: extract_optional_arg(ruby, kwargs, "hidden")?,
-        no_ignore: extract_optional_arg(ruby, kwargs, "no_ignore")?,
-        case_sensitive: extract_optional_arg(ruby, kwargs, "case_sensitive")?,
-        glob: extract_optional_arg(ruby, kwargs, "glob")?,
-        full_path: extract_optional_arg(ruby, kwargs, "full_path")?,
-        follow: extract_optional_arg(ruby, kwargs, "follow")?,
-        max_depth: extract_optional_arg(ruby, kwargs, "max_depth")?,
-        min_depth: extract_optional_arg(ruby, kwargs, "min_depth")?,
-        file_type: extract_optional_arg(ruby, kwargs, "type")?,
-        extension: extract_optional_arg(ruby, kwargs, "extension")?,
-        exclude: extract_optional_arg(ruby, kwargs, "exclude")?,
-        min_size: extract_optional_arg(ruby, kwargs, "min_size")?,
-        max_size: extract_optional_arg(ruby, kwargs, "max_size")?,
-        changed_within: extract_optional_arg(ruby, kwargs, "changed_within")?,
-        changed_before: extract_optional_arg(ruby, kwargs, "changed_before")?,
+        pattern: extract_optional_arg(kwargs, &PATTERN)?,
+        paths: extract_optional_arg(kwargs, &PATHS)?,
+        hidden: extract_optional_arg(kwargs, &HIDDEN)?,
+        no_ignore: extract_optional_arg(kwargs, &NO_IGNORE)?,
+        case_sensitive: extract_optional_arg(kwargs, &CASE_SENSITIVE)?,
+        glob: extract_optional_arg(kwargs, &GLOB)?,
+        full_path: extract_optional_arg(kwargs, &FULL_PATH)?,
+        follow: extract_optional_arg(kwargs, &FOLLOW)?,
+        max_depth: extract_optional_arg(kwargs, &MAX_DEPTH)?,
+        min_depth: extract_optional_arg(kwargs, &MIN_DEPTH)?,
+        file_type: extract_optional_arg(kwargs, &TYPE)?,
+        extension: extract_optional_arg(kwargs, &EXTENSION)?,
+        exclude: extract_optional_arg(kwargs, &EXCLUDE)?,
+        min_size: extract_optional_arg(kwargs, &MIN_SIZE)?,
+        max_size: extract_optional_arg(kwargs, &MAX_SIZE)?,
+        changed_within: extract_optional_arg(kwargs, &CHANGED_WITHIN)?,
+        changed_before: extract_optional_arg(kwargs, &CHANGED_BEFORE)?,
     })
 }
 
@@ -308,7 +324,7 @@ fn line_string(ruby: &Ruby, line: &[u8]) -> Result<RString, Error> {
 
 fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
-    let params = extract_search_params(ruby, args_scan.keywords)?;
+    let params = extract_search_params(args_scan.keywords)?;
     let config = build_search_config(ruby, params)?;
 
     if depth_range_is_empty(&config) {
@@ -317,21 +333,19 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
 
     let results = interruptible(|cancel| search_with_cancel(&config, cancel))?
         .map_err(|err| core_error(ruby, "Search", &err))?;
-    let ruby_array = ruby.ary_new();
-    for result in results {
-        ruby_array.push(ruby.str_new(&result))?;
-    }
 
-    Ok(ruby_array)
+    Ok(ruby.ary_from_vec(results))
 }
 
 fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
     let kwargs = args_scan.keywords;
-    let pattern: String = extract_optional_arg(ruby, kwargs, "pattern")?
+    let mut params = extract_search_params(kwargs)?;
+    let pattern = params
+        .pattern
+        .take()
         .ok_or_else(|| Error::new(ruby.exception_arg_error(), "missing keyword: pattern"))?;
-    let mut params = extract_search_params(ruby, kwargs)?;
-    params.pattern = extract_optional_arg(ruby, kwargs, "name")?;
+    params.pattern = extract_optional_arg(kwargs, &NAME)?;
     let search = build_search_config(ruby, params)?;
 
     if depth_range_is_empty(&search) {
