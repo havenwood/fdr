@@ -1,6 +1,13 @@
-use anyhow::Result;
+use crossbeam_channel::unbounded;
+use globset::GlobBuilder;
+use grep_matcher::LineTerminator;
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder};
+use ignore::{DirEntry, WalkBuilder, WalkState};
+use regex::bytes::{Regex, RegexBuilder};
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Default)]
@@ -47,7 +54,7 @@ impl Default for GrepConfig {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct GrepResult {
     pub path: String,
     /// Matching lines as `(one-based number, text without its terminator)`.
@@ -56,8 +63,8 @@ pub struct GrepResult {
 
 #[derive(Debug)]
 pub enum SearchError {
-    InvalidRegex(anyhow::Error),
-    InvalidInput(anyhow::Error),
+    InvalidRegex(String),
+    InvalidInput(String),
     Io(std::io::Error),
     Cancelled,
 }
@@ -65,7 +72,9 @@ pub enum SearchError {
 impl std::fmt::Display for SearchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidRegex(error) | Self::InvalidInput(error) => error.fmt(formatter),
+            Self::InvalidRegex(message) | Self::InvalidInput(message) => {
+                formatter.write_str(message)
+            }
             Self::Io(error) => error.fmt(formatter),
             Self::Cancelled => formatter.write_str("interrupted"),
         }
@@ -74,57 +83,50 @@ impl std::fmt::Display for SearchError {
 
 impl std::error::Error for SearchError {}
 
-fn build_pattern_regex(config: &SearchConfig) -> Result<Option<regex::bytes::Regex>, SearchError> {
-    use regex::bytes::RegexBuilder;
+fn build_pattern_regex(config: &SearchConfig) -> Result<Option<Regex>, SearchError> {
+    let Some(ref pat) = config.pattern else {
+        return Ok(None);
+    };
 
-    if let Some(ref pat) = config.pattern {
-        let regex_pattern = if config.glob {
-            glob_to_regex(pat).map_err(SearchError::InvalidInput)?
-        } else {
-            pat.clone()
-        };
-
-        Ok(Some(
-            RegexBuilder::new(&regex_pattern)
-                .case_insensitive(!config.case_sensitive)
-                .build()
-                .map_err(|error| {
-                    if config.glob {
-                        SearchError::InvalidInput(error.into())
-                    } else {
-                        SearchError::InvalidRegex(error.into())
-                    }
-                })?,
-        ))
+    let regex_pattern = if config.glob {
+        glob_to_regex(pat).map_err(|error| SearchError::InvalidInput(error.to_string()))?
     } else {
-        Ok(None)
-    }
+        pat.clone()
+    };
+
+    let regex = RegexBuilder::new(&regex_pattern)
+        .case_insensitive(!config.case_sensitive)
+        .build()
+        .map_err(|error| {
+            if config.glob {
+                SearchError::InvalidInput(error.to_string())
+            } else {
+                SearchError::InvalidRegex(error.to_string())
+            }
+        })?;
+
+    Ok(Some(regex))
 }
 
-fn build_extension_regex(
-    config: &SearchConfig,
-) -> Result<Option<regex::bytes::Regex>, SearchError> {
-    use regex::bytes::RegexBuilder;
+fn build_extension_regex(config: &SearchConfig) -> Result<Option<Regex>, SearchError> {
+    let Some(ref ext) = config.extension else {
+        return Ok(None);
+    };
 
-    if let Some(ref ext) = config.extension {
-        let ext = ext.trim_start_matches('.');
-        // Require a character before the dot so a bare dotfile like `.rs`
-        // is not treated as its own extension, matching fd.
-        let pattern = format!(r".\.{}$", regex::escape(ext));
-        Ok(Some(
-            RegexBuilder::new(&pattern)
-                .case_insensitive(true)
-                .build()
-                .map_err(|error| SearchError::InvalidInput(error.into()))?,
-        ))
-    } else {
-        Ok(None)
-    }
+    let ext = ext.trim_start_matches('.');
+    // A bare dotfile like `.rs` is not its own extension, matching fd.
+    let pattern = format!(r".\.{}$", regex::escape(ext));
+    let regex = RegexBuilder::new(&pattern)
+        .case_insensitive(true)
+        .build()
+        .map_err(|error| SearchError::InvalidInput(error.to_string()))?;
+
+    Ok(Some(regex))
 }
 
 struct EntryFilters {
-    pattern: Option<regex::bytes::Regex>,
-    extension: Option<regex::bytes::Regex>,
+    pattern: Option<Regex>,
+    extension: Option<Regex>,
     file_type: Option<String>,
     /// Base for absolute full-path pattern matching, as in fd.
     full_path_base: Option<PathBuf>,
@@ -162,7 +164,7 @@ impl EntryFilters {
         })
     }
 
-    fn matches(&self, entry: &ignore::DirEntry) -> bool {
+    fn matches(&self, entry: &DirEntry) -> bool {
         let path = entry.path();
         let search_str = self.full_path_base.as_deref().map_or_else(
             || path.file_name().unwrap_or_default().to_string_lossy(),
@@ -203,7 +205,7 @@ impl EntryFilters {
         self.matches_metadata(entry)
     }
 
-    fn matches_metadata(&self, entry: &ignore::DirEntry) -> bool {
+    fn matches_metadata(&self, entry: &DirEntry) -> bool {
         let sized = self.min_size.is_some() || self.max_size.is_some();
         let timed = self.changed_within.is_some() || self.changed_before.is_some();
 
@@ -254,7 +256,7 @@ impl EntryFilters {
 
 pub const FILE_TYPES: [&str; 7] = ["f", "file", "d", "dir", "directory", "l", "symlink"];
 
-fn matches_file_type(entry: &ignore::DirEntry, file_type: &str) -> bool {
+fn matches_file_type(entry: &DirEntry, file_type: &str) -> bool {
     let entry_file_type = entry.file_type();
 
     match file_type {
@@ -266,9 +268,9 @@ fn matches_file_type(entry: &ignore::DirEntry, file_type: &str) -> bool {
 }
 
 fn configure_walker(
-    builder: &mut ignore::WalkBuilder,
+    builder: &mut WalkBuilder,
     config: &SearchConfig,
-    root: &std::path::Path,
+    root: &Path,
 ) -> Result<(), SearchError> {
     builder
         .hidden(!config.hidden)
@@ -288,12 +290,12 @@ fn configure_walker(
         for pattern in &config.exclude {
             overrides
                 .add(&format!("!{pattern}"))
-                .map_err(|error| SearchError::InvalidInput(error.into()))?;
+                .map_err(|error| SearchError::InvalidInput(error.to_string()))?;
         }
         builder.overrides(
             overrides
                 .build()
-                .map_err(|error| SearchError::InvalidInput(error.into()))?,
+                .map_err(|error| SearchError::InvalidInput(error.to_string()))?,
         );
     }
 
@@ -307,18 +309,9 @@ fn walk_threads() -> usize {
         .div_ceil(2)
 }
 
-fn build_walker(config: &SearchConfig) -> Result<ignore::WalkBuilder, SearchError> {
-    use ignore::WalkBuilder;
-
-    let search_paths: Vec<PathBuf> = if config.paths.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        config.paths.clone()
-    };
-
-    let (first_path, rest) = search_paths
-        .split_first()
-        .ok_or_else(|| SearchError::InvalidInput(anyhow::anyhow!("No paths to search")))?;
+fn build_walker(config: &SearchConfig) -> Result<WalkBuilder, SearchError> {
+    let default_path = PathBuf::from(".");
+    let (first_path, rest) = config.paths.split_first().unwrap_or((&default_path, &[]));
     let mut builder = WalkBuilder::new(first_path);
 
     for path in rest {
@@ -378,10 +371,10 @@ impl Drop for ResultBatch {
 }
 
 pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
-    search_with_cancel(config, &std::sync::atomic::AtomicBool::new(false))
+    search_with_cancel(config, &AtomicBool::new(false))
 }
 
-fn search_entry(entry: &ignore::DirEntry, filters: &EntryFilters) -> Option<String> {
+fn search_entry(entry: &DirEntry, filters: &EntryFilters) -> Option<String> {
     // Skip symlinked directory roots the same way in both walkers.
     if entry.depth() == 0 && entry.path().is_dir() {
         return None;
@@ -395,12 +388,10 @@ fn search_entry(entry: &ignore::DirEntry, filters: &EntryFilters) -> Option<Stri
 }
 
 fn serial_search(
-    builder: &ignore::WalkBuilder,
+    builder: &WalkBuilder,
     filters: &EntryFilters,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &AtomicBool,
 ) -> Result<Option<Vec<String>>, SearchError> {
-    use std::sync::atomic::Ordering;
-
     let mut results = Vec::new();
 
     for (visited, entry) in builder.build().enumerate() {
@@ -431,13 +422,8 @@ fn serial_search(
 
 pub fn search_with_cancel(
     config: &SearchConfig,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &AtomicBool,
 ) -> Result<Vec<String>, SearchError> {
-    use crossbeam_channel::unbounded;
-    use ignore::WalkState;
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-
     let filters = EntryFilters::new(config)?;
     let builder = build_walker(config)?;
 
@@ -516,7 +502,7 @@ impl grep_searcher::Sink for LineCollector {
 
     fn matched(
         &mut self,
-        _searcher: &grep_searcher::Searcher,
+        _searcher: &Searcher,
         matched: &grep_searcher::SinkMatch<'_>,
     ) -> std::io::Result<bool> {
         if let Some(line_number) = matched.line_number() {
@@ -533,7 +519,7 @@ impl grep_searcher::Sink for LineCollector {
 
     fn binary_data(
         &mut self,
-        _searcher: &grep_searcher::Searcher,
+        _searcher: &Searcher,
         _binary_byte_offset: u64,
     ) -> std::io::Result<bool> {
         self.binary = true;
@@ -542,13 +528,10 @@ impl grep_searcher::Sink for LineCollector {
 }
 
 pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
-    grep_with_cancel(config, &std::sync::atomic::AtomicBool::new(false))
+    grep_with_cancel(config, &AtomicBool::new(false))
 }
 
-fn build_searcher() -> grep_searcher::Searcher {
-    use grep_matcher::LineTerminator;
-    use grep_searcher::{BinaryDetection, SearcherBuilder};
-
+fn build_searcher() -> Searcher {
     SearcherBuilder::new()
         .line_number(true)
         .line_terminator(LineTerminator::crlf())
@@ -559,7 +542,7 @@ fn build_searcher() -> grep_searcher::Searcher {
 }
 
 /// Whether an entry is a file `grep` should scan.
-fn grep_candidate(entry: &ignore::DirEntry, filters: &EntryFilters) -> bool {
+fn grep_candidate(entry: &DirEntry, filters: &EntryFilters) -> bool {
     entry
         .file_type()
         .is_some_and(|file_type| file_type.is_file())
@@ -569,9 +552,9 @@ fn grep_candidate(entry: &ignore::DirEntry, filters: &EntryFilters) -> bool {
 /// Matching lines in `path`, or `None` when it is binary, unreadable, cancelled,
 /// or has no match.
 fn grep_file(
-    searcher: &mut grep_searcher::Searcher,
-    matcher: &grep_regex::RegexMatcher,
-    path: &std::path::Path,
+    searcher: &mut Searcher,
+    matcher: &RegexMatcher,
+    path: &Path,
     cancel: &AtomicBool,
 ) -> Option<GrepResult> {
     let mut collector = LineCollector {
@@ -600,13 +583,11 @@ fn grep_file(
 }
 
 fn serial_grep(
-    builder: &ignore::WalkBuilder,
-    matcher: &grep_regex::RegexMatcher,
+    builder: &WalkBuilder,
+    matcher: &RegexMatcher,
     filters: &EntryFilters,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &AtomicBool,
 ) -> Result<Option<Vec<GrepResult>>, SearchError> {
-    use std::sync::atomic::Ordering;
-
     let mut searcher = build_searcher();
     let mut results = Vec::new();
     let mut scanned_bytes = 0_u64;
@@ -641,7 +622,7 @@ fn serial_grep(
         return Err(SearchError::Cancelled);
     }
 
-    results.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    results.sort_unstable();
     merge_colliding_paths(&mut results);
 
     Ok(Some(results))
@@ -649,14 +630,8 @@ fn serial_grep(
 
 pub fn grep_with_cancel(
     config: &GrepConfig,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &AtomicBool,
 ) -> Result<Vec<GrepResult>, SearchError> {
-    use crossbeam_channel::unbounded;
-    use grep_regex::RegexMatcherBuilder;
-    use ignore::WalkState;
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-
     let mut matcher_builder = RegexMatcherBuilder::new();
     matcher_builder
         .case_insensitive(!config.search.case_sensitive)
@@ -667,7 +642,7 @@ pub fn grep_with_cancel(
         .crlf(true);
     let matcher = matcher_builder
         .build(&config.pattern)
-        .map_err(|error| SearchError::InvalidRegex(error.into()))?;
+        .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
     let filters = EntryFilters::new(&config.search)?;
     let builder = build_walker(&config.search)?;
 
@@ -713,13 +688,13 @@ pub fn grep_with_cancel(
     }
 
     let mut results: Vec<GrepResult> = rx.iter().collect();
-    results.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    results.sort_unstable();
     merge_colliding_paths(&mut results);
 
     Ok(results)
 }
 
-fn path_to_string(path: &std::path::Path) -> String {
+fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
@@ -734,9 +709,7 @@ fn merge_colliding_paths(results: &mut Vec<GrepResult>) {
     });
 }
 
-fn glob_to_regex(glob: &str) -> Result<String> {
-    use globset::GlobBuilder;
-
+fn glob_to_regex(glob: &str) -> Result<String, globset::Error> {
     let glob_pattern = GlobBuilder::new(glob).literal_separator(true).build()?;
 
     Ok(glob_pattern.regex().to_string())
@@ -751,7 +724,7 @@ mod tests {
     fn path_to_string_replaces_invalid_utf8() {
         use std::os::unix::ffi::OsStrExt;
 
-        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(b"bad\xffname.txt"));
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"bad\xffname.txt"));
         assert_eq!(path_to_string(path), "bad\u{FFFD}name.txt");
     }
 
