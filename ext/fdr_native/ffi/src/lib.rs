@@ -4,7 +4,10 @@
 use fdr_core::{GrepConfig, SearchConfig, grep, search};
 use magnus::scan_args::scan_args;
 use magnus::{Error, RArray, RHash, Ruby, TryConvert, Value, function, prelude::*};
+use std::ffi::c_void;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
+use std::ptr;
 
 fn extract_optional_arg<T: TryConvert>(
     ruby: &Ruby,
@@ -15,6 +18,46 @@ fn extract_optional_arg<T: TryConvert>(
         .filter(|val| !val.is_nil())
         .map(TryConvert::try_convert)
         .transpose()
+}
+
+/// Runs `func` with the GVL released, so it must not touch any Ruby API.
+fn without_gvl<F, R>(func: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct CallState<F, R> {
+        func: Option<F>,
+        result: Option<std::thread::Result<R>>,
+    }
+
+    unsafe extern "C" fn call<F: FnOnce() -> R, R>(state: *mut c_void) -> *mut c_void {
+        // SAFETY: `state` points to the `CallState` below, alive for this synchronous call.
+        let state = unsafe { &mut *state.cast::<CallState<F, R>>() };
+        if let Some(func) = state.func.take() {
+            state.result = Some(catch_unwind(AssertUnwindSafe(func)));
+        }
+        ptr::null_mut()
+    }
+
+    let mut state = CallState::<F, R> {
+        func: Some(func),
+        result: None,
+    };
+    // SAFETY: `call` runs synchronously while `state` is alive. No unblock
+    // function, so Ruby just waits for it to return.
+    unsafe {
+        rb_sys::rb_thread_call_without_gvl(
+            Some(call::<F, R>),
+            (&raw mut state).cast(),
+            None,
+            ptr::null_mut(),
+        );
+    }
+    match state.result {
+        Some(Ok(result)) => result,
+        Some(Err(panic)) => resume_unwind(panic),
+        None => unreachable!("rb_thread_call_without_gvl did not invoke its callback"),
+    }
 }
 
 struct SearchParams {
@@ -186,7 +229,7 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
         return Ok(ruby.ary_new());
     }
 
-    let results = search(&config).map_err(|err| {
+    let results = without_gvl(|| search(&config)).map_err(|err| {
         Error::new(
             ruby.exception_runtime_error(),
             format!("Search failed: {err}"),
@@ -214,7 +257,7 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
     }
 
     let config = GrepConfig { pattern, search };
-    let results = grep(&config).map_err(|err| {
+    let results = without_gvl(|| grep(&config)).map_err(|err| {
         Error::new(
             ruby.exception_runtime_error(),
             format!("Grep failed: {err}"),
