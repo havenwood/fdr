@@ -1,7 +1,13 @@
 # frozen_string_literal: true
 
 require "fdr/version"
-require "fdr/fdr_native"
+
+begin
+  require "fdr/fdr_native"
+rescue LoadError => e
+  raise LoadError, "Failed to load the fdr native extension on #{RUBY_PLATFORM} (#{e.message}). " \
+    "Install Rust and reinstall fdr to build from source."
+end
 
 # Fast directory recursion for Ruby using Rust
 module Fdr
