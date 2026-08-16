@@ -1,5 +1,7 @@
 use anyhow::Result;
+use std::io::{self, Read};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Default)]
 #[allow(
@@ -337,9 +339,17 @@ fn matches_metadata_filters(
 }
 
 pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
+    search_with_cancel(config, &std::sync::atomic::AtomicBool::new(false))
+}
+
+pub fn search_with_cancel(
+    config: &SearchConfig,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<String>, SearchError> {
     use crossbeam_channel::unbounded;
     use ignore::WalkState;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     let filters = Arc::new(EntryFilters::new(config)?);
     let builder = build_walker(config)?;
@@ -355,6 +365,10 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
         let mut batch = ResultBatch::new(tx);
 
         Box::new(move |entry| {
+            if cancel.load(Ordering::Relaxed) {
+                return WalkState::Quit;
+            }
+
             let Ok(entry) = entry else {
                 return WalkState::Continue;
             };
@@ -374,6 +388,10 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
     });
 
     drop(tx);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(SearchError::Cancelled);
+    }
+
     let batches: Vec<Vec<String>> = rx.iter().collect();
     let total_size: usize = batches.iter().map(Vec::len).sum();
     let mut results = Vec::with_capacity(total_size);
@@ -385,6 +403,21 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
     results.sort_unstable();
 
     Ok(results)
+}
+
+struct CancellableReader<'a, R> {
+    inner: R,
+    cancel: &'a AtomicBool,
+}
+
+impl<R: Read> Read for CancellableReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::other("search cancelled"));
+        }
+
+        self.inner.read(buffer)
+    }
 }
 
 struct LineCollector {
@@ -423,12 +456,20 @@ impl grep_searcher::Sink for LineCollector {
 }
 
 pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
+    grep_with_cancel(config, &std::sync::atomic::AtomicBool::new(false))
+}
+
+pub fn grep_with_cancel(
+    config: &GrepConfig,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<GrepResult>, SearchError> {
     use crossbeam_channel::unbounded;
     use grep_matcher::LineTerminator;
     use grep_regex::RegexMatcherBuilder;
     use grep_searcher::{BinaryDetection, SearcherBuilder};
     use ignore::WalkState;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     let mut matcher_builder = RegexMatcherBuilder::new();
     matcher_builder
@@ -462,6 +503,10 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
             .build();
 
         Box::new(move |entry| {
+            if cancel.load(Ordering::Relaxed) {
+                return WalkState::Quit;
+            }
+
             let Ok(entry) = entry else {
                 return WalkState::Continue;
             };
@@ -477,13 +522,20 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
             }
 
             let path = entry.path();
+            let Ok(file) = std::fs::File::open(path) else {
+                return WalkState::Continue;
+            };
+            let reader = CancellableReader {
+                inner: file,
+                cancel,
+            };
             let mut collector = LineCollector {
                 lines: Vec::new(),
                 binary: false,
             };
 
             if searcher
-                .search_path(matcher.as_ref(), path, &mut collector)
+                .search_reader(matcher.as_ref(), reader, &mut collector)
                 .is_ok()
                 && !collector.binary
                 && !collector.lines.is_empty()
@@ -499,6 +551,10 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
     });
 
     drop(tx);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(SearchError::Cancelled);
+    }
+
     let mut results: Vec<GrepResult> = rx.iter().collect();
     results.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     merge_colliding_paths(&mut results);
@@ -578,5 +634,52 @@ mod tests {
                 },
             ]
         );
+    }
+    #[test]
+    fn grep_reader_checks_cancellation_between_buffers() {
+        struct CancelAfterFirstRead<'a> {
+            cancel: &'a AtomicBool,
+            emitted: bool,
+        }
+
+        impl Read for CancelAfterFirstRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.emitted {
+                    return Ok(0);
+                }
+
+                self.emitted = true;
+                buffer.fill(b'a');
+                self.cancel.store(true, Ordering::Relaxed);
+                Ok(buffer.len())
+            }
+        }
+
+        let cancel = AtomicBool::new(false);
+        let reader = CancellableReader {
+            inner: CancelAfterFirstRead {
+                cancel: &cancel,
+                emitted: false,
+            },
+            cancel: &cancel,
+        };
+        let matcher = grep_regex::RegexMatcherBuilder::new()
+            .build("needle")
+            .expect("should compile regex");
+        let mut searcher = grep_searcher::SearcherBuilder::new()
+            .line_number(true)
+            .binary_detection(grep_searcher::BinaryDetection::quit(b'\0'))
+            .build();
+        let mut collector = LineCollector {
+            lines: Vec::new(),
+            binary: false,
+        };
+
+        let error = searcher
+            .search_reader(&matcher, reader, &mut collector)
+            .expect_err("cancelled reader should stop the search");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "search cancelled");
     }
 }
