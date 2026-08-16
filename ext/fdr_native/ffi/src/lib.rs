@@ -10,7 +10,9 @@ use magnus::{Error, RArray, RHash, Ruby, TryConvert, Value, function, prelude::*
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 static PATTERN: LazyId = LazyId::new("pattern");
 static PATHS: LazyId = LazyId::new("paths");
@@ -38,10 +40,9 @@ fn extract_optional_arg<T: TryConvert>(hash: RHash, key: &LazyId) -> Result<Opti
         .transpose()
 }
 
-/// Runs `func` with the GVL released, so it must not touch any Ruby API.
-/// Ruby sets `cancel` when the calling thread is interrupted. Returns `None`
-/// without running `func` when an interrupt is already pending.
-fn without_gvl<F, R>(func: F, cancel: &AtomicBool) -> Option<R>
+/// Runs `func` without the GVL, so it must not call Ruby. Ruby calls
+/// `unblock` with `arg` on interrupt. `None` means `func` never started.
+fn without_gvl<F, R, A>(func: F, unblock: unsafe extern "C" fn(*mut c_void), arg: &A) -> Option<R>
 where
     F: FnOnce() -> R,
 {
@@ -59,24 +60,18 @@ where
         ptr::null_mut()
     }
 
-    unsafe extern "C" fn interrupt(cancel: *mut c_void) {
-        // SAFETY: `cancel` is the `AtomicBool` passed below, alive for the whole call.
-        let cancel = unsafe { &*cancel.cast::<AtomicBool>() };
-        cancel.store(true, Ordering::Relaxed);
-    }
-
     let mut state = CallState::<F, R> {
         func: Some(func),
         result: None,
     };
     // SAFETY: `call` runs synchronously while `state` is alive, and Ruby may
-    // invoke `interrupt` with `cancel` from another thread while it runs.
+    // invoke `unblock` with `arg` from another thread while it runs.
     unsafe {
         rb_sys::rb_thread_call_without_gvl2(
             Some(call::<F, R>),
             (&raw mut state).cast(),
-            Some(interrupt),
-            ptr::from_ref(cancel).cast_mut().cast(),
+            Some(unblock),
+            ptr::from_ref(arg).cast_mut().cast(),
         );
     }
     match state.result {
@@ -86,26 +81,59 @@ where
     }
 }
 
-/// Retries transiently interrupted calls, then finishes while holding the GVL
-/// rather than raising for a handled signal or retrying forever.
-fn interruptible<R>(
-    ruby: &Ruby,
-    run: impl Fn(&AtomicBool) -> Result<R, SearchError>,
-) -> Result<Result<R, SearchError>, Error> {
-    const SPURIOUS_RETRIES: usize = 3;
+enum Message<R> {
+    Done(Result<R, SearchError>),
+    Panicked(Box<dyn std::any::Any + Send>),
+    Wake,
+}
 
-    let cancel = AtomicBool::new(false);
-    for _ in 0..SPURIOUS_RETRIES {
-        cancel.store(false, Ordering::Relaxed);
-        let outcome = without_gvl(|| run(&cancel), &cancel);
-        ruby.thread_check_ints()?;
-        match outcome {
-            None | Some(Err(SearchError::Cancelled)) => {}
-            Some(result) => return Ok(result),
+unsafe extern "C" fn wake<R>(sender: *mut c_void) {
+    // SAFETY: `sender` points to the `Sender` in `interruptible`, which
+    // outlives every call Ruby can make here.
+    let sender = unsafe { &*sender.cast::<mpsc::Sender<Message<R>>>() };
+    drop(sender.send(Message::Wake));
+}
+
+/// Waits on a worker thread with the GVL released, so a real interrupt
+/// raises and a spurious one resumes the wait without discarding the walk.
+fn interruptible<R: Send + 'static>(
+    ruby: &Ruby,
+    cancel: &Arc<AtomicBool>,
+    run: impl FnOnce(&AtomicBool) -> Result<R, SearchError> + Send + 'static,
+) -> Result<Result<R, SearchError>, Error> {
+    struct StopWorker<'a>(&'a AtomicBool);
+
+    impl Drop for StopWorker<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
         }
     }
 
-    Ok(run(&AtomicBool::new(false)))
+    let stop = StopWorker(cancel);
+    let (sender, receiver) = mpsc::channel::<Message<R>>();
+    let worker_sender = sender.clone();
+    let worker_cancel = Arc::clone(cancel);
+
+    std::thread::spawn(move || {
+        let outcome = catch_unwind(AssertUnwindSafe(|| run(&worker_cancel)));
+        drop(worker_sender.send(match outcome {
+            Ok(result) => Message::Done(result),
+            Err(panic) => Message::Panicked(panic),
+        }));
+    });
+
+    loop {
+        let outcome = without_gvl(|| receiver.recv().ok(), wake::<R>, &sender);
+        ruby.thread_check_ints()?;
+        match outcome {
+            Some(Some(Message::Done(result))) => {
+                drop(stop);
+                return Ok(result);
+            }
+            Some(Some(Message::Panicked(panic))) => resume_unwind(panic),
+            _ => {}
+        }
+    }
 }
 
 fn extract_array<T: TryConvert>(hash: RHash, key: &LazyId) -> Result<Option<Vec<T>>, Error> {
@@ -233,8 +261,11 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
         return Ok(ruby.ary_new());
     }
 
-    let results = interruptible(ruby, |cancel| search_with_cancel(&config, cancel))?
-        .map_err(|err| core_error(ruby, "Search", &err))?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let results = interruptible(ruby, &cancel, move |cancel| {
+        search_with_cancel(&config, cancel)
+    })?
+    .map_err(|err| core_error(ruby, "Search", &err))?;
 
     Ok(ruby.ary_from_vec(results))
 }
@@ -251,8 +282,11 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
     }
 
     let config = GrepConfig { pattern, search };
-    let results = interruptible(ruby, |cancel| grep_with_cancel(&config, cancel))?
-        .map_err(|err| core_error(ruby, "Grep", &err))?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let results = interruptible(ruby, &cancel, move |cancel| {
+        grep_with_cancel(&config, cancel)
+    })?
+    .map_err(|err| core_error(ruby, "Grep", &err))?;
     let ruby_results = ruby.hash_new();
 
     for result in results {
