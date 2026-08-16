@@ -17,5 +17,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 fdr-core = { workspace = true }
-magnus = { version = "0.8", features = ["rb-sys"] }
+magnus = "0.8"
 rb-sys = { version = "0.9", features = ["stable-api-compiled-fallback"] }

@@ -129,6 +129,24 @@ describe "Fdr error handling" do
       end
     end
 
+    it "raises TypeError when max_depth is a Float" do
+      assert_raises(TypeError) do
+        Fdr.search(paths: ["lib"], max_depth: 2.9)
+      end
+    end
+
+    it "raises TypeError when min_size is a Float" do
+      assert_raises(TypeError) do
+        Fdr.search(paths: ["lib"], min_size: 1.5)
+      end
+    end
+
+    it "raises TypeError when changed_within is a Float" do
+      assert_raises(TypeError) do
+        Fdr.search(paths: ["lib"], changed_within: 0.5)
+      end
+    end
+
     it "raises TypeError when exclude is not an Array" do
       assert_raises(TypeError) do
         Fdr.search(paths: ["lib"], exclude: "vendor")
