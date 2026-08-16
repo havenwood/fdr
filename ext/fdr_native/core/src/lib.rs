@@ -108,7 +108,9 @@ fn build_extension_regex(
 
     if let Some(ref ext) = config.extension {
         let ext = ext.trim_start_matches('.');
-        let pattern = format!(r"\.{}$", regex::escape(ext));
+        // Require a character before the dot so a bare dotfile like `.rs`
+        // is not treated as its own extension, matching fd.
+        let pattern = format!(r".\.{}$", regex::escape(ext));
         Ok(Some(
             RegexBuilder::new(&pattern)
                 .case_insensitive(true)
@@ -124,34 +126,55 @@ struct EntryFilters {
     pattern: Option<regex::bytes::Regex>,
     extension: Option<regex::bytes::Regex>,
     file_type: Option<String>,
-    full_path: bool,
+    /// Base for absolute full-path pattern matching, as in fd.
+    full_path_base: Option<PathBuf>,
     min_size: Option<u64>,
     max_size: Option<u64>,
-    changed_within: Option<i64>,
-    changed_before: Option<i64>,
+    changed_within: Option<std::time::SystemTime>,
+    changed_before: Option<std::time::SystemTime>,
 }
 
 impl EntryFilters {
     fn new(config: &SearchConfig) -> Result<Self, SearchError> {
+        let full_path_base = if config.full_path && config.pattern.is_some() {
+            Some(std::env::current_dir().map_err(SearchError::Io)?)
+        } else {
+            None
+        };
+        // Keep time-filter cutoffs fixed for the whole walk.
+        let now = std::time::SystemTime::now();
+        let cutoff = |seconds: i64| {
+            now.checked_sub(std::time::Duration::from_secs(
+                u64::try_from(seconds).unwrap_or(0),
+            ))
+            .unwrap_or(std::time::UNIX_EPOCH)
+        };
+
         Ok(Self {
             pattern: build_pattern_regex(config)?,
             extension: build_extension_regex(config)?,
             file_type: config.file_type.clone(),
-            full_path: config.full_path,
+            full_path_base,
             min_size: config.min_size,
             max_size: config.max_size,
-            changed_within: config.changed_within,
-            changed_before: config.changed_before,
+            changed_within: config.changed_within.map(cutoff),
+            changed_before: config.changed_before.map(cutoff),
         })
     }
 
     fn matches(&self, entry: &ignore::DirEntry) -> bool {
         let path = entry.path();
-        let search_str = if self.full_path {
-            path.to_string_lossy()
-        } else {
-            path.file_name().unwrap_or_default().to_string_lossy()
-        };
+        let search_str = self.full_path_base.as_deref().map_or_else(
+            || path.file_name().unwrap_or_default().to_string_lossy(),
+            |base| {
+                let relative = path.strip_prefix(".").unwrap_or(path);
+                if relative.is_absolute() {
+                    relative.to_string_lossy()
+                } else {
+                    std::borrow::Cow::Owned(base.join(relative).to_string_lossy().into_owned())
+                }
+            },
+        );
 
         if let Some(regex) = self.pattern.as_ref()
             && !regex.is_match(search_str.as_bytes())
@@ -159,8 +182,14 @@ impl EntryFilters {
             return false;
         }
 
+        // Always match extensions against file names, even in full-path mode.
         if let Some(ext_regex) = self.extension.as_ref()
-            && !ext_regex.is_match(search_str.as_bytes())
+            && !ext_regex.is_match(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .as_bytes(),
+            )
         {
             return false;
         }
@@ -171,13 +200,55 @@ impl EntryFilters {
             return false;
         }
 
-        matches_metadata_filters(
-            entry,
-            self.min_size,
-            self.max_size,
-            self.changed_within,
-            self.changed_before,
-        )
+        self.matches_metadata(entry)
+    }
+
+    fn matches_metadata(&self, entry: &ignore::DirEntry) -> bool {
+        let sized = self.min_size.is_some() || self.max_size.is_some();
+        let timed = self.changed_within.is_some() || self.changed_before.is_some();
+
+        if !sized && !timed {
+            return true;
+        }
+
+        let Ok(metadata) = entry.metadata() else {
+            return false;
+        };
+
+        if sized {
+            // Follow symlinks to identify files, but measure each entry, as in fd.
+            if !entry.path().is_file() {
+                return false;
+            }
+            if let Some(min) = self.min_size
+                && metadata.len() < min
+            {
+                return false;
+            }
+            if let Some(max) = self.max_size
+                && metadata.len() > max
+            {
+                return false;
+            }
+        }
+
+        if timed {
+            let Ok(modified) = metadata.modified() else {
+                return false;
+            };
+            if let Some(cutoff) = self.changed_within
+                && modified < cutoff
+            {
+                return false;
+            }
+            if let Some(cutoff) = self.changed_before
+                && modified > cutoff
+            {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -197,17 +268,23 @@ fn matches_file_type(entry: &ignore::DirEntry, file_type: &str) -> bool {
 fn configure_walker(
     builder: &mut ignore::WalkBuilder,
     config: &SearchConfig,
+    root: &std::path::Path,
 ) -> Result<(), SearchError> {
     builder
         .hidden(!config.hidden)
         .ignore(!config.no_ignore)
         .git_ignore(!config.no_ignore)
+        .git_global(!config.no_ignore)
+        .git_exclude(!config.no_ignore)
         .follow_links(config.follow)
         .max_depth(config.max_depth)
-        .min_depth(config.min_depth);
+        .min_depth(config.min_depth)
+        .threads(walk_threads());
 
     if !config.exclude.is_empty() {
-        let mut overrides = ignore::overrides::OverrideBuilder::new(".");
+        // Exclude globs anchor to the first search path, as in fd; "." would
+        // silently anchor slash-containing patterns to the process cwd.
+        let mut overrides = ignore::overrides::OverrideBuilder::new(root);
         for pattern in &config.exclude {
             overrides
                 .add(&format!("!{pattern}"))
@@ -221,6 +298,13 @@ fn configure_walker(
     }
 
     Ok(())
+}
+
+/// Uses half the cores because directory I/O, not CPU, limits walking.
+fn walk_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .div_ceil(2)
 }
 
 fn build_walker(config: &SearchConfig) -> Result<ignore::WalkBuilder, SearchError> {
@@ -241,7 +325,7 @@ fn build_walker(config: &SearchConfig) -> Result<ignore::WalkBuilder, SearchErro
         builder.add(path);
     }
 
-    configure_walker(&mut builder, config)?;
+    configure_walker(&mut builder, config, first_path)?;
 
     Ok(builder)
 }
@@ -254,6 +338,9 @@ const PARALLEL_THRESHOLD: usize = 1024;
 
 /// Grep switches earlier because each entry scans file contents.
 const GREP_PARALLEL_THRESHOLD: usize = 64;
+
+/// Limits discarded work during serial grep pre-scan.
+const GREP_SERIAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Wrapper for batched result sending with automatic flush on drop.
 struct ResultBatch {
@@ -290,63 +377,6 @@ impl Drop for ResultBatch {
     }
 }
 
-fn matches_metadata_filters(
-    entry: &ignore::DirEntry,
-    min_size: Option<u64>,
-    max_size: Option<u64>,
-    changed_within: Option<i64>,
-    changed_before: Option<i64>,
-) -> bool {
-    if min_size.is_none()
-        && max_size.is_none()
-        && changed_within.is_none()
-        && changed_before.is_none()
-    {
-        return true;
-    }
-
-    let Ok(metadata) = entry.metadata() else {
-        return false;
-    };
-
-    if let Some(min) = min_size
-        && metadata.len() < min
-    {
-        return false;
-    }
-
-    if let Some(max) = max_size
-        && metadata.len() > max
-    {
-        return false;
-    }
-    if (changed_within.is_some() || changed_before.is_some())
-        && let Ok(modified) = metadata.modified()
-        && let Ok(duration_since_epoch) = modified.duration_since(std::time::UNIX_EPOCH)
-    {
-        let file_time = i64::try_from(duration_since_epoch.as_secs()).unwrap_or(i64::MAX);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-
-        if let Some(within_seconds) = changed_within {
-            let cutoff = now.saturating_sub(within_seconds);
-            if file_time < cutoff {
-                return false;
-            }
-        }
-
-        if let Some(before_seconds) = changed_before {
-            let cutoff = now.saturating_sub(before_seconds);
-            if file_time > cutoff {
-                return false;
-            }
-        }
-    }
-
-    true
-}
-
 pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
     search_with_cancel(config, &std::sync::atomic::AtomicBool::new(false))
 }
@@ -372,7 +402,9 @@ fn serial_search(
             continue;
         };
 
-        if entry.depth() == 0 && entry.file_type().is_some_and(|t| t.is_dir()) {
+        // Path::is_dir follows symlinks, so a symlink-to-dir root is skipped
+        // consistently by the serial and parallel walkers.
+        if entry.depth() == 0 && entry.path().is_dir() {
             continue;
         }
 
@@ -428,7 +460,7 @@ pub fn search_with_cancel(
                 return WalkState::Continue;
             };
 
-            if entry.depth() == 0 && entry.file_type().is_some_and(|t| t.is_dir()) {
+            if entry.depth() == 0 && entry.path().is_dir() {
                 return WalkState::Continue;
             }
 
@@ -532,6 +564,7 @@ fn serial_grep(
         .bom_sniffing(false)
         .build();
     let mut results = Vec::new();
+    let mut scanned_bytes = 0_u64;
 
     for (visited, entry) in builder.build().enumerate() {
         if visited >= GREP_PARALLEL_THRESHOLD {
@@ -554,6 +587,11 @@ fn serial_grep(
 
         if !filters.matches(&entry) {
             continue;
+        }
+
+        scanned_bytes = scanned_bytes.saturating_add(entry.metadata().map_or(0, |m| m.len()));
+        if scanned_bytes > GREP_SERIAL_MAX_BYTES {
+            return Ok(None);
         }
 
         let path = entry.path();
