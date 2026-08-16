@@ -350,13 +350,10 @@ fn search_unicode_filenames() {
     );
 }
 
-/// Regression test: Extension filtering must be case-insensitive.
-///
-/// This test ensures that `extension: Some("txt")` matches files with `.txt`, `.TXT`, `.TxT`, etc.
-/// Files are created in separate subdirectories to work correctly on case-insensitive
-/// filesystems (like macOS APFS), where `file.txt` and `FILE.TXT` would be the same file.
+/// Files live in separate subdirectories so they stay distinct on case-insensitive
+/// filesystems like APFS.
 #[test]
-fn search_case_sensitive_extension_filter() {
+fn search_case_insensitive_extension_filter() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
 
@@ -547,15 +544,7 @@ fn search_nested_exclude_patterns() {
     );
 }
 
-/// Regression test: The `min_size` filter must correctly exclude empty (0-byte) files.
-///
-/// This test verifies that:
-/// 1. Empty files are found by default (without `min_size` filter)
-/// 2. Empty files are excluded when `min_size: Some(1)` is set
-/// 3. Non-empty files are still included with the filter
-///
-/// Note: Filenames use `ends_with()` checks, so they must not overlap as substrings.
-/// `"empty.txt"` and `"nonempty.txt"` would fail because `"nonempty.txt".ends_with("empty.txt")` is true!
+/// Filenames must not overlap as substrings, since the assertions use `ends_with`.
 #[test]
 fn search_zero_byte_files() {
     let temp_dir = TempDir::new().expect("should create temp dir");
