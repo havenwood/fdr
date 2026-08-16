@@ -46,29 +46,36 @@ describe "Fdr error handling" do
     end
 
     it "raises error for invalid regex pattern" do
-      error = assert_raises(RuntimeError) do
+      error = assert_raises(ArgumentError) do
         Fdr.search(pattern: "[invalid(regex", paths: ["."], max_depth: 1)
       end
       assert_match(/Search failed/, error.message)
     end
 
     it "raises error for unclosed bracket in regex" do
-      error = assert_raises(RuntimeError) do
+      error = assert_raises(ArgumentError) do
         Fdr.search(pattern: "[abc", paths: ["."], max_depth: 1)
       end
       assert_match(/Search failed/, error.message)
     end
 
     it "raises error for invalid named group in regex" do
-      error = assert_raises(RuntimeError) do
+      error = assert_raises(ArgumentError) do
         Fdr.search(pattern: "(?P<invalid)", paths: ["."], max_depth: 1)
       end
       assert_match(/Search failed/, error.message)
     end
 
     it "raises error for invalid glob pattern" do
-      error = assert_raises(RuntimeError) do
+      error = assert_raises(ArgumentError) do
         Fdr.search(pattern: "[invalid", paths: ["."], glob: true, max_depth: 1)
+      end
+      assert_match(/Search failed/, error.message)
+    end
+
+    it "raises error for invalid exclude pattern" do
+      error = assert_raises(ArgumentError) do
+        Fdr.search(paths: ["."], exclude: ["[invalid"], max_depth: 1)
       end
       assert_match(/Search failed/, error.message)
     end
