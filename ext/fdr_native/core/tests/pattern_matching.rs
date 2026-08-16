@@ -95,7 +95,7 @@ fn search_case_sensitive_distinguishes_case() {
 #[test]
 fn search_full_path_matches_directory_names() {
     let config = SearchConfig {
-        pattern: Some("src".to_string()),
+        pattern: Some("^/.*/src$".to_string()),
         full_path: true,
         paths: vec![PathBuf::from(".")],
         max_depth: Some(3),
@@ -104,8 +104,8 @@ fn search_full_path_matches_directory_names() {
 
     let results = search(&config).expect("search should succeed");
     assert!(
-        results.iter().any(|path| path.contains("src")),
-        "full path search should match directory names in path"
+        results.iter().any(|path| path.ends_with("src")),
+        "full path search should match directory names in the absolute path"
     );
 }
 
@@ -157,7 +157,7 @@ fn search_complex_regex_pattern() {
 #[test]
 fn search_glob_with_subdirectory() {
     let config = SearchConfig {
-        pattern: Some("src/*.rs".to_string()),
+        pattern: Some("**/src/*.rs".to_string()),
         glob: true,
         full_path: true,
         paths: vec![PathBuf::from(".")],
@@ -166,6 +166,7 @@ fn search_glob_with_subdirectory() {
     };
 
     let results = search(&config).expect("search should succeed");
+    assert!(!results.is_empty(), "should match .rs files under src");
     for path in &results {
         assert!(
             path.contains("src")
@@ -175,4 +176,24 @@ fn search_glob_with_subdirectory() {
             "should match .rs files in src directory: {path}"
         );
     }
+}
+
+#[test]
+fn search_glob_full_path_anchors_to_the_absolute_path() {
+    // Globs are anchored and full_path matches absolute paths, so a relative
+    // glob without a leading wildcard can never match, as in fd.
+    let config = SearchConfig {
+        pattern: Some("src/*.rs".to_string()),
+        glob: true,
+        full_path: true,
+        paths: vec![PathBuf::from(".")],
+        max_depth: Some(3),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(
+        results.is_empty(),
+        "a glob without a leading wildcard should not match subpaths"
+    );
 }

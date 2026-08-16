@@ -603,3 +603,89 @@ fn search_zero_byte_files() {
         "should include non-empty files"
     );
 }
+
+#[test]
+fn search_bare_dotfile_is_not_its_own_extension() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+
+    File::create(temp_path.join(".rs")).expect("should create file");
+    File::create(temp_path.join("main.rs")).expect("should create file");
+
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(temp_path)],
+        extension: Some("rs".to_string()),
+        hidden: true,
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(
+        results.iter().any(|path| path.ends_with("main.rs")),
+        "should match a file that has an extension"
+    );
+    assert!(
+        !results.iter().any(|path| path.ends_with("/.rs")),
+        "should not treat a bare dotfile as its own extension"
+    );
+}
+
+#[test]
+fn search_exclude_pattern_anchors_to_the_search_root() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+
+    let vendor = temp_path.join("vendor");
+    fs::create_dir(&vendor).expect("should create dir");
+    File::create(vendor.join("a.rs")).expect("should create file");
+    File::create(vendor.join("keep.rs")).expect("should create file");
+
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(temp_path)],
+        exclude: vec!["vendor/a.rs".to_string()],
+        file_type: Some("f".to_string()),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(
+        results.iter().any(|path| path.ends_with("keep.rs")),
+        "should keep files the exclude does not name"
+    );
+    assert!(
+        !results.iter().any(|path| path.ends_with("a.rs")),
+        "a slash-containing exclude should anchor to the search root"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn search_sizes_symlinks_by_the_link_not_the_target() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+
+    fs::write(temp_path.join("target.txt"), vec![b'x'; 5000]).expect("should create file");
+    std::os::unix::fs::symlink("target.txt", temp_path.join("link.txt"))
+        .expect("should create symlink");
+    fs::create_dir(temp_path.join("subdir")).expect("should create dir");
+
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(temp_path)],
+        max_size: Some(100),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(
+        results.iter().any(|path| path.ends_with("link.txt")),
+        "should size a symlink by the link itself"
+    );
+    assert!(
+        !results.iter().any(|path| path.ends_with("target.txt")),
+        "should exclude a target above max_size"
+    );
+    assert!(
+        !results.iter().any(|path| path.ends_with("subdir")),
+        "should apply size filters only to regular files"
+    );
+}

@@ -3,6 +3,7 @@
 require_relative "spec_helper"
 require "tmpdir"
 require "fileutils"
+require "open3"
 
 describe "Fdr search options" do
   describe "depth control" do
@@ -85,6 +86,39 @@ describe "Fdr search options" do
         "lib search should only return lib files")
       assert(spec_only.all? { |p| p.start_with?("spec") },
         "spec search should only return spec files")
+    end
+
+    it "does not resolve the current directory without a full-path pattern" do
+      Dir.mktmpdir("fdr-absolute-search") do |target|
+        cwd = Dir.mktmpdir("fdr-deleted-cwd")
+        begin
+          file = File.join(target, "match.txt")
+          File.write(file, "")
+          script = <<~RUBY
+            require "fdr"
+
+            cwd, target = ARGV
+            Dir.chdir(cwd)
+            Dir.rmdir(cwd)
+            puts Fdr.search(paths: [target], type: "f", full_path: true, max_depth: 1)
+          RUBY
+          stdout, stderr, status = Open3.capture3(
+            {"RUBYOPT" => nil, "RUBYLIB" => nil},
+            Gem.ruby,
+            "--disable-gems",
+            "-I#{File.expand_path("../lib", __dir__)}",
+            "-e",
+            script,
+            cwd,
+            target
+          )
+
+          assert status.success?, stderr
+          assert_equal "#{file}\n", stdout
+        ensure
+          FileUtils.remove_entry(cwd) if File.exist?(cwd)
+        end
+      end
     end
   end
 
