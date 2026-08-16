@@ -35,6 +35,8 @@ Distribution packages are often older than 1.88, so `rustup` is usually the way 
 
 ## Usage
 
+`Fdr.search` returns a path-sorted `Array` of matching paths.
+
 ```ruby
 require 'fdr'
 

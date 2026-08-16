@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "tmpdir"
 require_relative "spec_helper"
 
 describe Fdr do
@@ -36,6 +37,19 @@ describe Fdr do
       results = Fdr.search(paths: ["lib"], max_depth: 1)
       assert_kind_of Array, results
       refute_empty results, "should find files in lib directory"
+    end
+
+    it "returns path-sorted results" do
+      Dir.mktmpdir("fdr-sort") do |dir|
+        20.times do |i|
+          subdir = File.join(dir, "dir#{i}")
+          Dir.mkdir(subdir)
+          10.times { |j| File.write(File.join(subdir, "file#{j}.txt"), "") }
+        end
+
+        results = Fdr.search(paths: [dir])
+        assert_equal results.sort, results, "search results should be path-sorted"
+      end
     end
 
     it "returns String paths that point to existing files" do
