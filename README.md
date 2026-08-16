@@ -127,6 +127,8 @@ Search is case-sensitive by default and works one line at a time, so patterns ca
 
 Missing: `fd`'s owner filters, executable/empty/socket/pipe/device types, smart case and `.fdignore`, plus `rg`'s context lines, fixed-string and multiline matching, inverted matches and replacements. No `--crlf` either, so `needle$` won't match before a CRLF.
 
+Filenames that aren't valid UTF-8 come back with `U+FFFD` replacements, as in `fd`'s output, so they can't be reopened as returned. Colliding replacement paths in `Fdr.grep` share one result with merged line numbers.
+
 ## Releasing
 
 1. Bump `lib/fdr/version.rb`, commit and tag.

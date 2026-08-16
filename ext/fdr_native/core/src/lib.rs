@@ -326,9 +326,7 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>> {
                 return WalkState::Continue;
             }
 
-            if let Some(path_str) = entry.path().to_str() {
-                batch.push(path_str.to_string());
-            }
+            batch.push(path_to_string(entry.path()));
 
             WalkState::Continue
         })
@@ -432,9 +430,6 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>> {
             }
 
             let path = entry.path();
-            let Some(path_str) = path.to_str() else {
-                return WalkState::Continue;
-            };
             let mut collector = LineCollector {
                 lines: Vec::new(),
                 binary: false,
@@ -447,7 +442,7 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>> {
                 && !collector.lines.is_empty()
             {
                 drop(tx.send(GrepResult {
-                    path: path_str.to_string(),
+                    path: path_to_string(path),
                     lines: collector.lines,
                 }));
             }
@@ -459,8 +454,24 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>> {
     drop(tx);
     let mut results: Vec<GrepResult> = rx.iter().collect();
     results.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    merge_colliding_paths(&mut results);
 
     Ok(results)
+}
+
+fn path_to_string(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn merge_colliding_paths(results: &mut Vec<GrepResult>) {
+    results.dedup_by(|next, kept| {
+        next.path == kept.path && {
+            kept.lines.append(&mut next.lines);
+            kept.lines.sort_unstable();
+            kept.lines.dedup_by(|next, kept| next.0 == kept.0);
+            true
+        }
+    });
 }
 
 fn glob_to_regex(glob: &str) -> Result<String> {
@@ -469,4 +480,56 @@ fn glob_to_regex(glob: &str) -> Result<String> {
     let glob_pattern = GlobBuilder::new(glob).literal_separator(true).build()?;
 
     Ok(glob_pattern.regex().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn path_to_string_replaces_invalid_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(b"bad\xffname.txt"));
+        assert_eq!(path_to_string(path), "bad\u{FFFD}name.txt");
+    }
+
+    #[test]
+    fn merge_colliding_paths_merges_line_numbers_of_equal_paths() {
+        let mut results = vec![
+            GrepResult {
+                path: "a\u{FFFD}.txt".into(),
+                lines: vec![(2, b"two".to_vec()), (3, b"three".to_vec())],
+            },
+            GrepResult {
+                path: "a\u{FFFD}.txt".into(),
+                lines: vec![(3, b"three".to_vec()), (7, b"seven".to_vec())],
+            },
+            GrepResult {
+                path: "b.txt".into(),
+                lines: vec![(1, b"one".to_vec())],
+            },
+        ];
+
+        merge_colliding_paths(&mut results);
+
+        assert_eq!(
+            results,
+            vec![
+                GrepResult {
+                    path: "a\u{FFFD}.txt".into(),
+                    lines: vec![
+                        (2, b"two".to_vec()),
+                        (3, b"three".to_vec()),
+                        (7, b"seven".to_vec())
+                    ],
+                },
+                GrepResult {
+                    path: "b.txt".into(),
+                    lines: vec![(1, b"one".to_vec())],
+                },
+            ]
+        );
+    }
 }

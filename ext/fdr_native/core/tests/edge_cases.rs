@@ -5,6 +5,32 @@ use std::fs::{self, File};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn search_includes_non_utf8_filenames() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+
+    File::create(temp_path.join(OsStr::from_bytes(b"bad\xffname.txt")))
+        .expect("should create non-UTF-8 filename");
+
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(temp_path)],
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert_eq!(results.len(), 1, "non-UTF-8 filename should be emitted");
+    let result = results.first().expect("should have one result");
+    assert!(
+        result.ends_with("bad\u{FFFD}name.txt"),
+        "invalid bytes should be replaced, got {result:?}"
+    );
+}
+
 #[test]
 fn search_empty_directory_returns_empty() {
     let temp_dir = TempDir::new().expect("should create temp dir");
