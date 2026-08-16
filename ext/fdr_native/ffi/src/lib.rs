@@ -9,7 +9,6 @@ use magnus::value::LazyId;
 use magnus::{Error, RArray, RHash, Ruby, TryConvert, Value, function, prelude::*};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -87,19 +86,10 @@ where
     }
 }
 
-/// Raises any pending interrupt, such as `Timeout::Error` or `Interrupt`.
-fn check_interrupts() -> Result<(), Error> {
-    magnus::rb_sys::protect(|| {
-        // SAFETY: called on a Ruby thread with the GVL held.
-        unsafe { rb_sys::rb_thread_check_ints() };
-        rb_sys::Qnil as rb_sys::VALUE
-    })?;
-    Ok(())
-}
-
 /// Retries transiently interrupted calls, then finishes while holding the GVL
 /// rather than raising for a handled signal or retrying forever.
 fn interruptible<R>(
+    ruby: &Ruby,
     run: impl Fn(&AtomicBool) -> Result<R, SearchError>,
 ) -> Result<Result<R, SearchError>, Error> {
     const SPURIOUS_RETRIES: usize = 3;
@@ -108,7 +98,7 @@ fn interruptible<R>(
     for _ in 0..SPURIOUS_RETRIES {
         cancel.store(false, Ordering::Relaxed);
         let outcome = without_gvl(|| run(&cancel), &cancel);
-        check_interrupts()?;
+        ruby.thread_check_ints()?;
         match outcome {
             None | Some(Err(SearchError::Cancelled)) => {}
             Some(result) => return Ok(result),
@@ -118,175 +108,96 @@ fn interruptible<R>(
     Ok(run(&AtomicBool::new(false)))
 }
 
-struct SearchParams {
-    pattern: Option<String>,
-    paths: Option<RArray>,
-    hidden: Option<bool>,
-    no_ignore: Option<bool>,
-    case_sensitive: Option<bool>,
-    glob: Option<bool>,
-    full_path: Option<bool>,
-    follow: Option<bool>,
-    max_depth: Option<i64>,
-    min_depth: Option<i64>,
-    file_type: Option<String>,
-    extension: Option<String>,
-    exclude: Option<RArray>,
-    min_size: Option<i64>,
-    max_size: Option<i64>,
-    changed_within: Option<i64>,
-    changed_before: Option<i64>,
+fn extract_array<T: TryConvert>(hash: RHash, key: &LazyId) -> Result<Option<Vec<T>>, Error> {
+    let Some(array) = extract_optional_arg::<RArray>(hash, key)? else {
+        return Ok(None);
+    };
+
+    array
+        .into_iter()
+        .map(TryConvert::try_convert)
+        .collect::<Result<Vec<T>, Error>>()
+        .map(Some)
 }
 
-fn extract_search_params(kwargs: RHash) -> Result<SearchParams, Error> {
-    Ok(SearchParams {
-        pattern: extract_optional_arg(kwargs, &PATTERN)?,
-        paths: extract_optional_arg(kwargs, &PATHS)?,
-        hidden: extract_optional_arg(kwargs, &HIDDEN)?,
-        no_ignore: extract_optional_arg(kwargs, &NO_IGNORE)?,
-        case_sensitive: extract_optional_arg(kwargs, &CASE_SENSITIVE)?,
-        glob: extract_optional_arg(kwargs, &GLOB)?,
-        full_path: extract_optional_arg(kwargs, &FULL_PATH)?,
-        follow: extract_optional_arg(kwargs, &FOLLOW)?,
-        max_depth: extract_optional_arg(kwargs, &MAX_DEPTH)?,
-        min_depth: extract_optional_arg(kwargs, &MIN_DEPTH)?,
-        file_type: extract_optional_arg(kwargs, &TYPE)?,
+/// Extracts an optional non-negative `Integer`, rejecting `Float` and other
+/// numerics that `i64` conversion would silently truncate.
+fn non_negative<T: TryFrom<i64>>(
+    ruby: &Ruby,
+    kwargs: RHash,
+    key: &LazyId,
+    name: &str,
+) -> Result<Option<T>, Error> {
+    let Some(value) = kwargs.get(**key).filter(|value| !value.is_nil()) else {
+        return Ok(None);
+    };
+
+    if !value.is_kind_of(ruby.class_integer()) {
+        return Err(Error::new(
+            ruby.exception_type_error(),
+            format!("no implicit conversion of {} into Integer", value.class()),
+        ));
+    }
+
+    let number = i64::try_convert(value)?;
+    T::try_from(number)
+        .ok()
+        .filter(|_| number >= 0)
+        .map(Some)
+        .ok_or_else(|| {
+            Error::new(
+                ruby.exception_arg_error(),
+                format!("{name} must be a non-negative integer, got {number}"),
+            )
+        })
+}
+
+fn extract_file_type(ruby: &Ruby, kwargs: RHash) -> Result<Option<String>, Error> {
+    let file_type: Option<String> = extract_optional_arg(kwargs, &TYPE)?;
+
+    if let Some(ref file_type) = file_type
+        && !FILE_TYPES.contains(&file_type.as_str())
+    {
+        return Err(Error::new(
+            ruby.exception_arg_error(),
+            format!(
+                "type must be one of {}, got {file_type}",
+                FILE_TYPES.join(", ")
+            ),
+        ));
+    }
+
+    Ok(file_type)
+}
+
+/// Builds a config from `kwargs`, taking `SearchConfig::pattern` from
+/// `pattern_key`, which is `:pattern` for search and `:name` for grep.
+fn build_search_config(
+    ruby: &Ruby,
+    kwargs: RHash,
+    pattern_key: &LazyId,
+) -> Result<SearchConfig, Error> {
+    Ok(SearchConfig {
+        pattern: extract_optional_arg(kwargs, pattern_key)?,
+        // PathBuf conversion accepts any byte sequence on Unix, so
+        // non-UTF-8 paths can be searched.
+        paths: extract_array(kwargs, &PATHS)?.unwrap_or_default(),
+        hidden: extract_optional_arg(kwargs, &HIDDEN)?.unwrap_or_default(),
+        no_ignore: extract_optional_arg(kwargs, &NO_IGNORE)?.unwrap_or_default(),
+        case_sensitive: extract_optional_arg(kwargs, &CASE_SENSITIVE)?.unwrap_or_default(),
+        glob: extract_optional_arg(kwargs, &GLOB)?.unwrap_or_default(),
+        full_path: extract_optional_arg(kwargs, &FULL_PATH)?.unwrap_or_default(),
+        follow: extract_optional_arg(kwargs, &FOLLOW)?.unwrap_or_default(),
+        max_depth: non_negative(ruby, kwargs, &MAX_DEPTH, "max_depth")?,
+        min_depth: non_negative(ruby, kwargs, &MIN_DEPTH, "min_depth")?,
+        file_type: extract_file_type(ruby, kwargs)?,
         extension: extract_optional_arg(kwargs, &EXTENSION)?,
-        exclude: extract_optional_arg(kwargs, &EXCLUDE)?,
-        min_size: extract_optional_arg(kwargs, &MIN_SIZE)?,
-        max_size: extract_optional_arg(kwargs, &MAX_SIZE)?,
-        changed_within: extract_optional_arg(kwargs, &CHANGED_WITHIN)?,
-        changed_before: extract_optional_arg(kwargs, &CHANGED_BEFORE)?,
+        exclude: extract_array(kwargs, &EXCLUDE)?.unwrap_or_default(),
+        min_size: non_negative(ruby, kwargs, &MIN_SIZE, "min_size")?,
+        max_size: non_negative(ruby, kwargs, &MAX_SIZE, "max_size")?,
+        changed_within: non_negative(ruby, kwargs, &CHANGED_WITHIN, "changed_within")?,
+        changed_before: non_negative(ruby, kwargs, &CHANGED_BEFORE, "changed_before")?,
     })
-}
-
-fn validate_file_type(ruby: &Ruby, file_type: &str) -> Result<(), Error> {
-    if FILE_TYPES.contains(&file_type) {
-        return Ok(());
-    }
-
-    Err(Error::new(
-        ruby.exception_arg_error(),
-        format!(
-            "type must be one of {}, got {file_type}",
-            FILE_TYPES.join(", ")
-        ),
-    ))
-}
-
-fn build_search_config(ruby: &Ruby, params: SearchParams) -> Result<SearchConfig, Error> {
-    let mut config = SearchConfig::default();
-
-    if let Some(pattern) = params.pattern {
-        config.pattern = Some(pattern);
-    }
-
-    if let Some(paths_array) = params.paths {
-        let mut paths_vec = Vec::with_capacity(paths_array.len());
-        for path_val in paths_array {
-            let path_str: String = TryConvert::try_convert(path_val)?;
-            paths_vec.push(PathBuf::from(path_str));
-        }
-        config.paths = paths_vec;
-    }
-
-    if let Some(hidden) = params.hidden {
-        config.hidden = hidden;
-    }
-    if let Some(no_ignore) = params.no_ignore {
-        config.no_ignore = no_ignore;
-    }
-    if let Some(case_sensitive) = params.case_sensitive {
-        config.case_sensitive = case_sensitive;
-    }
-    if let Some(glob) = params.glob {
-        config.glob = glob;
-    }
-    if let Some(full_path) = params.full_path {
-        config.full_path = full_path;
-    }
-    if let Some(follow) = params.follow {
-        config.follow = follow;
-    }
-
-    if let Some(max_depth) = params.max_depth {
-        let max_depth_usize = usize::try_from(max_depth).map_err(|_| {
-            Error::new(
-                ruby.exception_arg_error(),
-                format!("max_depth must be a non-negative integer, got {max_depth}"),
-            )
-        })?;
-        config.max_depth = Some(max_depth_usize);
-    }
-
-    if let Some(min_depth) = params.min_depth {
-        let min_depth_usize = usize::try_from(min_depth).map_err(|_| {
-            Error::new(
-                ruby.exception_arg_error(),
-                format!("min_depth must be a non-negative integer, got {min_depth}"),
-            )
-        })?;
-        config.min_depth = Some(min_depth_usize);
-    }
-
-    if let Some(file_type) = params.file_type {
-        validate_file_type(ruby, &file_type)?;
-        config.file_type = Some(file_type);
-    }
-
-    if let Some(extension) = params.extension {
-        config.extension = Some(extension);
-    }
-
-    if let Some(exclude_array) = params.exclude {
-        let mut excludes = Vec::with_capacity(exclude_array.len());
-        for exclude_val in exclude_array {
-            excludes.push(TryConvert::try_convert(exclude_val)?);
-        }
-        config.exclude = excludes;
-    }
-
-    if let Some(min_size) = params.min_size {
-        let min_size_u64 = u64::try_from(min_size).map_err(|_| {
-            Error::new(
-                ruby.exception_arg_error(),
-                format!("min_size must be a non-negative integer, got {min_size}"),
-            )
-        })?;
-        config.min_size = Some(min_size_u64);
-    }
-
-    if let Some(max_size) = params.max_size {
-        let max_size_u64 = u64::try_from(max_size).map_err(|_| {
-            Error::new(
-                ruby.exception_arg_error(),
-                format!("max_size must be a non-negative integer, got {max_size}"),
-            )
-        })?;
-        config.max_size = Some(max_size_u64);
-    }
-
-    if let Some(changed_within) = params.changed_within {
-        if changed_within < 0 {
-            return Err(Error::new(
-                ruby.exception_arg_error(),
-                format!("changed_within must be a non-negative integer, got {changed_within}"),
-            ));
-        }
-        config.changed_within = Some(changed_within);
-    }
-
-    if let Some(changed_before) = params.changed_before {
-        if changed_before < 0 {
-            return Err(Error::new(
-                ruby.exception_arg_error(),
-                format!("changed_before must be a non-negative integer, got {changed_before}"),
-            ));
-        }
-        config.changed_before = Some(changed_before);
-    }
-
-    Ok(config)
 }
 
 fn core_error(ruby: &Ruby, operation: &str, error: &SearchError) -> Error {
@@ -316,14 +227,13 @@ fn depth_range_is_empty(config: &SearchConfig) -> bool {
 
 fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
-    let params = extract_search_params(args_scan.keywords)?;
-    let config = build_search_config(ruby, params)?;
+    let config = build_search_config(ruby, args_scan.keywords, &PATTERN)?;
 
     if depth_range_is_empty(&config) {
         return Ok(ruby.ary_new());
     }
 
-    let results = interruptible(|cancel| search_with_cancel(&config, cancel))?
+    let results = interruptible(ruby, |cancel| search_with_cancel(&config, cancel))?
         .map_err(|err| core_error(ruby, "Search", &err))?;
 
     Ok(ruby.ary_from_vec(results))
@@ -332,29 +242,24 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
 fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
     let kwargs = args_scan.keywords;
-    let mut params = extract_search_params(kwargs)?;
-    let pattern = params
-        .pattern
-        .take()
+    let pattern: String = extract_optional_arg(kwargs, &PATTERN)?
         .ok_or_else(|| Error::new(ruby.exception_arg_error(), "missing keyword: pattern"))?;
-    params.pattern = extract_optional_arg(kwargs, &NAME)?;
-    let search = build_search_config(ruby, params)?;
+    let search = build_search_config(ruby, kwargs, &NAME)?;
 
     if depth_range_is_empty(&search) {
         return Ok(ruby.hash_new());
     }
 
     let config = GrepConfig { pattern, search };
-    let results = interruptible(|cancel| grep_with_cancel(&config, cancel))?
+    let results = interruptible(ruby, |cancel| grep_with_cancel(&config, cancel))?
         .map_err(|err| core_error(ruby, "Grep", &err))?;
     let ruby_results = ruby.hash_new();
 
     for result in results {
-        let line_numbers = ruby.ary_new();
-        for line_number in result.line_numbers {
-            line_numbers.push(line_number)?;
-        }
-        ruby_results.aset(ruby.str_new(&result.path), line_numbers)?;
+        ruby_results.aset(
+            ruby.str_new(&result.path),
+            ruby.ary_from_vec(result.line_numbers),
+        )?;
     }
 
     Ok(ruby_results)

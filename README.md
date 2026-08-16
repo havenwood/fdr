@@ -126,7 +126,7 @@ Search is case-sensitive by default and works one line at a time, so patterns ca
 
 Some non-CLI `fd` features `Fdr` lacks: owner filters, nonfile types, smart case switching and `.fdignore` support.
 
-Filenames that aren't valid UTF-8 come back with `U+FFFD` replacements, as in `fd`'s output, so they can't be reopened as returned. Colliding replacement paths in `Fdr.grep` share one result with merged line numbers.
+Filenames that aren't valid UTF-8 come back with `U+FFFD` replacements, as in `fd`'s output, so they can't be reopened as returned. Input `paths` accept any byte sequence, including `Pathname` objects and non-UTF-8 strings. Colliding replacement paths in `Fdr.grep` share one result with merged line numbers.
 
 ## Releasing
 
