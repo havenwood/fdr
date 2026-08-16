@@ -6,14 +6,15 @@ use magnus::scan_args::scan_args;
 use magnus::{Error, RArray, RHash, RString, Ruby, TryConvert, Value, function, prelude::*};
 use std::path::PathBuf;
 
-fn extract_optional_arg<T: TryConvert>(ruby: &Ruby, hash: RHash, key: &str) -> Option<T> {
-    hash.get(ruby.to_symbol(key)).and_then(|val| {
-        if val.is_nil() {
-            None
-        } else {
-            TryConvert::try_convert(val).ok()
-        }
-    })
+fn extract_optional_arg<T: TryConvert>(
+    ruby: &Ruby,
+    hash: RHash,
+    key: &str,
+) -> Result<Option<T>, Error> {
+    hash.get(ruby.to_symbol(key))
+        .filter(|val| !val.is_nil())
+        .map(TryConvert::try_convert)
+        .transpose()
 }
 
 struct SearchParams {
@@ -36,26 +37,26 @@ struct SearchParams {
     changed_before: Option<i64>,
 }
 
-fn extract_search_params(ruby: &Ruby, kwargs: RHash) -> SearchParams {
-    SearchParams {
-        pattern: extract_optional_arg(ruby, kwargs, "pattern"),
-        paths: extract_optional_arg(ruby, kwargs, "paths"),
-        hidden: extract_optional_arg(ruby, kwargs, "hidden"),
-        no_ignore: extract_optional_arg(ruby, kwargs, "no_ignore"),
-        case_sensitive: extract_optional_arg(ruby, kwargs, "case_sensitive"),
-        glob: extract_optional_arg(ruby, kwargs, "glob"),
-        full_path: extract_optional_arg(ruby, kwargs, "full_path"),
-        follow: extract_optional_arg(ruby, kwargs, "follow"),
-        max_depth: extract_optional_arg(ruby, kwargs, "max_depth"),
-        min_depth: extract_optional_arg(ruby, kwargs, "min_depth"),
-        file_type: extract_optional_arg(ruby, kwargs, "type"),
-        extension: extract_optional_arg(ruby, kwargs, "extension"),
-        exclude: extract_optional_arg(ruby, kwargs, "exclude"),
-        min_size: extract_optional_arg(ruby, kwargs, "min_size"),
-        max_size: extract_optional_arg(ruby, kwargs, "max_size"),
-        changed_within: extract_optional_arg(ruby, kwargs, "changed_within"),
-        changed_before: extract_optional_arg(ruby, kwargs, "changed_before"),
-    }
+fn extract_search_params(ruby: &Ruby, kwargs: RHash) -> Result<SearchParams, Error> {
+    Ok(SearchParams {
+        pattern: extract_optional_arg(ruby, kwargs, "pattern")?,
+        paths: extract_optional_arg(ruby, kwargs, "paths")?,
+        hidden: extract_optional_arg(ruby, kwargs, "hidden")?,
+        no_ignore: extract_optional_arg(ruby, kwargs, "no_ignore")?,
+        case_sensitive: extract_optional_arg(ruby, kwargs, "case_sensitive")?,
+        glob: extract_optional_arg(ruby, kwargs, "glob")?,
+        full_path: extract_optional_arg(ruby, kwargs, "full_path")?,
+        follow: extract_optional_arg(ruby, kwargs, "follow")?,
+        max_depth: extract_optional_arg(ruby, kwargs, "max_depth")?,
+        min_depth: extract_optional_arg(ruby, kwargs, "min_depth")?,
+        file_type: extract_optional_arg(ruby, kwargs, "type")?,
+        extension: extract_optional_arg(ruby, kwargs, "extension")?,
+        exclude: extract_optional_arg(ruby, kwargs, "exclude")?,
+        min_size: extract_optional_arg(ruby, kwargs, "min_size")?,
+        max_size: extract_optional_arg(ruby, kwargs, "max_size")?,
+        changed_within: extract_optional_arg(ruby, kwargs, "changed_within")?,
+        changed_before: extract_optional_arg(ruby, kwargs, "changed_before")?,
+    })
 }
 
 fn build_search_config(ruby: &Ruby, params: SearchParams) -> Result<SearchConfig, Error> {
@@ -186,7 +187,7 @@ fn line_string(ruby: &Ruby, line: &[u8]) -> Result<RString, Error> {
 
 fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
-    let params = extract_search_params(ruby, args_scan.keywords);
+    let params = extract_search_params(ruby, args_scan.keywords)?;
     let config = build_search_config(ruby, params)?;
 
     if depth_range_is_empty(&config) {
@@ -210,10 +211,10 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
 fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
     let kwargs = args_scan.keywords;
-    let pattern: String = extract_optional_arg(ruby, kwargs, "pattern")
+    let pattern: String = extract_optional_arg(ruby, kwargs, "pattern")?
         .ok_or_else(|| Error::new(ruby.exception_arg_error(), "missing keyword: pattern"))?;
-    let mut params = extract_search_params(ruby, kwargs);
-    params.pattern = extract_optional_arg(ruby, kwargs, "name");
+    let mut params = extract_search_params(ruby, kwargs)?;
+    params.pattern = extract_optional_arg(ruby, kwargs, "name")?;
     let search = build_search_config(ruby, params)?;
 
     if depth_range_is_empty(&search) {
