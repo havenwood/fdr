@@ -388,6 +388,21 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
     search_with_cancel(config, &std::sync::atomic::AtomicBool::new(false))
 }
 
+/// Path to report for an entry, or `None` when it is filtered out.
+fn search_entry(entry: &ignore::DirEntry, filters: &EntryFilters) -> Option<String> {
+    // Path::is_dir follows symlinks, so a symlink-to-dir root is skipped
+    // consistently by the serial and parallel walkers.
+    if entry.depth() == 0 && entry.path().is_dir() {
+        return None;
+    }
+
+    if !filters.matches(entry) {
+        return None;
+    }
+
+    Some(path_to_string(entry.path()))
+}
+
 fn serial_search(
     builder: &ignore::WalkBuilder,
     filters: &EntryFilters,
@@ -409,17 +424,9 @@ fn serial_search(
             continue;
         };
 
-        // Path::is_dir follows symlinks, so a symlink-to-dir root is skipped
-        // consistently by the serial and parallel walkers.
-        if entry.depth() == 0 && entry.path().is_dir() {
-            continue;
+        if let Some(path) = search_entry(&entry, filters) {
+            results.push(path);
         }
-
-        if !filters.matches(&entry) {
-            continue;
-        }
-
-        results.push(path_to_string(entry.path()));
     }
 
     if cancel.load(Ordering::Relaxed) {
@@ -467,15 +474,9 @@ pub fn search_with_cancel(
                 return WalkState::Continue;
             };
 
-            if entry.depth() == 0 && entry.path().is_dir() {
-                return WalkState::Continue;
+            if let Some(path) = search_entry(&entry, &filters) {
+                batch.push(path);
             }
-
-            if !filters.matches(&entry) {
-                return WalkState::Continue;
-            }
-
-            batch.push(path_to_string(entry.path()));
 
             WalkState::Continue
         })
@@ -547,19 +548,65 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
     grep_with_cancel(config, &std::sync::atomic::AtomicBool::new(false))
 }
 
+fn build_searcher() -> grep_searcher::Searcher {
+    use grep_searcher::{BinaryDetection, SearcherBuilder};
+
+    SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(b'\0'))
+        .build()
+}
+
+/// Whether an entry is a file `grep` should scan.
+fn grep_candidate(entry: &ignore::DirEntry, filters: &EntryFilters) -> bool {
+    entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_file())
+        && filters.matches(entry)
+}
+
+/// Matching lines in `path`, or `None` when it is binary, unreadable, cancelled,
+/// or has no match.
+fn grep_file(
+    searcher: &mut grep_searcher::Searcher,
+    matcher: &grep_regex::RegexMatcher,
+    path: &std::path::Path,
+    cancel: &AtomicBool,
+) -> Option<GrepResult> {
+    let mut collector = LineCollector {
+        line_numbers: Vec::new(),
+        binary: false,
+    };
+    let file = std::fs::File::open(path).ok()?;
+    let reader = CancellableReader {
+        inner: file,
+        cancel,
+    };
+
+    if searcher
+        .search_reader(matcher, reader, &mut collector)
+        .is_ok()
+        && !collector.binary
+        && !collector.line_numbers.is_empty()
+    {
+        Some(GrepResult {
+            path: path_to_string(path),
+            line_numbers: collector.line_numbers,
+        })
+    } else {
+        None
+    }
+}
+
 fn serial_grep(
     builder: &ignore::WalkBuilder,
     matcher: &grep_regex::RegexMatcher,
     filters: &EntryFilters,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<Vec<GrepResult>>, SearchError> {
-    use grep_searcher::{BinaryDetection, SearcherBuilder};
     use std::sync::atomic::Ordering;
 
-    let mut searcher = SearcherBuilder::new()
-        .line_number(true)
-        .binary_detection(BinaryDetection::quit(b'\0'))
-        .build();
+    let mut searcher = build_searcher();
     let mut results = Vec::new();
     let mut scanned_bytes = 0_u64;
 
@@ -575,14 +622,7 @@ fn serial_grep(
             continue;
         };
 
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
-            continue;
-        }
-
-        if !filters.matches(&entry) {
+        if !grep_candidate(&entry, filters) {
             continue;
         }
 
@@ -591,20 +631,8 @@ fn serial_grep(
             return Ok(None);
         }
 
-        let path = entry.path();
-        let mut collector = LineCollector {
-            line_numbers: Vec::new(),
-            binary: false,
-        };
-
-        if searcher.search_path(matcher, path, &mut collector).is_ok()
-            && !collector.binary
-            && !collector.line_numbers.is_empty()
-        {
-            results.push(GrepResult {
-                path: path_to_string(path),
-                line_numbers: collector.line_numbers,
-            });
+        if let Some(result) = grep_file(&mut searcher, matcher, entry.path(), cancel) {
+            results.push(result);
         }
     }
 
@@ -624,7 +652,6 @@ pub fn grep_with_cancel(
 ) -> Result<Vec<GrepResult>, SearchError> {
     use crossbeam_channel::unbounded;
     use grep_regex::RegexMatcherBuilder;
-    use grep_searcher::{BinaryDetection, SearcherBuilder};
     use ignore::WalkState;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -652,10 +679,7 @@ pub fn grep_with_cancel(
         let matcher = Arc::clone(&matcher);
         let filters = Arc::clone(&filters);
         let tx = tx.clone();
-        let mut searcher = SearcherBuilder::new()
-            .line_number(true)
-            .binary_detection(BinaryDetection::quit(b'\0'))
-            .build();
+        let mut searcher = build_searcher();
 
         Box::new(move |entry| {
             if cancel.load(Ordering::Relaxed) {
@@ -665,40 +689,13 @@ pub fn grep_with_cancel(
             let Ok(entry) = entry else {
                 return WalkState::Continue;
             };
-            if !entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
-            {
+
+            if !grep_candidate(&entry, &filters) {
                 return WalkState::Continue;
             }
 
-            if !filters.matches(&entry) {
-                return WalkState::Continue;
-            }
-
-            let path = entry.path();
-            let Ok(file) = std::fs::File::open(path) else {
-                return WalkState::Continue;
-            };
-            let reader = CancellableReader {
-                inner: file,
-                cancel,
-            };
-            let mut collector = LineCollector {
-                line_numbers: Vec::new(),
-                binary: false,
-            };
-
-            if searcher
-                .search_reader(matcher.as_ref(), reader, &mut collector)
-                .is_ok()
-                && !collector.binary
-                && !collector.line_numbers.is_empty()
-            {
-                drop(tx.send(GrepResult {
-                    path: path_to_string(path),
-                    line_numbers: collector.line_numbers,
-                }));
+            if let Some(result) = grep_file(&mut searcher, matcher.as_ref(), entry.path(), cancel) {
+                drop(tx.send(result));
             }
 
             WalkState::Continue
