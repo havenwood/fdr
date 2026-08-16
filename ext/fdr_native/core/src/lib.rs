@@ -108,6 +108,7 @@ fn build_extension_regex(
     use regex::bytes::RegexBuilder;
 
     if let Some(ref ext) = config.extension {
+        let ext = ext.strip_prefix('.').unwrap_or(ext);
         let pattern = format!(r"\.{}$", regex::escape(ext));
         Ok(Some(
             RegexBuilder::new(&pattern)
