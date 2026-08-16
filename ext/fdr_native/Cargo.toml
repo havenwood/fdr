@@ -5,6 +5,11 @@ resolver = "2"
 [workspace.dependencies]
 fdr-core = { path = "./core" }
 
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+
 [workspace.lints.clippy]
 # Clippy lint groups
 cargo = { level = "deny", priority = -1 }
