@@ -32,7 +32,7 @@ describe Fdr do
     it 'returns String paths that point to existing files' do
       results = Fdr.search(paths: ['lib'], max_depth: 1)
       refute_empty results
-      assert(results.all? { |result| result.is_a?(String) },
+      assert(results.all?(String),
              'all results should be String paths')
       assert(results.all? { |result| File.exist?(result) || File.symlink?(result) },
              'all paths should point to existing files or symlinks')

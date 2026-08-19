@@ -42,7 +42,7 @@ describe 'Fdr.search' do
       without_pattern = Fdr.search(paths: ['lib'], max_depth: 1)
 
       refute_empty without_pattern, 'should return files when no pattern given'
-      assert(without_pattern.all? { |p| p.is_a?(String) },
+      assert(without_pattern.all?(String),
              'results should be strings')
     end
 

@@ -155,8 +155,7 @@ fn matches_metadata_filters(
         let file_time = i64::try_from(duration_since_epoch.as_secs()).unwrap_or(i64::MAX);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
 
         if let Some(within_seconds) = changed_within {
             let cutoff = now.saturating_sub(within_seconds);
