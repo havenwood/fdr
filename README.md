@@ -1,13 +1,18 @@
 # Fdr
 
-`Fdr` is a fast file search gem for Ruby, implemented with a Rust native extension inspired directly by [fd](https://github.com/sharkdp/fd). `Fdr` uses the same core dependencies as `fd` and `ripgrep`, including [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore), [regex](https://github.com/rust-lang/regex), [globset](https://github.com/BurntSushi/ripgrep/tree/master/crates/globset) and [crossbeam-channel](https://github.com/crossbeam-rs/crossbeam).
+`Fdr` is a fast file search gem for Ruby, implemented with a Rust native extension inspired directly by [fd](https://github.com/sharkdp/fd). `Fdr` uses core crates from `fd` and `ripgrep`, including [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore), [regex](https://github.com/rust-lang/regex), [globset](https://github.com/BurntSushi/ripgrep/tree/master/crates/globset), [grep-searcher](https://github.com/BurntSushi/ripgrep/tree/master/crates/searcher) and [crossbeam-channel](https://github.com/crossbeam-rs/crossbeam).
 
 `Fdr` intentionally lacks an `fdr` executable, since `fd` is perfect for that job. If you need a fast file searching in a CLI tool use, use `fd`. If you need fast file searching from your Ruby code, use `Fdr`.
 
 ## Installation
 
+`Fdr` isn't published to RubyGems yet, so install it from a checkout. Have Rust on hand, since the native extension is compiled during install.
+
 ```bash
-gem install fdr
+git clone --depth=1 https://github.com/havenwood/fdr.git
+cd fdr
+bundle install
+bundle exec rake install
 ```
 
 ### Requirements
@@ -72,10 +77,34 @@ Fdr.search(
   changed_before: 604_800
 )
 
-# Aliases for `Fdr.search`, if you prefer:
+# Aliases for `Fdr.search`:
 Fdr.entries(extension: 'rb')
 Fdr.scan(extension: 'rb')
 ```
+
+### Grep
+
+`Fdr.grep` returns a path-sorted `Hash` of files and their one-based matching line numbers. Each line appears at most once.
+
+```ruby
+Fdr.grep(pattern: 'TODO|MARK', paths: %w[lib spec])
+# => {"lib/example.rb" => [7, 22], "spec/example_spec.rb" => [3]}
+```
+
+`pattern` searches file contents. Use `name` and the usual `Fdr.search` options to narrow down the files.
+
+```ruby
+Fdr.grep(
+  pattern: 'TODO',
+  name: '_spec\.rb$',
+  paths: %w[spec],
+  extension: 'rb',
+  max_depth: 3,
+  hidden: true
+)
+```
+
+Search is case-sensitive by default and works one line at a time, so patterns can't span lines. Binary files are skipped.
 
 ### Gaps
 
