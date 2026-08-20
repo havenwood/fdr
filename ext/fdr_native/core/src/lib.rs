@@ -339,9 +339,17 @@ fn matches_metadata_filters(
 }
 
 pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
+    search_with_cancel(config, &std::sync::atomic::AtomicBool::new(false))
+}
+
+pub fn search_with_cancel(
+    config: &SearchConfig,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<String>, SearchError> {
     use crossbeam_channel::unbounded;
     use ignore::WalkState;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     let filters = Arc::new(EntryFilters::new(config)?);
     let builder = build_walker(config)?;
@@ -357,6 +365,10 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
         let mut batch = ResultBatch::new(tx);
 
         Box::new(move |entry| {
+            if cancel.load(Ordering::Relaxed) {
+                return WalkState::Quit;
+            }
+
             let Ok(entry) = entry else {
                 return WalkState::Continue;
             };
@@ -376,6 +388,10 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
     });
 
     drop(tx);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(SearchError::Cancelled);
+    }
+
     let batches: Vec<Vec<String>> = rx.iter().collect();
     let total_size: usize = batches.iter().map(Vec::len).sum();
     let mut results = Vec::with_capacity(total_size);
@@ -419,11 +435,19 @@ impl grep_searcher::Sink for LineCollector {
 }
 
 pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
+    grep_with_cancel(config, &std::sync::atomic::AtomicBool::new(false))
+}
+
+pub fn grep_with_cancel(
+    config: &GrepConfig,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<GrepResult>, SearchError> {
     use crossbeam_channel::unbounded;
     use grep_regex::RegexMatcherBuilder;
     use grep_searcher::{BinaryDetection, SearcherBuilder};
     use ignore::WalkState;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     let mut matcher_builder = RegexMatcherBuilder::new();
     matcher_builder
@@ -450,6 +474,10 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
             .build();
 
         Box::new(move |entry| {
+            if cancel.load(Ordering::Relaxed) {
+                return WalkState::Quit;
+            }
+
             let Ok(entry) = entry else {
                 return WalkState::Continue;
             };
@@ -487,6 +515,10 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
     });
 
     drop(tx);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(SearchError::Cancelled);
+    }
+
     let mut results: Vec<GrepResult> = rx.iter().collect();
     results.sort_unstable_by(|a, b| a.path.cmp(&b.path));
 
