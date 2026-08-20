@@ -39,9 +39,10 @@ fn extract_optional_arg<T: TryConvert>(hash: RHash, key: &LazyId) -> Result<Opti
 }
 
 /// Runs `func` with the GVL released, so it must not touch any Ruby API.
-/// Ruby sets `cancel` when the calling thread is interrupted. Returns `None`
-/// without running `func` when an interrupt is already pending.
-fn without_gvl<F, R>(func: F, cancel: &AtomicBool) -> Option<R>
+/// Ruby sets `cancel` when the calling thread is interrupted, or runs `func`
+/// uninterrupted when no flag is given. Returns `None` without running `func`
+/// when an interrupt is already pending.
+fn without_gvl<F, R>(func: F, cancel: Option<&AtomicBool>) -> Option<R>
 where
     F: FnOnce() -> R,
 {
@@ -69,14 +70,19 @@ where
         func: Some(func),
         result: None,
     };
+    let interrupt_fn: unsafe extern "C" fn(*mut c_void) = interrupt;
+    let unblock = cancel.map(|_| interrupt_fn);
+    let unblock_arg = cancel.map_or(ptr::null_mut(), |cancel| {
+        ptr::from_ref(cancel).cast_mut().cast()
+    });
     // SAFETY: `call` runs synchronously while `state` is alive, and Ruby may
     // invoke `interrupt` with `cancel` from another thread while it runs.
     unsafe {
         rb_sys::rb_thread_call_without_gvl2(
             Some(call::<F, R>),
             (&raw mut state).cast(),
-            Some(interrupt),
-            ptr::from_ref(cancel).cast_mut().cast(),
+            unblock,
+            unblock_arg,
         );
     }
     match state.result {
@@ -86,8 +92,8 @@ where
     }
 }
 
-/// Retries transiently interrupted calls, then finishes while holding the GVL
-/// rather than raising for a handled signal or retrying forever.
+/// Retries transiently interrupted calls, then finishes uncancellable with
+/// the GVL still released, so a pending interrupt raises once the walk ends.
 fn interruptible<R>(
     ruby: &Ruby,
     run: impl Fn(&AtomicBool) -> Result<R, SearchError>,
@@ -97,7 +103,7 @@ fn interruptible<R>(
     let cancel = AtomicBool::new(false);
     for _ in 0..SPURIOUS_RETRIES {
         cancel.store(false, Ordering::Relaxed);
-        let outcome = without_gvl(|| run(&cancel), &cancel);
+        let outcome = without_gvl(|| run(&cancel), Some(&cancel));
         ruby.thread_check_ints()?;
         match outcome {
             None | Some(Err(SearchError::Cancelled)) => {}
@@ -105,7 +111,13 @@ fn interruptible<R>(
         }
     }
 
-    Ok(run(&AtomicBool::new(false)))
+    loop {
+        let outcome = without_gvl(|| run(&AtomicBool::new(false)), None);
+        ruby.thread_check_ints()?;
+        if let Some(result) = outcome {
+            return Ok(result);
+        }
+    }
 }
 
 fn extract_array<T: TryConvert>(hash: RHash, key: &LazyId) -> Result<Option<Vec<T>>, Error> {
