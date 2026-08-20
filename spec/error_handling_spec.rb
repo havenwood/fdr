@@ -181,12 +181,18 @@ describe 'Fdr error handling' do
   end
 
   describe 'invalid options' do
-    it 'handles unknown file types by ignoring the filter' do
-      results = Fdr.search(type: 'invalid', paths: ['.'], max_depth: 1)
-      all_files = Fdr.search(paths: ['.'], max_depth: 1)
-      assert_kind_of Array, results
-      assert_equal results.size, all_files.size,
-                   'invalid file type should be ignored'
+    it 'raises error for unknown file types' do
+      error = assert_raises(ArgumentError) do
+        Fdr.search(type: 'invalid', paths: ['.'], max_depth: 1)
+      end
+      assert_match(/type must be one of/, error.message)
+    end
+
+    it 'strips a leading dot from extension' do
+      with_dot = Fdr.search(extension: '.rb', paths: ['lib'], max_depth: 1)
+      without_dot = Fdr.search(extension: 'rb', paths: ['lib'], max_depth: 1)
+      refute_empty with_dot, 'a dotted extension should match like the bare extension'
+      assert_equal without_dot, with_dot
     end
 
     it 'handles empty extension by matching no files' do

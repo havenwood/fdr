@@ -142,6 +142,22 @@ fn extract_search_params(ruby: &Ruby, kwargs: RHash) -> Result<SearchParams, Err
     })
 }
 
+fn validate_file_type(ruby: &Ruby, file_type: &str) -> Result<(), Error> {
+    const FILE_TYPES: [&str; 7] = ["f", "file", "d", "dir", "directory", "l", "symlink"];
+
+    if FILE_TYPES.contains(&file_type) {
+        return Ok(());
+    }
+
+    Err(Error::new(
+        ruby.exception_arg_error(),
+        format!(
+            "type must be one of {}, got {file_type}",
+            FILE_TYPES.join(", ")
+        ),
+    ))
+}
+
 fn build_search_config(ruby: &Ruby, params: SearchParams) -> Result<SearchConfig, Error> {
     let mut config = SearchConfig::default();
 
@@ -198,6 +214,7 @@ fn build_search_config(ruby: &Ruby, params: SearchParams) -> Result<SearchConfig
     }
 
     if let Some(file_type) = params.file_type {
+        validate_file_type(ruby, &file_type)?;
         config.file_type = Some(file_type);
     }
 
