@@ -16,9 +16,8 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = '>= 3.2'
   spec.requirements << 'Rust 1.88 or newer'
   spec.files = (
-    %w[Gemfile LICENSE Rakefile README.md] +
+    %w[Gemfile LICENSE README.md] +
     Dir['lib/**/*.rb'] +
-    Dir['rakelib/**/*.rb'] +
     Dir['ext/**/*.{lock,rb,rs,toml}'].reject { |file| file.start_with?('ext/fdr_native/target/') }
   ).sort
   spec.require_paths = %w[lib]
