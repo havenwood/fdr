@@ -328,9 +328,7 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>> {
                 return WalkState::Continue;
             }
 
-            if let Some(path_str) = entry.path().to_str() {
-                batch.push(path_str.to_string());
-            }
+            batch.push(path_to_string(entry.path()));
 
             WalkState::Continue
         })
@@ -420,9 +418,6 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>> {
             }
 
             let path = entry.path();
-            let Some(path_str) = path.to_str() else {
-                return WalkState::Continue;
-            };
             let mut collector = LineCollector {
                 line_numbers: Vec::new(),
                 binary: false,
@@ -435,7 +430,7 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>> {
                 && !collector.line_numbers.is_empty()
             {
                 drop(tx.send(GrepResult {
-                    path: path_str.to_string(),
+                    path: path_to_string(path),
                     line_numbers: collector.line_numbers,
                 }));
             }
@@ -451,6 +446,10 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>> {
     Ok(results)
 }
 
+fn path_to_string(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 fn glob_to_regex(glob: &str) -> Result<String> {
     use globset::GlobBuilder;
 
@@ -462,6 +461,23 @@ fn glob_to_regex(glob: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_to_string_preserves_utf8() {
+        assert_eq!(
+            path_to_string(std::path::Path::new("lib/fdr.rb")),
+            "lib/fdr.rb"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_to_string_replaces_invalid_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(b"bad\xffname.txt"));
+        assert_eq!(path_to_string(path), "bad\u{FFFD}name.txt");
+    }
 
     #[test]
     fn glob_to_regex_converts_simple_glob() {
