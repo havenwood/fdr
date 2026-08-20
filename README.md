@@ -6,26 +6,24 @@
 
 ## Installation
 
-`Fdr` isn't published to RubyGems yet. You'll need Rust installed so the native extension can compile.
-
-Add it to your application's `Gemfile`, then run `bundle install`:
-
-```ruby
-gem 'fdr', github: 'havenwood/fdr'
-```
-
-Or install it from a checkout:
+Install `Fdr` from RubyGems:
 
 ```bash
-git clone --depth=1 https://github.com/havenwood/fdr.git
-cd fdr
-bundle install
-bundle exec rake install
+gem install fdr
 ```
 
+Or add it to your application's `Gemfile`, then run `bundle install`:
+
+```ruby
+gem 'fdr'
+```
+
+Precompiled gems are provided for x86-64 and ARM64 macOS, and for x86-64 and ARM64 Linux with glibc or musl. Other platforms build the extension from source.
+
 ### Requirements
+
 - Ruby 3.2+
-- Rust
+- Rust 1.88+ for source builds
 
 ## Usage
 

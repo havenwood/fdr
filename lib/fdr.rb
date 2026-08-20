@@ -1,7 +1,16 @@
 # frozen_string_literal: true
 
+require 'rbconfig'
 require 'fdr/version'
-require 'fdr/fdr_native'
+
+ruby_api_version = RUBY_VERSION[/\A\d+\.\d+/]
+versioned_extension = File.expand_path("fdr/#{ruby_api_version}/fdr_native", __dir__)
+extension_suffixes = [RbConfig::CONFIG['DLEXT'], RbConfig::CONFIG['DLEXT2']].compact.uniq
+versioned_extension = extension_suffixes
+                      .map { |suffix| "#{versioned_extension}.#{suffix}" }
+                      .find { |path| File.file?(path) }
+
+require versioned_extension || 'fdr/fdr_native'
 
 # Fast directory recursion for Ruby using Rust
 module Fdr

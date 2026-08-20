@@ -14,14 +14,19 @@ Gem::Specification.new do |spec|
   spec.homepage = 'https://github.com/havenwood/fdr'
   spec.licenses = %w[MIT]
   spec.required_ruby_version = '>= 3.2'
-  spec.files = %w[Gemfile LICENSE Rakefile README.md] +
-               Dir['lib/**/*.rb'] +
-               Dir['ext/**/*.{rb,rs,toml}']
+  spec.requirements << 'Rust 1.88 or newer'
+  spec.files = (
+    %w[Gemfile LICENSE Rakefile README.md] +
+    Dir['lib/**/*.rb'] +
+    Dir['rakelib/**/*.rb'] +
+    Dir['ext/**/*.{lock,rb,rs,toml}'].reject { |file| file.start_with?('ext/fdr_native/target/') }
+  ).sort
   spec.require_paths = %w[lib]
   spec.extensions = ['ext/fdr_native/extconf.rb']
 
-  spec.add_dependency 'rb_sys', '~> 0.9'
+  spec.add_dependency 'rb_sys', '~> 0.9.128'
   spec.metadata['rubygems_mfa_required'] = 'true'
+  spec.metadata['cargo_crate_name'] = 'fdr-native'
   spec.metadata['source_code_uri'] = 'https://github.com/havenwood/fdr'
   spec.metadata['bug_tracker_uri'] = 'https://github.com/havenwood/fdr/issues'
 end

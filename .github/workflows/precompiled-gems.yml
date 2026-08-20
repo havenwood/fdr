@@ -1,0 +1,123 @@
+name: Package gems
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Build source gem
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+
+      - name: Build and verify source gem
+        run: bundle exec rake gem:verify
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fdr-ruby
+          path: pkg/fdr-*.gem
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - arm64-darwin
+          - x86_64-darwin
+          - aarch64-linux-gnu
+          - x86_64-linux-gnu
+          - aarch64-linux-musl
+          - x86_64-linux-musl
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+
+      - name: Build precompiled gem
+        run: bundle exec rake "native:build[${{ matrix.platform }}]"
+
+      - name: Verify gem structure
+        run: bundle exec rake "native:verify[pkg/fdr-*-${{ matrix.platform }}.gem]"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fdr-${{ matrix.platform }}
+          path: pkg/fdr-*-${{ matrix.platform }}.gem
+          if-no-files-found: error
+
+  smoke:
+    name: Smoke ${{ matrix.target }} on Ruby ${{ matrix.ruby }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ['3.2', '3.3', '3.4', '4.0']
+        target: [arm64-darwin, x86_64-darwin, aarch64-linux-gnu, x86_64-linux-gnu]
+        include:
+          - target: arm64-darwin
+            runner: macos-26
+          - target: x86_64-darwin
+            runner: macos-26-intel
+          - target: aarch64-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-linux-gnu
+            runner: ubuntu-24.04
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fdr-${{ matrix.target }}
+          path: artifact
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+
+      - name: Install and load the precompiled gem
+        run: |
+          gem install artifact/*.gem --no-document
+          ruby -rfdr -e 'raise "native search failed" if Fdr.search(paths: ["artifact"], extension: "gem").empty?'
+
+  smoke-musl:
+    name: Smoke ${{ matrix.target }} on Ruby ${{ matrix.ruby }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ['3.2', '3.3', '3.4', '4.0']
+        target: [aarch64-linux-musl, x86_64-linux-musl]
+        include:
+          - target: aarch64-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-linux-musl
+            runner: ubuntu-24.04
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fdr-${{ matrix.target }}
+          path: artifact
+
+      - name: Install and load the precompiled gem on Alpine
+        run: |
+          docker run --rm --volume "$PWD/artifact:/gems:ro" "ruby:${{ matrix.ruby }}-alpine" sh -c \
+            'gem install /gems/*.gem --no-document && ruby -rfdr -e "raise %q[native search failed] if Fdr.search(paths: [%q[/gems]], extension: %q[gem]).empty?"'

@@ -5,6 +5,12 @@ plugins:
 AllCops:
   NewCops: enable
   TargetRubyVersion: 3.2
+  Exclude:
+    - ".bundle/**/*"
+    - "ext/fdr_native/target/**/*"
+    - "pkg/**/*"
+    - "tmp/**/*"
+    - "vendor/**/*"
 
 Metrics/BlockLength:
   Exclude:

@@ -2,6 +2,7 @@
 vendor/
 Gemfile.lock
 pkg/
+/tmp/
 *.gem
 *.bundle
 *.so
@@ -11,7 +12,6 @@ pkg/
 lib/fdr/fdr_native.bundle
 lib/fdr/fdr_native.so
 ext/fdr_native/target/
-ext/fdr_native/Cargo.lock
 ext/fdr_native/Makefile
 ext/fdr_native/mkmf.log
 ext/fdr_native/tmp/
