@@ -53,6 +53,56 @@ fn search_empty_directory_returns_empty() {
 }
 
 #[test]
+fn search_crosses_the_parallel_threshold() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+
+    for index in 0..1500 {
+        let file = temp_path.join(format!("file_{index:04}.txt"));
+        File::create(&file).expect("should create file");
+    }
+
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(temp_path)],
+        file_type: Some("f".to_string()),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert_eq!(
+        results.len(),
+        1500,
+        "parallel fallback should find every file"
+    );
+}
+
+#[test]
+fn search_matches_across_the_parallel_threshold_boundary() {
+    for &file_count in &[1023, 1024, 1025] {
+        let temp_dir = TempDir::new().expect("should create temp dir");
+        let temp_path = temp_dir.path();
+
+        for index in 0..file_count {
+            let file = temp_path.join(format!("file_{index:04}.txt"));
+            File::create(&file).expect("should create file");
+        }
+
+        let config = SearchConfig {
+            paths: vec![PathBuf::from(temp_path)],
+            file_type: Some("f".to_string()),
+            ..Default::default()
+        };
+
+        let results = search(&config).expect("search should succeed");
+        assert_eq!(
+            results.len(),
+            file_count,
+            "serial and parallel walks should agree at {file_count} files"
+        );
+    }
+}
+
+#[test]
 fn search_large_result_set() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
