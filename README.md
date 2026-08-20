@@ -118,6 +118,8 @@ Search is case-sensitive by default and works one line at a time, so patterns ca
 
 Some non-CLI `fd` features `Fdr` lacks: owner filters, nonfile types, smart case switching and `.fdignore` support.
 
+Filenames that aren't valid UTF-8 come back with `U+FFFD` replacements, as in `fd`'s output, so they can't be reopened as returned.
+
 ## Releasing
 
 Precompiled gems come from the `Package gems` workflow. `scripts/fetch-gems` downloads and verifies them into `gems/`.
