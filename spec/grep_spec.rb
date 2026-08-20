@@ -146,7 +146,7 @@ describe 'Fdr.grep' do
     end
 
     it 'raises for an invalid regex pattern' do
-      error = assert_raises(RuntimeError) do
+      error = assert_raises(ArgumentError) do
         Fdr.grep(pattern: '[invalid', paths: [@tmpdir])
       end
 
@@ -154,7 +154,7 @@ describe 'Fdr.grep' do
     end
 
     it 'raises for a pattern spanning lines' do
-      error = assert_raises(RuntimeError) do
+      error = assert_raises(ArgumentError) do
         Fdr.grep(pattern: "first\nNeedle", paths: [@tmpdir])
       end
 

@@ -229,12 +229,8 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
         return Ok(ruby.ary_new());
     }
 
-    let results = without_gvl(|| search(&config)).map_err(|err| {
-        Error::new(
-            ruby.exception_runtime_error(),
-            format!("Search failed: {err}"),
-        )
-    })?;
+    let results = without_gvl(|| search(&config))
+        .map_err(|err| Error::new(ruby.exception_arg_error(), format!("Search failed: {err}")))?;
     let ruby_array = ruby.ary_new();
     for result in results {
         ruby_array.push(ruby.str_new(&result))?;
@@ -257,12 +253,8 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
     }
 
     let config = GrepConfig { pattern, search };
-    let results = without_gvl(|| grep(&config)).map_err(|err| {
-        Error::new(
-            ruby.exception_runtime_error(),
-            format!("Grep failed: {err}"),
-        )
-    })?;
+    let results = without_gvl(|| grep(&config))
+        .map_err(|err| Error::new(ruby.exception_arg_error(), format!("Grep failed: {err}")))?;
     let ruby_results = ruby.hash_new();
 
     for result in results {
