@@ -95,7 +95,7 @@ fn search_case_sensitive_distinguishes_case() {
 #[test]
 fn search_full_path_matches_directory_names() {
     let config = SearchConfig {
-        pattern: Some("src".to_string()),
+        pattern: Some("^/.*/src$".to_string()),
         full_path: true,
         paths: vec![PathBuf::from(".")],
         max_depth: Some(3),
@@ -104,8 +104,8 @@ fn search_full_path_matches_directory_names() {
 
     let results = search(&config).expect("search should succeed");
     assert!(
-        results.iter().any(|path| path.contains("src")),
-        "full path search should match directory names in path"
+        results.iter().any(|path| path.ends_with("src")),
+        "full path search should match directory names in the absolute path"
     );
 }
 
