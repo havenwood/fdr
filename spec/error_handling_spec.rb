@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'tmpdir'
 require_relative 'spec_helper'
 
 describe 'Fdr error handling' do
@@ -144,6 +145,38 @@ describe 'Fdr error handling' do
       assert_raises(TypeError) do
         Fdr.grep(pattern: 42, paths: ['lib'])
       end
+    end
+
+    it 'accepts truthy values for boolean kwargs' do
+      Dir.mktmpdir('fdr-truthy') do |dir|
+        File.write(File.join(dir, '.hidden.txt'), '')
+        with_string = Fdr.search(paths: [dir], hidden: 'yes')
+        with_true = Fdr.search(paths: [dir], hidden: true)
+        refute_empty with_string, 'truthy hidden should include hidden files'
+        assert_equal with_true, with_string, 'truthy non-boolean should behave like true'
+      end
+    end
+  end
+
+  describe 'invalid size and time values' do
+    it 'raises error for negative min_size' do
+      error = assert_raises(ArgumentError) { Fdr.search(paths: ['.'], min_size: -1) }
+      assert_match(/min_size must be a non-negative integer/, error.message)
+    end
+
+    it 'raises error for negative max_size' do
+      error = assert_raises(ArgumentError) { Fdr.search(paths: ['.'], max_size: -1) }
+      assert_match(/max_size must be a non-negative integer/, error.message)
+    end
+
+    it 'raises error for negative changed_within' do
+      error = assert_raises(ArgumentError) { Fdr.search(paths: ['.'], changed_within: -1) }
+      assert_match(/changed_within must be a non-negative integer/, error.message)
+    end
+
+    it 'raises error for negative changed_before' do
+      error = assert_raises(ArgumentError) { Fdr.search(paths: ['.'], changed_before: -1) }
+      assert_match(/changed_before must be a non-negative integer/, error.message)
     end
   end
 

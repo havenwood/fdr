@@ -18,6 +18,16 @@ class NativeLoaderSpec < Minitest::Test
     end
   end
 
+  def test_reports_a_missing_native_extension
+    Dir.mktmpdir('fdr-native-loader') do |directory|
+      lib = build_versioned_library(directory, nil)
+      stderr, status = load_fdr(lib)
+
+      refute status.success?, 'loading without any native extension should fail'
+      assert_match(%r{fdr/fdr_native}, stderr)
+    end
+  end
+
   private
 
   def compiled_extension
@@ -31,7 +41,7 @@ class NativeLoaderSpec < Minitest::Test
     FileUtils.mkdir_p(versioned)
     FileUtils.cp(File.expand_path('../lib/fdr.rb', __dir__), lib)
     FileUtils.cp(File.expand_path('../lib/fdr/version.rb', __dir__), fdr)
-    FileUtils.cp(extension, File.join(versioned, File.basename(extension)))
+    FileUtils.cp(extension, File.join(versioned, File.basename(extension))) if extension
     lib
   end
 
