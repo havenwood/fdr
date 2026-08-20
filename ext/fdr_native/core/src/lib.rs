@@ -1,5 +1,4 @@
 //! File search library in the style of `fd`
-use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(Debug, Default)]
@@ -55,8 +54,8 @@ pub struct GrepResult {
 
 #[derive(Debug)]
 pub enum SearchError {
-    InvalidRegex(anyhow::Error),
-    InvalidInput(anyhow::Error),
+    InvalidRegex(String),
+    InvalidInput(String),
     Io(std::io::Error),
     Cancelled,
 }
@@ -64,7 +63,9 @@ pub enum SearchError {
 impl std::fmt::Display for SearchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidRegex(error) | Self::InvalidInput(error) => error.fmt(formatter),
+            Self::InvalidRegex(message) | Self::InvalidInput(message) => {
+                formatter.write_str(message)
+            }
             Self::Io(error) => error.fmt(formatter),
             Self::Cancelled => formatter.write_str("interrupted"),
         }
@@ -78,7 +79,7 @@ fn build_pattern_regex(config: &SearchConfig) -> Result<Option<regex::bytes::Reg
 
     if let Some(ref pat) = config.pattern {
         let regex_pattern = if config.glob {
-            glob_to_regex(pat).map_err(SearchError::InvalidInput)?
+            glob_to_regex(pat).map_err(|error| SearchError::InvalidInput(error.to_string()))?
         } else {
             pat.clone()
         };
@@ -89,9 +90,9 @@ fn build_pattern_regex(config: &SearchConfig) -> Result<Option<regex::bytes::Reg
                 .build()
                 .map_err(|error| {
                     if config.glob {
-                        SearchError::InvalidInput(error.into())
+                        SearchError::InvalidInput(error.to_string())
                     } else {
-                        SearchError::InvalidRegex(error.into())
+                        SearchError::InvalidRegex(error.to_string())
                     }
                 })?,
         ))
@@ -114,7 +115,7 @@ fn build_extension_regex(
             RegexBuilder::new(&pattern)
                 .case_insensitive(true)
                 .build()
-                .map_err(|error| SearchError::InvalidInput(error.into()))?,
+                .map_err(|error| SearchError::InvalidInput(error.to_string()))?,
         ))
     } else {
         Ok(None)
@@ -301,12 +302,12 @@ fn configure_walker(
         for pattern in &config.exclude {
             overrides
                 .add(&format!("!{pattern}"))
-                .map_err(|error| SearchError::InvalidInput(error.into()))?;
+                .map_err(|error| SearchError::InvalidInput(error.to_string()))?;
         }
         builder.overrides(
             overrides
                 .build()
-                .map_err(|error| SearchError::InvalidInput(error.into()))?,
+                .map_err(|error| SearchError::InvalidInput(error.to_string()))?,
         );
     }
 
@@ -316,15 +317,8 @@ fn configure_walker(
 fn build_walker(config: &SearchConfig) -> Result<ignore::WalkBuilder, SearchError> {
     use ignore::WalkBuilder;
 
-    let search_paths: Vec<PathBuf> = if config.paths.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        config.paths.clone()
-    };
-
-    let (first_path, rest) = search_paths
-        .split_first()
-        .ok_or_else(|| SearchError::InvalidInput(anyhow::anyhow!("No paths to search")))?;
+    let default_path = PathBuf::from(".");
+    let (first_path, rest) = config.paths.split_first().unwrap_or((&default_path, &[]));
     let mut builder = WalkBuilder::new(first_path);
 
     for path in rest {
@@ -640,7 +634,7 @@ pub fn grep_with_cancel(
         .line_terminator(Some(b'\n'));
     let matcher = matcher_builder
         .build(&config.pattern)
-        .map_err(|error| SearchError::InvalidRegex(error.into()))?;
+        .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
     let filters = EntryFilters::new(&config.search)?;
     let builder = build_walker(&config.search)?;
 
@@ -695,7 +689,7 @@ fn path_to_string(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn glob_to_regex(glob: &str) -> Result<String> {
+fn glob_to_regex(glob: &str) -> Result<String, globset::Error> {
     use globset::GlobBuilder;
 
     let glob_pattern = GlobBuilder::new(glob).literal_separator(true).build()?;
