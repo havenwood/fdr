@@ -343,6 +343,8 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>> {
         results.extend(batch);
     }
 
+    results.sort_unstable();
+
     Ok(results)
 }
 

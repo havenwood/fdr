@@ -27,6 +27,8 @@ Precompiled gems are provided for x86-64 and ARM64 macOS, and for x86-64 and ARM
 
 ## Usage
 
+`Fdr.search` returns a path-sorted `Array` of matching paths.
+
 ```ruby
 require 'fdr'
 
