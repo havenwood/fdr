@@ -121,9 +121,9 @@ Some non-CLI `fd` features `Fdr` lacks: owner filters, nonfile types, smart case
 Precompiled gems come from the `Package gems` workflow. `scripts/fetch-gems` downloads and verifies them into `gems/`.
 
 1. Bump `lib/fdr/version.rb`, commit and tag.
-2. `gh workflow run "Package gems"`
-3. `scripts/fetch-gems`
-4. `git push && git push --tags`
+2. `git push && git push --tags`
+3. `gh workflow run "Package gems" && gh run watch`
+4. `scripts/fetch-gems`
 5. `for gem in gems/*.gem ; do gem push "$gem" ; done`
 
 ## Attribution
