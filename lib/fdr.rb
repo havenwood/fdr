@@ -10,7 +10,13 @@ versioned_extension = extension_suffixes
                       .map { |suffix| "#{versioned_extension}.#{suffix}" }
                       .find { |path| File.file?(path) }
 
-require versioned_extension || 'fdr/fdr_native'
+begin
+  require versioned_extension || 'fdr/fdr_native'
+rescue LoadError => e
+  raise LoadError, "Failed to load the fdr native extension for Ruby #{ruby_api_version} on " \
+                   "#{RUBY_PLATFORM} (#{e.message}). " \
+                   'Install Rust and reinstall fdr to build from source.'
+end
 
 # Fast directory recursion for Ruby using Rust
 module Fdr

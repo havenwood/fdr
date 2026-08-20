@@ -24,7 +24,8 @@ class NativeLoaderSpec < Minitest::Test
       stderr, status = load_fdr(lib)
 
       refute status.success?, 'loading without any native extension should fail'
-      assert_match(%r{fdr/fdr_native}, stderr)
+      assert_match(/native extension for Ruby #{Regexp.escape(RUBY_VERSION[/\A\d+\.\d+/])}/, stderr)
+      assert_match(/Install Rust/, stderr)
     end
   end
 
