@@ -116,6 +116,16 @@ Search is case-sensitive by default and works one line at a time, so patterns ca
 
 Some non-CLI `fd` features `Fdr` lacks: owner filters, nonfile types, smart case switching and `.fdignore` support.
 
+## Releasing
+
+Precompiled gems come from the `Package gems` workflow. `scripts/fetch-gems` downloads and verifies them into `gems/`.
+
+1. Bump `lib/fdr/version.rb`, commit and tag.
+2. `gh workflow run "Package gems"`
+3. `scripts/fetch-gems`
+4. `git push && git push --tags`
+5. `for gem in gems/*.gem ; do gem push "$gem" ; done`
+
 ## Attribution
 
 `Fdr` directly borrows code from `fd`, under an MIT license.

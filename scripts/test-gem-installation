@@ -1,0 +1,35 @@
+#! /usr/bin/env ruby
+# frozen_string_literal: true
+
+# install the gem matching this machine and smoke-test it
+
+require 'rubygems/package'
+require 'tmpdir'
+
+abort "USAGE: #{File.basename(__FILE__)} <gem>..." if ARGV.empty?
+
+gem_path = ARGV.find do |path|
+  spec = Gem::Package.new(path).spec
+
+  spec.platform != 'ruby' && Gem::Platform.match_spec?(spec)
+end
+
+abort "No gem matches #{Gem::Platform.local}" unless gem_path
+
+smoke_test = <<~'RUBY'
+  gem_home = ARGV.fetch(0)
+  Gem.use_paths(gem_home)
+  require 'fdr'
+
+  raise 'Fdr.search returned no gems' if Fdr.search(paths: [gem_home], extension: 'gem').empty?
+
+  puts "Verified installed Fdr #{Fdr::VERSION}"
+RUBY
+
+Dir.mktmpdir('fdr-gem-installation') do |directory|
+  gem_home = File.join(directory, 'gem-home')
+
+  system(Gem.ruby, '-S', 'gem', 'install', gem_path, '--install-dir', gem_home, '--no-document',
+         exception: true)
+  system(Gem.ruby, '-e', smoke_test, gem_home, chdir: directory, exception: true)
+end

@@ -1,0 +1,27 @@
+#! /usr/bin/env bash
+# fetch the release gems built by the "Package gems" workflow
+set -o errexit
+set -o nounset
+set -x
+
+run=${1:-$(gh run list --workflow "Package gems" --status success --limit 1 --json databaseId --jq '.[0].databaseId')}
+
+if [[ "$(gh run view "$run" --json headSha --jq .headSha)" != "$(git rev-parse HEAD)" ]] ; then
+  echo "ERROR: run ${run} did not build this commit" >&2
+  exit 1
+fi
+
+rm -rf gems
+gh run download "$run" --dir gems
+mv gems/*/*.gem gems
+rmdir gems/*/
+
+for gem in gems/fdr-*-*.gem ; do
+  bundle exec rake "native:verify[${gem}]"
+done
+
+scripts/test-gem-installation gems/*.gem
+
+pushd gems
+  shasum -a 256 -- *.gem
+popd
