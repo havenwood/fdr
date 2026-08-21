@@ -4,6 +4,7 @@ require_relative "spec_helper"
 require "tmpdir"
 require "fileutils"
 require "open3"
+require "pathname"
 
 describe "Fdr search options" do
   describe "depth control" do
@@ -27,6 +28,26 @@ describe "Fdr search options" do
 
       assert_operator depth_2_only.size, "<=", less_restricted.size,
         "broader depth range should find at least as many files"
+    end
+
+    it "keeps directory pruning active with min_depth" do
+      Dir.mktmpdir("fdr-min-depth") do |dir|
+        Dir.mkdir(File.join(dir, ".git"))
+        File.write(File.join(dir, ".gitignore"), "ignored/\n")
+        %w[.hidden ignored excluded visible].each do |directory|
+          Dir.mkdir(File.join(dir, directory))
+          File.write(File.join(dir, directory, "file.txt"), "")
+        end
+
+        results = Fdr.search(
+          paths: [dir],
+          min_depth: 2,
+          type: "f",
+          exclude: %w[excluded]
+        )
+
+        assert_equal [File.join(dir, "visible", "file.txt")], results
+      end
     end
 
     it "returns empty when min_depth exceeds directory depth" do
@@ -76,6 +97,20 @@ describe "Fdr search options" do
       refute_empty results
       assert(results.none? { |result| result.start_with?("/") },
         "paths should be relative, not absolute")
+    end
+
+    it "accepts binary-encoded paths" do
+      results = Fdr.search(paths: ["lib".b], max_depth: 1)
+
+      refute_empty results
+      assert(results.all? { |result| result.start_with?("lib") },
+        "all results should be from lib directory")
+    end
+
+    it "accepts Pathname paths" do
+      results = Fdr.search(paths: [Pathname.new("lib")], max_depth: 1)
+
+      assert_includes results, "lib/fdr.rb"
     end
 
     it "limits results to specified paths only" do

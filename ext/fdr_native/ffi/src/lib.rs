@@ -6,7 +6,7 @@ use fdr_core::{
 };
 use magnus::scan_args::scan_args;
 use magnus::value::LazyId;
-use magnus::{Error, RArray, RHash, Ruby, TryConvert, Value, function, prelude::*};
+use magnus::{Error, RArray, RHash, Ruby, Symbol, TryConvert, Value, function, prelude::*};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr;
@@ -19,6 +19,7 @@ static PATHS: LazyId = LazyId::new("paths");
 static HIDDEN: LazyId = LazyId::new("hidden");
 static NO_IGNORE: LazyId = LazyId::new("no_ignore");
 static CASE_SENSITIVE: LazyId = LazyId::new("case_sensitive");
+static CONTENT_CASE_SENSITIVE: LazyId = LazyId::new("content_case_sensitive");
 static GLOB: LazyId = LazyId::new("glob");
 static FULL_PATH: LazyId = LazyId::new("full_path");
 static FOLLOW: LazyId = LazyId::new("follow");
@@ -148,6 +149,18 @@ fn extract_array<T: TryConvert>(hash: RHash, key: &LazyId) -> Result<Option<Vec<
         .map(Some)
 }
 
+fn extract_paths(hash: RHash) -> Result<Vec<std::path::PathBuf>, Error> {
+    let Some(value) = hash.get(*PATHS) else {
+        return Ok(Vec::new());
+    };
+    let array = RArray::try_convert(value)?;
+
+    array
+        .into_iter()
+        .map(TryConvert::try_convert)
+        .collect::<Result<Vec<_>, Error>>()
+}
+
 /// Extracts an optional non-negative `Integer`, rejecting `Float` and other
 /// numerics that `i64` conversion would silently truncate.
 fn non_negative<T: TryFrom<i64>>(
@@ -181,11 +194,16 @@ fn non_negative<T: TryFrom<i64>>(
 }
 
 fn extract_file_type(ruby: &Ruby, kwargs: RHash) -> Result<Option<String>, Error> {
-    let file_type: Option<String> = extract_optional_arg(kwargs, &TYPE)?;
+    let Some(value) = kwargs.get(*TYPE).filter(|value| !value.is_nil()) else {
+        return Ok(None);
+    };
+    let file_type = if let Some(symbol) = Symbol::from_value(value) {
+        symbol.name()?.into_owned()
+    } else {
+        String::try_convert(value)?
+    };
 
-    if let Some(ref file_type) = file_type
-        && !FILE_TYPES.contains(&file_type.as_str())
-    {
+    if !FILE_TYPES.contains(&file_type.as_str()) {
         return Err(Error::new(
             ruby.exception_arg_error(),
             format!(
@@ -195,7 +213,7 @@ fn extract_file_type(ruby: &Ruby, kwargs: RHash) -> Result<Option<String>, Error
         ));
     }
 
-    Ok(file_type)
+    Ok(Some(file_type))
 }
 
 /// Builds a config from `kwargs`, taking `SearchConfig::pattern` from
@@ -204,12 +222,13 @@ fn build_search_config(
     ruby: &Ruby,
     kwargs: RHash,
     pattern_key: &LazyId,
+    file_type: Option<String>,
 ) -> Result<SearchConfig, Error> {
     Ok(SearchConfig {
         pattern: extract_optional_arg(kwargs, pattern_key)?,
         // PathBuf conversion accepts any byte sequence on Unix, so
         // non-UTF-8 paths can be searched.
-        paths: extract_array(kwargs, &PATHS)?.unwrap_or_default(),
+        paths: extract_paths(kwargs)?,
         hidden: extract_optional_arg(kwargs, &HIDDEN)?.unwrap_or_default(),
         no_ignore: extract_optional_arg(kwargs, &NO_IGNORE)?.unwrap_or_default(),
         case_sensitive: extract_optional_arg(kwargs, &CASE_SENSITIVE)?.unwrap_or_default(),
@@ -218,7 +237,7 @@ fn build_search_config(
         follow: extract_optional_arg(kwargs, &FOLLOW)?.unwrap_or_default(),
         max_depth: non_negative(ruby, kwargs, &MAX_DEPTH, "max_depth")?,
         min_depth: non_negative(ruby, kwargs, &MIN_DEPTH, "min_depth")?,
-        file_type: extract_file_type(ruby, kwargs)?,
+        file_type,
         extension: extract_optional_arg(kwargs, &EXTENSION)?,
         exclude: extract_array(kwargs, &EXCLUDE)?.unwrap_or_default(),
         min_size: non_negative(ruby, kwargs, &MIN_SIZE, "min_size")?,
@@ -255,7 +274,9 @@ fn depth_range_is_empty(config: &SearchConfig) -> bool {
 
 fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
-    let config = build_search_config(ruby, args_scan.keywords, &PATTERN)?;
+    let kwargs = args_scan.keywords;
+    let file_type = extract_file_type(ruby, kwargs)?;
+    let config = build_search_config(ruby, kwargs, &PATTERN, file_type)?;
 
     if depth_range_is_empty(&config) {
         return Ok(ruby.ary_new());
@@ -275,13 +296,25 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
     let kwargs = args_scan.keywords;
     let pattern: String = extract_optional_arg(kwargs, &PATTERN)?
         .ok_or_else(|| Error::new(ruby.exception_arg_error(), "missing keyword: pattern"))?;
-    let search = build_search_config(ruby, kwargs, &NAME)?;
+    if kwargs.get(*TYPE).is_some() {
+        return Err(Error::new(
+            ruby.exception_arg_error(),
+            "unknown keyword: :type",
+        ));
+    }
+    let search = build_search_config(ruby, kwargs, &NAME, None)?;
+    let content_case_sensitive =
+        extract_optional_arg(kwargs, &CONTENT_CASE_SENSITIVE)?.unwrap_or(true);
 
     if depth_range_is_empty(&search) {
         return Ok(ruby.hash_new());
     }
 
-    let config = GrepConfig { pattern, search };
+    let config = GrepConfig {
+        pattern,
+        content_case_sensitive,
+        search,
+    };
     let cancel = Arc::new(AtomicBool::new(false));
     let results = interruptible(ruby, &cancel, move |cancel| {
         grep_with_cancel(&config, cancel)

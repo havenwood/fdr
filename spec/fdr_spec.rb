@@ -13,12 +13,9 @@ describe Fdr do
       assert Fdr.respond_to?(:grep), "Fdr.grep method should exist"
     end
 
-    it "responds to .entries alias" do
-      assert Fdr.respond_to?(:entries), "Fdr.entries method should exist"
-    end
-
-    it "responds to .scan alias" do
-      assert Fdr.respond_to?(:scan), "Fdr.scan method should exist"
+    it "does not expose ambiguous search aliases" do
+      refute_respond_to Fdr, :entries
+      refute_respond_to Fdr, :scan
     end
 
     it "keeps .native_search private" do
@@ -89,11 +86,10 @@ describe Fdr do
     end
 
     it "accepts options with pattern and paths" do
-      results = Fdr.search(pattern: "test", paths: ["."], type: "d", max_depth: 2)
+      results = Fdr.search(pattern: "spec", paths: ["."], type: "d", max_depth: 2)
 
-      assert_kind_of Array, results
-      # Verify type filter is applied
-      assert(results.none? { |p| File.file?(p) && !File.directory?(p) },
+      assert_includes results, "./spec"
+      assert(results.all? { |p| File.directory?(p) },
         "should only include directories with type: d")
     end
 

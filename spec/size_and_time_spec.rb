@@ -43,6 +43,12 @@ describe "Size and time filtering" do
         "should not find file > max_size")
     end
 
+    it "includes files exactly at the size boundaries" do
+      results = Fdr.search(min_size: 500, max_size: 500, paths: [@tmpdir], type: "f")
+
+      assert_equal [@medium_file], results
+    end
+
     it "combines size and time filters" do
       results = Fdr.search(
         min_size: 100,

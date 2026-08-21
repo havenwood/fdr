@@ -471,21 +471,6 @@ fn search_empty_pattern_matches_all() {
 }
 
 #[test]
-fn search_with_no_paths_uses_current_directory() {
-    let config = SearchConfig {
-        paths: vec![],
-        max_depth: Some(1),
-        ..Default::default()
-    };
-
-    let results = search(&config).expect("search should succeed");
-    assert!(
-        !results.is_empty(),
-        "should search current directory when no paths specified"
-    );
-}
-
-#[test]
 fn search_extremely_long_filename() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();

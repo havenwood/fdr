@@ -47,6 +47,7 @@ fn grep_with_cancel_stops_when_cancelled() {
             paths: vec![PathBuf::from(temp_path)],
             ..Default::default()
         },
+        ..Default::default()
     };
 
     let cancel = AtomicBool::new(true);

@@ -46,6 +46,13 @@ describe "Fdr filtering" do
       assert(results.all? { |path| File.file?(path) })
     end
 
+    it "accepts file types as symbols" do
+      results = Fdr.search(type: :file, paths: ["lib"], max_depth: 2)
+
+      refute_empty results
+      assert(results.all? { |path| File.file?(path) })
+    end
+
     it "supports dir type alias" do
       results = Fdr.search(type: "dir", paths: ["."], max_depth: 2)
       refute_empty results
@@ -56,14 +63,6 @@ describe "Fdr filtering" do
       results = Fdr.search(type: "directory", paths: ["."], max_depth: 2)
       refute_empty results
       assert(results.all? { |path| File.directory?(path) })
-    end
-
-    it "supports symlink type alias" do
-      results = Fdr.search(type: "symlink", paths: ["."], max_depth: 3, hidden: true)
-      assert_kind_of Array, results
-      results.each do |path|
-        assert File.symlink?(path) if File.exist?(path)
-      end
     end
   end
 

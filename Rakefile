@@ -8,10 +8,39 @@ require_relative "rakelib/native_packaging"
 
 require "standard/rake"
 
-GEMSPEC = Gem::Specification.load("fdr.gemspec") || abort("Could not load fdr.gemspec")
-NativePackaging.configure(GEMSPEC)
+GEM_SMOKE_TEST = <<~'RUBY'
+  gem_home, expected_version = ARGV
+  Gem.use_paths(gem_home)
+  require 'fdr'
+
+  raise "Expected Fdr #{expected_version}, got #{Fdr::VERSION}" unless Fdr::VERSION == expected_version
+  raise 'Fdr.search returned no Ruby files' if Fdr.search(paths: [gem_home], extension: 'rb').empty?
+  raise 'Fdr.search searched an empty path set' unless Fdr.search(paths: []).empty?
+
+  grep_results = Fdr.grep(
+    pattern: 'MODULE FDR',
+    name: 'fdr\.rb$',
+    paths: [gem_home],
+    extension: 'rb',
+    content_case_sensitive: false
+  )
+  raise 'Fdr.grep returned no matches' if grep_results.empty?
+  raise 'Fdr.grep searched an empty path set' unless Fdr.grep(pattern: '.', paths: []).empty?
+  raise 'Fdr exposed removed search aliases' if Fdr.respond_to?(:entries) || Fdr.respond_to?(:scan)
+
+  puts "Verified installed Fdr #{Fdr::VERSION}"
+RUBY
 
 task default: :check
+
+desc "Compile the native extension"
+task :compile do
+  Dir.chdir("ext/fdr_native") do
+    ruby "extconf.rb"
+    sh "make"
+  end
+  FileUtils.cp "ext/fdr_native/fdr_native.#{RbConfig::CONFIG["DLEXT"]}", "lib/fdr/"
+end
 
 Minitest::TestTask.create do |test|
   test.framework = %(require_relative "./spec/spec_helper.rb")
@@ -34,6 +63,11 @@ task clobber: :clean do
   Dir.chdir("ext/fdr_native") do
     sh "cargo clean"
   end
+end
+
+desc "Validate RBS signatures"
+task :rbs do
+  sh "rbs -I sig validate"
 end
 
 namespace :rust do
@@ -63,7 +97,7 @@ namespace :rust do
 end
 
 desc "Run all checks (Rust + Ruby)"
-task check: %i[rust:format rust:lint rust:test test standard]
+task check: %i[rust:format rust:lint rust:test test rbs standard]
 
 desc "Build gem after compiling extension"
 task build: :compile
@@ -76,26 +110,16 @@ task "gem:verify" => :build do
 
   Dir.mktmpdir("fdr-gem-verify") do |directory|
     gem_home = File.join(directory, "gem-home")
-    smoke_test = <<~'RUBY'
-      gem_home, expected_version = ARGV
-      Gem.use_paths(gem_home)
-      require 'fdr'
-
-      raise "Expected Fdr #{expected_version}, got #{Fdr::VERSION}" unless Fdr::VERSION == expected_version
-      raise 'Fdr.search returned no Ruby files' if Fdr.search(paths: [gem_home], extension: 'rb').empty?
-
-      puts "Verified installed Fdr #{Fdr::VERSION}"
-    RUBY
 
     Bundler.with_unbundled_env do
       sh Gem.ruby, "-S", "gem", "install", gem_path, "--install-dir", gem_home, "--no-document"
 
       Dir.chdir(directory) do
-        sh Gem.ruby, "-e", smoke_test, gem_home, gemspec.version.to_s
+        sh Gem.ruby, "-e", GEM_SMOKE_TEST, gem_home, gemspec.version.to_s
       end
     end
   end
 end
 
 desc "Verify the packaged gem before pushing the release source"
-task "release:source_control_push" => "gem:verify"
+task "release:source_control_push" => %i[check gem:verify]

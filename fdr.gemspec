@@ -16,9 +16,18 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = ">= 3.2"
   spec.requirements << "Rust 1.88 or newer"
   spec.files = (
-    %w[LICENSE README.md] +
+    %w[
+      LICENSE
+      README.md
+      ext/fdr_native/Cargo.lock
+      ext/fdr_native/Cargo.toml
+      ext/fdr_native/core/Cargo.toml
+      ext/fdr_native/extconf.rb
+      ext/fdr_native/ffi/Cargo.toml
+    ] +
     Dir["lib/**/*.rb"] +
-    Dir["ext/**/*.{lock,rb,rs,toml}"].reject { |file| file.start_with?("ext/fdr_native/target/", "ext/fdr_native/tmp/") }
+    Dir["sig/**/*.rbs"] +
+    Dir["ext/fdr_native/{core,ffi}/src/**/*.rs"]
   ).sort
   spec.require_paths = %w[lib]
   spec.extensions = ["ext/fdr_native/extconf.rb"]

@@ -1,0 +1,47 @@
+module Fdr
+  VERSION: String
+
+  type path = ::path
+  type file_type = "f" | "file" | "d" | "dir" | "directory" | "l" | "symlink" | :f | :file | :d | :dir | :directory | :l | :symlink
+
+  def self.search: (
+    ?pattern: ::string?,
+    ?paths: ::array[path],
+    ?hidden: boolish,
+    ?no_ignore: boolish,
+    ?case_sensitive: boolish,
+    ?glob: boolish,
+    ?full_path: boolish,
+    ?follow: boolish,
+    ?max_depth: Integer?,
+    ?min_depth: Integer?,
+    ?type: file_type?,
+    ?extension: ::string?,
+    ?exclude: ::array[::string]?,
+    ?min_size: Integer?,
+    ?max_size: Integer?,
+    ?changed_within: Integer?,
+    ?changed_before: Integer?
+  ) -> Array[String]
+
+  def self.grep: (
+    pattern: ::string,
+    ?name: ::string?,
+    ?paths: ::array[path],
+    ?hidden: boolish,
+    ?no_ignore: boolish,
+    ?case_sensitive: boolish,
+    ?content_case_sensitive: boolish,
+    ?glob: boolish,
+    ?full_path: boolish,
+    ?follow: boolish,
+    ?max_depth: Integer?,
+    ?min_depth: Integer?,
+    ?extension: ::string?,
+    ?exclude: ::array[::string]?,
+    ?min_size: Integer?,
+    ?max_size: Integer?,
+    ?changed_within: Integer?,
+    ?changed_before: Integer?
+  ) -> Hash[String, Array[Integer]]
+end

@@ -27,11 +27,22 @@ jobs:
           ruby-version: ${{ matrix.ruby-version }}
           bundler-cache: true
 
-      - name: Run all checks
-        run: bundle exec rake check
+      - name: Test checkout and packaged gem
+        run: bundle exec rake test gem:verify
 
-      - name: Verify packaged gem
-        run: bundle exec rake gem:verify
+  quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '4.0'
+          bundler-cache: true
+
+      - name: Run static and Rust checks
+        run: bundle exec rake rust:check rbs standard
 
   msrv:
     runs-on: ubuntu-latest

@@ -1,7 +1,9 @@
 //! Integration tests for file filtering functionality
 
 use fdr_core::{SearchConfig, search};
+use std::fs;
 use std::path::PathBuf;
+use tempfile::TempDir;
 
 #[test]
 fn search_with_extension_filters_correctly() {
@@ -127,6 +129,44 @@ fn search_with_min_depth_excludes_shallow_files() {
         let depth = path.matches(std::path::MAIN_SEPARATOR).count();
         assert!(depth >= 1, "path should be at depth >= 2: {path}");
     }
+}
+
+#[test]
+fn search_min_depth_preserves_hidden_ignore_and_exclude_pruning() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+    for directory in [".git", ".hidden", "ignored", "excluded", "visible"] {
+        fs::create_dir(temp_path.join(directory)).expect("should create fixture directory");
+    }
+    fs::write(temp_path.join(".gitignore"), "ignored/\n").expect("should write gitignore");
+    for path in [
+        ".hidden/secret.txt",
+        "ignored/ignored.txt",
+        "excluded/excluded.txt",
+        "visible/public.txt",
+    ] {
+        fs::write(temp_path.join(path), "fixture\n").expect("should write fixture");
+    }
+
+    let results = search(&SearchConfig {
+        paths: vec![temp_path.to_path_buf()],
+        min_depth: Some(2),
+        file_type: Some("f".to_string()),
+        exclude: vec!["excluded".to_string()],
+        ..Default::default()
+    })
+    .expect("search should succeed");
+
+    assert_eq!(
+        results,
+        vec![
+            temp_path
+                .join("visible/public.txt")
+                .to_string_lossy()
+                .replace('\\', "/")
+        ],
+        "min_depth must not bypass directory pruning"
+    );
 }
 
 #[test]

@@ -39,7 +39,7 @@ describe "Fdr pattern matching" do
 
       assert(with_full.any? { |p| p.include?("ext") },
         "full path should find ext in paths")
-      assert(without_full.all? { |p| File.basename(p).include?("ext") || without_full.empty? },
+      assert(without_full.all? { |p| File.basename(p).include?("ext") },
         "filename only should match ext in basenames")
     end
 
@@ -107,6 +107,19 @@ describe "Fdr pattern matching" do
 
       assert(results.any? { |result| result.include?("fdr_native") },
         "should match directory names in full path")
+    end
+
+    it "matches full paths under an absolute search root" do
+      Dir.mktmpdir("fdr_full_path_test") do |tmpdir|
+        src = File.join(tmpdir, "src")
+        Dir.mkdir(src)
+        File.write(File.join(src, "main.rb"), "x")
+        File.write(File.join(tmpdir, "other.rb"), "x")
+
+        results = Fdr.search(pattern: "src/main", paths: [tmpdir], full_path: true)
+
+        assert_equal [File.join(src, "main.rb")], results
+      end
     end
   end
 end

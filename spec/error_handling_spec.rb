@@ -11,20 +11,22 @@ describe "Fdr error handling" do
       assert_empty results, "nonexistent paths should return empty results"
     end
 
-    it "handles empty paths array by falling back to current directory" do
+    it "returns no results for an empty paths array" do
       results = Fdr.search(paths: [], max_depth: 1)
-      all_files = Fdr.search(max_depth: 1)
+
       assert_kind_of Array, results
-      assert_equal results.size, all_files.size,
-        "empty paths array should fall back to current directory"
+      assert_empty results
     end
 
-    it "handles nil paths by falling back to current directory" do
+    it "defaults omitted paths to the current directory" do
       results = Fdr.search(max_depth: 1)
+
       assert_kind_of Array, results
-      refute_empty results, "nil paths should fall back to current directory"
-      assert(results.all? { |p| !p.empty? },
-        "results should be valid paths")
+      refute_empty results, "omitted paths should search the current directory"
+    end
+
+    it "rejects nil paths" do
+      assert_raises(TypeError) { Fdr.search(paths: nil) }
     end
   end
 
@@ -106,6 +108,12 @@ describe "Fdr error handling" do
     it "handles min_depth greater than max_depth" do
       results = Fdr.search(paths: ["."], min_depth: 5, max_depth: 2)
       assert_kind_of Array, results
+      assert_empty results
+    end
+
+    it "handles min_depth greater than max_depth in grep" do
+      results = Fdr.grep(pattern: "needle", paths: ["."], min_depth: 5, max_depth: 2)
+      assert_kind_of Hash, results
       assert_empty results
     end
   end
@@ -206,6 +214,13 @@ describe "Fdr error handling" do
       assert_match(/type must be one of/, error.message)
     end
 
+    it "raises error for unknown symbolic file types" do
+      error = assert_raises(ArgumentError) do
+        Fdr.search(type: :invalid, paths: ["."], max_depth: 1)
+      end
+      assert_match(/type must be one of/, error.message)
+    end
+
     it "strips a leading dot from extension" do
       with_dot = Fdr.search(extension: ".rb", paths: ["lib"], max_depth: 1)
       without_dot = Fdr.search(extension: "rb", paths: ["lib"], max_depth: 1)
@@ -247,24 +262,40 @@ describe "Fdr error handling" do
     end
 
     it "handles special characters in patterns" do
-      results = Fdr.search(pattern: "test", paths: ["spec"], max_depth: 1)
-      assert_kind_of Array, results
-      assert(results.all? { |p| p.include?("test") } || results.empty?,
-        "should either find test files or return empty")
+      results = Fdr.search(pattern: 'spec_helper\.rb$', paths: ["spec"], max_depth: 1)
+      assert_equal ["spec/spec_helper.rb"], results
     end
 
     it "handles Unicode patterns" do
-      all_files = Fdr.search(pattern: ".*", paths: ["."], max_depth: 1)
-      assert_kind_of Array, all_files
-      refute_empty all_files, "/* wildcard should match files"
+      Dir.mktmpdir do |dir|
+        File.write(File.join(dir, "サンプル.txt"), "")
+
+        results = Fdr.search(pattern: "サンプル", paths: [dir])
+        assert_equal 1, results.size
+      end
     end
   end
 
   describe "permission errors" do
     it "continues searching when encountering permission errors" do
-      results = Fdr.search(paths: ["."], max_depth: 2)
-      assert_kind_of Array, results
-      refute_empty results, "search should find files despite potential permission errors"
+      skip "chmod 0 does not restrict root or Windows" if Gem.win_platform? || Process.uid.zero?
+
+      Dir.mktmpdir do |dir|
+        File.write(File.join(dir, "readable.txt"), "")
+        locked = File.join(dir, "locked")
+        Dir.mkdir(locked)
+        File.write(File.join(locked, "unreachable.txt"), "")
+        File.chmod(0o000, locked)
+
+        begin
+          results = Fdr.search(paths: [dir])
+        ensure
+          File.chmod(0o755, locked)
+        end
+
+        assert_includes results, File.join(dir, "readable.txt")
+        refute_includes results, File.join(locked, "unreachable.txt")
+      end
     end
   end
 end
