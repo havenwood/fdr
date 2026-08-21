@@ -25,8 +25,8 @@ pub struct SearchConfig {
     pub full_path: bool,
     pub max_depth: Option<usize>,
     pub min_depth: Option<usize>,
-    pub file_type: Option<String>,
-    pub extension: Option<String>,
+    pub file_type: Vec<String>,
+    pub extension: Vec<String>,
     pub exclude: Vec<String>,
     pub follow: bool,
     pub min_size: Option<u64>,
@@ -38,6 +38,7 @@ pub struct SearchConfig {
 #[derive(Debug)]
 pub struct GrepConfig {
     pub pattern: String,
+    pub content_case_sensitive: bool,
     /// File filters, with `SearchConfig::pattern` matching names.
     pub search: SearchConfig,
 }
@@ -46,10 +47,8 @@ impl Default for GrepConfig {
     fn default() -> Self {
         Self {
             pattern: String::new(),
-            search: SearchConfig {
-                case_sensitive: true,
-                ..Default::default()
-            },
+            content_case_sensitive: true,
+            search: SearchConfig::default(),
         }
     }
 }
@@ -109,13 +108,19 @@ fn build_pattern_regex(config: &SearchConfig) -> Result<Option<Regex>, SearchErr
 }
 
 fn build_extension_regex(config: &SearchConfig) -> Result<Option<Regex>, SearchError> {
-    let Some(ref ext) = config.extension else {
+    if config.extension.is_empty() {
         return Ok(None);
-    };
+    }
 
-    let ext = ext.trim_start_matches('.');
+    let extensions = config
+        .extension
+        .iter()
+        .map(|ext| ext.trim_start_matches('.'))
+        .map(regex::escape)
+        .collect::<Vec<_>>()
+        .join("|");
     // A bare dotfile like `.rs` is not its own extension, matching fd.
-    let pattern = format!(r".\.{}$", regex::escape(ext));
+    let pattern = format!(r".\.(?:{extensions})$");
     let regex = RegexBuilder::new(&pattern)
         .case_insensitive(true)
         .build()
@@ -127,7 +132,9 @@ fn build_extension_regex(config: &SearchConfig) -> Result<Option<Regex>, SearchE
 struct EntryFilters {
     pattern: Option<Regex>,
     extension: Option<Regex>,
-    file_type: Option<String>,
+    file_type: Vec<String>,
+    /// Applied after walking so shallow ignored or excluded directories can prune.
+    min_depth: Option<usize>,
     /// Base for absolute full-path pattern matching, as in fd.
     full_path_base: Option<PathBuf>,
     min_size: Option<u64>,
@@ -156,6 +163,7 @@ impl EntryFilters {
             pattern: build_pattern_regex(config)?,
             extension: build_extension_regex(config)?,
             file_type: config.file_type.clone(),
+            min_depth: config.min_depth,
             full_path_base,
             min_size: config.min_size,
             max_size: config.max_size,
@@ -196,8 +204,11 @@ impl EntryFilters {
             return false;
         }
 
-        if let Some(ref file_type) = self.file_type
-            && !matches_file_type(entry, file_type)
+        if !self.file_type.is_empty()
+            && !self
+                .file_type
+                .iter()
+                .any(|file_type| matches_file_type(entry, file_type))
         {
             return false;
         }
@@ -280,7 +291,6 @@ fn configure_walker(
         .git_exclude(!config.no_ignore)
         .follow_links(config.follow)
         .max_depth(config.max_depth)
-        .min_depth(config.min_depth)
         .threads(walk_threads());
 
     if !config.exclude.is_empty() {
@@ -309,9 +319,10 @@ fn walk_threads() -> usize {
         .div_ceil(2)
 }
 
-fn build_walker(config: &SearchConfig) -> Result<WalkBuilder, SearchError> {
-    let default_path = PathBuf::from(".");
-    let (first_path, rest) = config.paths.split_first().unwrap_or((&default_path, &[]));
+fn build_walker(config: &SearchConfig) -> Result<Option<WalkBuilder>, SearchError> {
+    let Some((first_path, rest)) = config.paths.split_first() else {
+        return Ok(None);
+    };
     let mut builder = WalkBuilder::new(first_path);
 
     for path in rest {
@@ -320,7 +331,7 @@ fn build_walker(config: &SearchConfig) -> Result<WalkBuilder, SearchError> {
 
     configure_walker(&mut builder, config, first_path)?;
 
-    Ok(builder)
+    Ok(Some(builder))
 }
 
 /// Batch size for result collection (same as fd's default).
@@ -380,6 +391,13 @@ fn search_entry(entry: &DirEntry, filters: &EntryFilters) -> Option<String> {
         return None;
     }
 
+    if filters
+        .min_depth
+        .is_some_and(|min_depth| entry.depth() < min_depth)
+    {
+        return None;
+    }
+
     if !filters.matches(entry) {
         return None;
     }
@@ -425,7 +443,9 @@ pub fn search_with_cancel(
     cancel: &AtomicBool,
 ) -> Result<Vec<String>, SearchError> {
     let filters = EntryFilters::new(config)?;
-    let builder = build_walker(config)?;
+    let Some(builder) = build_walker(config)? else {
+        return Ok(Vec::new());
+    };
 
     if let Some(results) = serial_search(&builder, &filters, cancel)? {
         return Ok(results);
@@ -543,10 +563,21 @@ fn build_searcher() -> Searcher {
 
 /// Whether an entry is a file `grep` should scan.
 fn grep_candidate(entry: &DirEntry, filters: &EntryFilters) -> bool {
-    entry
+    if !entry
         .file_type()
         .is_some_and(|file_type| file_type.is_file())
-        && filters.matches(entry)
+    {
+        return false;
+    }
+
+    if filters
+        .min_depth
+        .is_some_and(|min_depth| entry.depth() < min_depth)
+    {
+        return false;
+    }
+
+    filters.matches(entry)
 }
 
 /// Matching lines in `path`, or `None` when it is binary, unreadable, cancelled,
@@ -634,17 +665,20 @@ pub fn grep_with_cancel(
 ) -> Result<Vec<GrepResult>, SearchError> {
     let mut matcher_builder = RegexMatcherBuilder::new();
     matcher_builder
-        .case_insensitive(!config.search.case_sensitive)
+        .case_insensitive(!config.content_case_sensitive)
         .unicode(true)
         .octal(false)
         .multi_line(true)
         .dot_matches_new_line(false)
-        .crlf(true);
+        .crlf(true)
+        .ban_byte(Some(b'\0'));
     let matcher = matcher_builder
         .build(&config.pattern)
         .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
     let filters = EntryFilters::new(&config.search)?;
-    let builder = build_walker(&config.search)?;
+    let Some(builder) = build_walker(&config.search)? else {
+        return Ok(Vec::new());
+    };
 
     if let Some(results) = serial_grep(&builder, &matcher, &filters, cancel)? {
         return Ok(results);

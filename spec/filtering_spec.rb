@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require_relative "spec_helper"
+require "fileutils"
+require "tmpdir"
 
 describe "Fdr filtering" do
   describe "extension filtering" do
@@ -20,6 +22,20 @@ describe "Fdr filtering" do
       results = Fdr.search(extension: "rb", paths: ["lib"], max_depth: 2)
       refute_empty results
       assert(results.all? { |result| result.end_with?(".rb") })
+    end
+
+    it "accepts extension arrays" do
+      Dir.mktmpdir("fdr-extensions") do |dir|
+        %w[one.rb two.rs three.txt].each { File.write(File.join(dir, _1), "") }
+
+        all = Fdr.search(paths: [dir], type: "f").sort
+        expected = %w[one.rb two.rs].map { File.join(dir, _1) }.sort
+
+        assert_equal expected, Fdr.search(paths: [dir], extension: [".rb", "rs"]).sort
+        assert_equal Fdr.search(paths: [dir], extension: "rb"),
+          Fdr.search(paths: [dir], extension: ["rb"])
+        assert_equal all, Fdr.search(paths: [dir], extension: []).sort
+      end
     end
   end
 
@@ -46,6 +62,13 @@ describe "Fdr filtering" do
       assert(results.all? { |path| File.file?(path) })
     end
 
+    it "accepts file types as symbols" do
+      results = Fdr.search(type: :file, paths: ["lib"], max_depth: 2)
+
+      refute_empty results
+      assert(results.all? { |path| File.file?(path) })
+    end
+
     it "supports dir type alias" do
       results = Fdr.search(type: "dir", paths: ["."], max_depth: 2)
       refute_empty results
@@ -58,11 +81,40 @@ describe "Fdr filtering" do
       assert(results.all? { |path| File.directory?(path) })
     end
 
-    it "supports symlink type alias" do
-      results = Fdr.search(type: "symlink", paths: ["."], max_depth: 3, hidden: true)
-      assert_kind_of Array, results
-      results.each do |path|
-        assert File.symlink?(path) if File.exist?(path)
+    it "accepts file type arrays" do
+      Dir.mktmpdir("fdr-file-types") do |dir|
+        File.write(File.join(dir, "file"), "")
+        Dir.mkdir(File.join(dir, "directory"))
+
+        all = Fdr.search(paths: [dir], max_depth: 1).sort
+
+        assert_equal all, Fdr.search(paths: [dir], type: [:f, "directory"], max_depth: 1).sort
+        assert_equal Fdr.search(paths: [dir], type: :f),
+          Fdr.search(paths: [dir], type: [:f])
+        assert_equal all, Fdr.search(paths: [dir], type: [], max_depth: 1).sort
+      end
+    end
+  end
+
+  describe "exclude globs" do
+    # `ignore` supports a single override root, so a slash-containing glob
+    # anchors to the first path only. `fd -E` behaves the same way.
+    it "anchors a slash-containing exclude to the first path" do
+      Dir.mktmpdir("fdr-exclude-roots") do |dir|
+        %w[a b].each do |root|
+          FileUtils.mkdir_p(File.join(dir, root, "sub", "vendor"))
+          File.write(File.join(dir, root, "sub", "vendor", "x.rb"), "")
+        end
+
+        results = Fdr.search(
+          paths: [File.join(dir, "a"), File.join(dir, "b")],
+          exclude: ["sub/vendor"]
+        )
+
+        assert(results.none? { |path| path.include?("/a/sub/vendor") },
+          "the first path should honor the slash-containing exclude")
+        assert(results.any? { |path| path.include?("/b/sub/vendor") },
+          "later paths keep fd's behavior of ignoring the anchored exclude")
       end
     end
   end

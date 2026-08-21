@@ -2,6 +2,8 @@
 
 require "tmpdir"
 require_relative "spec_helper"
+require "fileutils"
+require "timeout"
 
 describe "Fdr error handling" do
   describe "invalid paths" do
@@ -11,20 +13,22 @@ describe "Fdr error handling" do
       assert_empty results, "nonexistent paths should return empty results"
     end
 
-    it "handles empty paths array by falling back to current directory" do
+    it "returns no results for an empty paths array" do
       results = Fdr.search(paths: [], max_depth: 1)
-      all_files = Fdr.search(max_depth: 1)
+
       assert_kind_of Array, results
-      assert_equal results.size, all_files.size,
-        "empty paths array should fall back to current directory"
+      assert_empty results
     end
 
-    it "handles nil paths by falling back to current directory" do
+    it "defaults omitted paths to the current directory" do
       results = Fdr.search(max_depth: 1)
+
       assert_kind_of Array, results
-      refute_empty results, "nil paths should fall back to current directory"
-      assert(results.all? { |p| !p.empty? },
-        "results should be valid paths")
+      refute_empty results, "omitted paths should search the current directory"
+    end
+
+    it "rejects nil paths" do
+      assert_raises(TypeError) { Fdr.search(paths: nil) }
     end
   end
 
@@ -108,6 +112,12 @@ describe "Fdr error handling" do
       assert_kind_of Array, results
       assert_empty results
     end
+
+    it "handles min_depth greater than max_depth in grep" do
+      results = Fdr.grep(pattern: "needle", paths: ["."], min_depth: 5, max_depth: 2)
+      assert_kind_of Hash, results
+      assert_empty results
+    end
   end
 
   describe "invalid argument types" do
@@ -165,6 +175,12 @@ describe "Fdr error handling" do
       end
     end
 
+    it "raises Fdr::InvalidType when grep pattern is nil" do
+      assert_raises(Fdr::InvalidType) do
+        Fdr.grep(pattern: nil, paths: ["lib"])
+      end
+    end
+
     it "accepts truthy values for boolean kwargs" do
       Dir.mktmpdir("fdr-truthy") do |dir|
         File.write(File.join(dir, ".hidden.txt"), "")
@@ -198,12 +214,99 @@ describe "Fdr error handling" do
     end
   end
 
+  describe "error classes" do
+    it "tags the errors it raises itself while keeping their stdlib class" do
+      {
+        Fdr::InvalidPattern => [RegexpError, -> { Fdr.search(pattern: "[", paths: ["lib"]) }],
+        Fdr::InvalidOption => [ArgumentError, -> { Fdr.search(type: "nope", paths: ["lib"]) }],
+        Fdr::InvalidType => [TypeError, -> { Fdr.search(paths: nil) }],
+        Fdr::OutOfRange => [RangeError, -> { Fdr.search(max_depth: 2**64, paths: ["lib"]) }]
+      }.each do |fdr_class, (stdlib_class, call)|
+        error = assert_raises(fdr_class) { call.call }
+
+        assert_kind_of Fdr::Error, error
+        assert_kind_of stdlib_class, error
+      end
+    end
+
+    it "leaves an interrupt raised during a search untagged" do
+      Dir.mktmpdir("fdr-interrupt") do |dir|
+        path = File.join(dir, "big.txt")
+        File.open(path, "wb") { |file| 40.times { file.write("haystack\n" * (1024 * 1024 / 9)) } }
+
+        error = assert_raises(Timeout::Error) do
+          Timeout.timeout(0.02) { Fdr.grep(pattern: "(?i:(?:ha|hay|hays|haystac)+z)", paths: [path]) }
+        end
+
+        refute_kind_of Fdr::Error, error
+      end
+    end
+
+    it "raises Fdr::IOError when the working directory is gone" do
+      skip "fork is unavailable" unless Process.respond_to?(:fork)
+
+      reader, writer = IO.pipe
+      pid = fork do
+        reader.close
+        dir = Dir.mktmpdir("fdr-gone")
+        Dir.chdir(dir)
+        FileUtils.remove_entry(dir)
+        begin
+          Fdr.search(pattern: "x", full_path: true, paths: ["."])
+          writer.puts "no raise"
+        rescue => e
+          writer.puts "#{e.class} #{e.is_a?(Fdr::Error)} #{e.is_a?(IOError)}"
+        end
+        writer.close
+        exit! 0
+      end
+      writer.close
+      result = reader.read.strip
+      reader.close
+      Process.waitpid(pid)
+
+      assert_equal "Fdr::IOError true true", result
+    end
+
+    it "does not tag Ruby's own keyword errors" do
+      refute_kind_of Fdr::Error, assert_raises(ArgumentError) { Fdr.search(nope: true) }
+      refute_kind_of Fdr::Error, assert_raises(ArgumentError) { Fdr.grep(paths: []) }
+    end
+
+    it "leaves an exception raised by the caller's own coercion intact" do
+      boom = Class.new(ArgumentError)
+      raiser = Class.new { define_method(:to_str) { raise boom, "caller's problem" } }
+
+      error = assert_raises(boom) { Fdr.search(pattern: raiser.new, paths: ["lib"]) }
+
+      refute_kind_of Fdr::Error, error
+      assert_equal "caller's problem", error.message
+    end
+  end
+
   describe "invalid options" do
     it "raises error for unknown file types" do
       error = assert_raises(ArgumentError) do
         Fdr.search(type: "invalid", paths: ["."], max_depth: 1)
       end
       assert_match(/type must be one of/, error.message)
+    end
+
+    it "raises error for unknown symbolic file types" do
+      error = assert_raises(ArgumentError) do
+        Fdr.search(type: :invalid, paths: ["."], max_depth: 1)
+      end
+      assert_match(/type must be one of/, error.message)
+    end
+
+    it "validates array members" do
+      [
+        [Fdr::InvalidOption, -> { Fdr.search(type: %w[f invalid], paths: ["lib"]) }],
+        [Fdr::InvalidType, -> { Fdr.search(type: [:f, 42], paths: ["lib"]) }],
+        [Fdr::InvalidType, -> { Fdr.search(extension: [42], paths: ["lib"]) }]
+      ].each do |error_class, call|
+        assert_raises(error_class) { call.call }
+      end
     end
 
     it "strips leading dots from extension" do
@@ -214,10 +317,15 @@ describe "Fdr error handling" do
       assert_equal without_dot, Fdr.search(extension: "..rb", paths: ["lib"], max_depth: 1)
     end
 
-    it "handles empty extension by matching no files" do
-      with_empty = Fdr.search(extension: "", paths: ["lib"])
-      assert_kind_of Array, with_empty
-      assert_empty with_empty, "empty extension should match no files"
+    it "treats an empty extension as a trailing dot, as fd does" do
+      Dir.mktmpdir("fdr-empty-extension") do |dir|
+        trailing_dot = File.join(dir, "trailing.")
+        File.write(trailing_dot, "")
+        File.write(File.join(dir, "ordinary"), "")
+
+        assert_equal [trailing_dot], Fdr.search(extension: "", paths: [dir])
+        assert_equal [trailing_dot], Fdr.search(extension: ".", paths: [dir])
+      end
     end
 
     it "handles nil extension by ignoring the filter" do
@@ -248,24 +356,40 @@ describe "Fdr error handling" do
     end
 
     it "handles special characters in patterns" do
-      results = Fdr.search(pattern: "test", paths: ["spec"], max_depth: 1)
-      assert_kind_of Array, results
-      assert(results.all? { |p| p.include?("test") } || results.empty?,
-        "should either find test files or return empty")
+      results = Fdr.search(pattern: 'spec_helper\.rb$', paths: ["spec"], max_depth: 1)
+      assert_equal ["spec/spec_helper.rb"], results
     end
 
     it "handles Unicode patterns" do
-      all_files = Fdr.search(pattern: ".*", paths: ["."], max_depth: 1)
-      assert_kind_of Array, all_files
-      refute_empty all_files, "/* wildcard should match files"
+      Dir.mktmpdir do |dir|
+        File.write(File.join(dir, "サンプル.txt"), "")
+
+        results = Fdr.search(pattern: "サンプル", paths: [dir])
+        assert_equal 1, results.size
+      end
     end
   end
 
   describe "permission errors" do
     it "continues searching when encountering permission errors" do
-      results = Fdr.search(paths: ["."], max_depth: 2)
-      assert_kind_of Array, results
-      refute_empty results, "search should find files despite potential permission errors"
+      skip "chmod 0 does not restrict root or Windows" if Gem.win_platform? || Process.uid.zero?
+
+      Dir.mktmpdir do |dir|
+        File.write(File.join(dir, "readable.txt"), "")
+        locked = File.join(dir, "locked")
+        Dir.mkdir(locked)
+        File.write(File.join(locked, "unreachable.txt"), "")
+        File.chmod(0o000, locked)
+
+        begin
+          results = Fdr.search(paths: [dir])
+        ensure
+          File.chmod(0o755, locked)
+        end
+
+        assert_includes results, File.join(dir, "readable.txt")
+        refute_includes results, File.join(locked, "unreachable.txt")
+      end
     end
   end
 end

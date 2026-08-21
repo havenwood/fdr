@@ -1,6 +1,6 @@
 //! Integration tests for search configuration
 
-use fdr_core::{SearchConfig, search};
+use fdr_core::{GrepConfig, SearchConfig, grep, search};
 use std::path::PathBuf;
 
 #[test]
@@ -19,24 +19,32 @@ fn search_config_default_values() {
     assert!(!config.full_path, "full_path should default to false");
     assert!(config.max_depth.is_none());
     assert!(config.min_depth.is_none());
-    assert!(config.file_type.is_none());
-    assert!(config.extension.is_none());
+    assert!(config.file_type.is_empty());
+    assert!(config.extension.is_empty());
     assert!(config.exclude.is_empty());
     assert!(!config.follow, "follow should default to false");
 }
 
 #[test]
-fn search_with_empty_paths_uses_current_directory() {
+fn search_with_empty_paths_returns_empty() {
     let config = SearchConfig {
         max_depth: Some(1),
         ..Default::default()
     };
 
     let results = search(&config).expect("search should succeed");
-    assert!(
-        !results.is_empty(),
-        "should default to searching current directory"
-    );
+    assert!(results.is_empty(), "no paths should mean no search roots");
+}
+
+#[test]
+fn grep_with_empty_paths_returns_empty() {
+    let results = grep(&GrepConfig {
+        pattern: ".".to_string(),
+        ..Default::default()
+    })
+    .expect("grep should succeed");
+
+    assert!(results.is_empty(), "no paths should mean no grep roots");
 }
 
 #[test]
@@ -149,8 +157,28 @@ fn search_min_depth_greater_than_max_depth() {
 
     let results = search(&config).expect("search should succeed");
     assert!(
-        !results.is_empty(),
-        "with max_depth=2, should find results up to that depth"
+        results.is_empty(),
+        "min_depth above max_depth should match nothing"
+    );
+}
+
+#[test]
+fn grep_min_depth_greater_than_max_depth() {
+    let config = GrepConfig {
+        pattern: ".".to_string(),
+        search: SearchConfig {
+            paths: vec![PathBuf::from(".")],
+            min_depth: Some(5),
+            max_depth: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let results = grep(&config).expect("grep should succeed");
+    assert!(
+        results.is_empty(),
+        "an empty depth range should match nothing"
     );
 }
 
@@ -186,8 +214,8 @@ fn search_allows_all_options_combined() {
         full_path: true,
         max_depth: Some(3),
         min_depth: Some(1),
-        file_type: Some("f".to_string()),
-        extension: Some("rs".to_string()),
+        file_type: vec!["f".to_string()],
+        extension: vec!["rs".to_string()],
         exclude: vec!["target".to_string()],
         follow: false,
         min_size: None,
@@ -216,7 +244,7 @@ fn search_empty_pattern_string_finds_all() {
 #[test]
 fn search_empty_extension_string() {
     let config = SearchConfig {
-        extension: Some(String::new()),
+        extension: vec![String::new()],
         paths: vec![PathBuf::from(".")],
         max_depth: Some(1),
         ..Default::default()

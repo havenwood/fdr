@@ -6,28 +6,25 @@ require_relative "spec_helper"
 describe Fdr do
   describe "module methods" do
     it "responds to .search" do
-      assert Fdr.respond_to?(:search), "Fdr.search method should exist"
+      assert_respond_to Fdr, :search
     end
 
     it "responds to .grep" do
-      assert Fdr.respond_to?(:grep), "Fdr.grep method should exist"
+      assert_respond_to Fdr, :grep
     end
 
-    it "responds to .entries alias" do
-      assert Fdr.respond_to?(:entries), "Fdr.entries method should exist"
-    end
-
-    it "responds to .scan alias" do
-      assert Fdr.respond_to?(:scan), "Fdr.scan method should exist"
+    it "does not expose ambiguous search aliases" do
+      refute_respond_to Fdr, :entries
+      refute_respond_to Fdr, :scan
     end
 
     it "keeps .native_search private" do
-      refute Fdr.respond_to?(:native_search), "Fdr.native_search should be private"
+      refute_respond_to Fdr, :native_search
       assert_raises(NoMethodError) { Fdr.native_search }
     end
 
     it "keeps .native_grep private" do
-      refute Fdr.respond_to?(:native_grep), "Fdr.native_grep should be private"
+      refute_respond_to Fdr, :native_grep
       assert_raises(NoMethodError) { Fdr.native_grep }
     end
   end
@@ -50,6 +47,29 @@ describe Fdr do
         results = Fdr.search(paths: [dir])
         assert_equal results.sort, results, "search results should be path-sorted"
       end
+    end
+
+    it "returns path-sorted results from the parallel walker" do
+      Dir.mktmpdir("fdr-sort-parallel") do |dir|
+        70.times do |index|
+          subdir = File.join(dir, format("dir_%<index>03d", index:))
+          Dir.mkdir(subdir)
+          File.write(File.join(subdir, "file.txt"), "")
+        end
+
+        results = Fdr.search(paths: [dir])
+
+        assert_equal 140, results.size
+        assert_equal results.sort, results, "parallel search results should be path-sorted"
+      end
+    end
+
+    it "tags result paths with the filesystem encoding" do
+      results = Fdr.search(paths: ["lib"], max_depth: 1)
+
+      refute_empty results
+      assert(results.all? { |path| path.encoding == Encoding.find("filesystem") },
+        "paths should carry the filesystem encoding")
     end
 
     it "returns String paths that point to existing files" do
@@ -89,11 +109,10 @@ describe Fdr do
     end
 
     it "accepts options with pattern and paths" do
-      results = Fdr.search(pattern: "test", paths: ["."], type: "d", max_depth: 2)
+      results = Fdr.search(pattern: "spec", paths: ["."], type: "d", max_depth: 2)
 
-      assert_kind_of Array, results
-      # Verify type filter is applied
-      assert(results.none? { |p| File.file?(p) && !File.directory?(p) },
+      assert_includes results, "./spec"
+      assert(results.all? { |p| File.directory?(p) },
         "should only include directories with type: d")
     end
 

@@ -16,12 +16,16 @@ fn needle_in(search: SearchConfig) -> GrepConfig {
     GrepConfig {
         pattern: "needle".to_string(),
         search,
+        ..Default::default()
     }
 }
 
 #[test]
-fn grep_defaults_to_case_sensitive() {
-    assert!(GrepConfig::default().search.case_sensitive);
+fn grep_defaults_to_case_sensitive_content_and_case_insensitive_names() {
+    let config = GrepConfig::default();
+
+    assert!(config.content_case_sensitive);
+    assert!(!config.search.case_sensitive);
 }
 
 #[test]
@@ -46,19 +50,16 @@ fn grep_groups_one_based_matching_lines_by_file() {
 }
 
 #[test]
-fn grep_honors_case_sensitivity() {
+fn grep_honors_content_case_sensitivity() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     fs::write(temp_dir.path().join("case.txt"), "Needle\nneedle\n").expect("should write fixture");
 
-    let sensitive = grep(&needle_in(SearchConfig {
-        case_sensitive: true,
-        ..search_under(temp_dir.path())
-    }))
-    .expect("case-sensitive grep should succeed");
-    let insensitive = grep(&needle_in(SearchConfig {
-        case_sensitive: false,
-        ..search_under(temp_dir.path())
-    }))
+    let sensitive = grep(&needle_in(search_under(temp_dir.path())))
+        .expect("case-sensitive grep should succeed");
+    let insensitive = grep(&GrepConfig {
+        content_case_sensitive: false,
+        ..needle_in(search_under(temp_dir.path()))
+    })
     .expect("case-insensitive grep should succeed");
 
     let sensitive_result = sensitive.first().expect("should find sensitive match");
@@ -140,6 +141,39 @@ fn grep_skips_excluded_patterns() {
 }
 
 #[test]
+fn grep_min_depth_preserves_hidden_ignore_and_exclude_pruning() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+    for directory in [".git", ".hidden", "ignored", "excluded", "visible"] {
+        fs::create_dir(temp_path.join(directory)).expect("should create fixture directory");
+    }
+    fs::write(temp_path.join(".gitignore"), "ignored/\n").expect("should write gitignore");
+    for path in [
+        ".hidden/secret.txt",
+        "ignored/ignored.txt",
+        "excluded/excluded.txt",
+        "visible/public.txt",
+    ] {
+        fs::write(temp_path.join(path), "needle\n").expect("should write fixture");
+    }
+
+    let results = grep(&needle_in(SearchConfig {
+        min_depth: Some(2),
+        exclude: vec!["excluded".to_string()],
+        ..search_under(temp_path)
+    }))
+    .expect("grep should succeed");
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        results
+            .first()
+            .is_some_and(|result| result.path.ends_with("visible/public.txt")),
+        "min_depth must not bypass directory pruning"
+    );
+}
+
+#[test]
 fn grep_searches_multiple_paths() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
@@ -171,7 +205,7 @@ fn grep_filters_by_extension() {
     fs::write(temp_path.join("notes.txt"), "needle\n").expect("should write fixture");
 
     let results = grep(&needle_in(SearchConfig {
-        extension: Some("rb".to_string()),
+        extension: vec!["rb".to_string()],
         ..search_under(temp_path)
     }))
     .expect("grep should succeed");
@@ -349,6 +383,7 @@ fn grep_rejects_invalid_patterns() {
             paths: vec![PathBuf::from(".")],
             ..Default::default()
         },
+        ..Default::default()
     });
 
     assert!(result.is_err(), "invalid pattern should return an error");
@@ -362,6 +397,7 @@ fn grep_rejects_patterns_matching_a_line_terminator() {
             paths: vec![PathBuf::from(".")],
             ..Default::default()
         },
+        ..Default::default()
     });
 
     assert!(
@@ -396,24 +432,19 @@ fn grep_returns_matching_line_text_without_its_terminator() {
 fn grep_reports_a_line_with_two_matches_once() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
-    fs::write(temp_path.join("a.txt"), "needle and needle again\n")
-        .expect("should write fixture");
+    fs::write(temp_path.join("a.txt"), "needle and needle again\n").expect("should write fixture");
 
     let results = grep(&needle_in(search_under(temp_path))).expect("grep should succeed");
 
     let result = results.first().expect("should match one file");
-    assert_eq!(
-        result.lines,
-        vec![(1, b"needle and needle again".to_vec())]
-    );
+    assert_eq!(result.lines, vec![(1, b"needle and needle again".to_vec())]);
 }
 
 #[test]
 fn grep_trims_a_carriage_return_and_handles_a_missing_final_newline() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
-    fs::write(temp_path.join("a.txt"), "needle one\r\nneedle two")
-        .expect("should write fixture");
+    fs::write(temp_path.join("a.txt"), "needle one\r\nneedle two").expect("should write fixture");
 
     let results = grep(&needle_in(search_under(temp_path))).expect("grep should succeed");
 
@@ -452,18 +483,14 @@ fn grep_matches_anchors_before_lf_and_crlf_terminators() {
 fn grep_keeps_a_trailing_carriage_return_that_is_not_a_terminator() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
-    fs::write(temp_path.join("a.txt"), "one needle\r\ntwo needle\r")
-        .expect("should write fixture");
+    fs::write(temp_path.join("a.txt"), "one needle\r\ntwo needle\r").expect("should write fixture");
 
     let results = grep(&needle_in(search_under(temp_path))).expect("grep should succeed");
 
     let result = results.first().expect("should match one file");
     assert_eq!(
         result.lines,
-        vec![
-            (1, b"one needle".to_vec()),
-            (2, b"two needle\r".to_vec())
-        ]
+        vec![(1, b"one needle".to_vec()), (2, b"two needle\r".to_vec())]
     );
 }
 

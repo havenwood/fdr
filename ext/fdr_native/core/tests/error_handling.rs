@@ -202,7 +202,7 @@ fn search_with_very_long_pattern() {
 fn search_with_very_long_extension() {
     let long_ext = "x".repeat(1000);
     let config = SearchConfig {
-        extension: Some(long_ext),
+        extension: vec![long_ext],
         paths: vec![PathBuf::from(".")],
         max_depth: Some(1),
         ..Default::default()
@@ -231,7 +231,7 @@ fn search_with_backtracking_regex() {
 #[test]
 fn search_with_invalid_file_type() {
     let config = SearchConfig {
-        file_type: Some("invalid_type".to_string()),
+        file_type: vec!["invalid_type".to_string()],
         paths: vec![PathBuf::from(".")],
         max_depth: Some(1),
         ..Default::default()

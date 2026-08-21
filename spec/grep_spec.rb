@@ -45,6 +45,23 @@ describe "Fdr.grep" do
 
       assert_equal keys.sort, keys, "paths should be sorted"
     end
+
+    it "orders paths deterministically from the parallel walker" do
+      600.times do |index|
+        File.write(File.join(@tmpdir, format("file_%<index>03d.txt", index:)), "needle\n")
+      end
+
+      keys = Fdr.grep(pattern: "needle", paths: [@tmpdir]).keys
+
+      assert_equal 601, keys.size
+      assert_equal keys.sort, keys, "parallel grep paths should be sorted"
+    end
+
+    it "tags matching lines with the external encoding" do
+      line = Fdr.grep(pattern: "needle", paths: [@tmpdir]).fetch(@path).fetch(3)
+
+      assert_equal Encoding.default_external, line.encoding
+    end
   end
 
   describe "content matching" do
@@ -55,7 +72,13 @@ describe "Fdr.grep" do
     end
 
     it "can search case insensitively" do
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], case_sensitive: false)
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], content_case_sensitive: false)
+
+      assert_equal [2, 3, 4], results[@path].keys
+    end
+
+    it "treats nil case sensitivity as falsey" do
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], content_case_sensitive: nil)
 
       assert_equal [2, 3, 4], results[@path].keys
     end
@@ -113,6 +136,35 @@ describe "Fdr.grep" do
       FileUtils.rm_rf(other)
     end
 
+    it "returns no results for an empty paths array" do
+      assert_empty Fdr.grep(pattern: "needle", paths: [])
+    end
+
+    it "rejects nil paths" do
+      assert_raises(TypeError) { Fdr.grep(pattern: "needle", paths: nil) }
+    end
+
+    it "filters by size" do
+      big = File.join(@tmpdir, "big.txt")
+      File.write(big, "needle\n#{"padding\n" * 100}")
+
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], max_size: 100)
+
+      assert_includes results.keys, @path
+      refute_includes results.keys, big
+    end
+
+    it "filters by modification time" do
+      old = File.join(@tmpdir, "old.txt")
+      File.write(old, "needle\n")
+      File.utime(Time.now - 86_400, Time.now - 86_400, old)
+
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], changed_within: 3600)
+
+      assert_includes results.keys, @path
+      refute_includes results.keys, old
+    end
+
     it "filters by extension" do
       File.write(File.join(@tmpdir, "notes.txt"), "needle\n")
 
@@ -121,12 +173,40 @@ describe "Fdr.grep" do
       assert_equal [@path], results.keys
     end
 
+    it "filters by multiple extensions" do
+      notes = File.join(@tmpdir, "notes.txt")
+      File.write(notes, "needle\n")
+
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], extension: %w[rb txt])
+
+      assert_equal [@path, notes].sort, results.keys.sort
+    end
+
     it "filters by filename with name" do
       File.write(File.join(@tmpdir, "example_spec.rb"), "needle\n")
 
       results = Fdr.grep(pattern: "needle", paths: [@tmpdir], name: '_spec\.rb$')
 
       assert_equal [File.join(@tmpdir, "example_spec.rb")], results.keys
+    end
+
+    it "filters names case insensitively by default" do
+      upper_path = File.join(@tmpdir, "UPPER.rb")
+      File.write(upper_path, "needle\n")
+
+      default_results = Fdr.grep(pattern: "needle", paths: [@tmpdir], name: "upper")
+      sensitive = Fdr.grep(pattern: "needle", paths: [@tmpdir], name: "upper", case_sensitive: true)
+
+      assert_equal [upper_path], default_results.keys
+      assert_empty sensitive
+    end
+
+    it "filters names with a glob when glob is true" do
+      File.write(File.join(@tmpdir, "notes.txt"), "needle\n")
+
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], name: "*.rb", glob: true)
+
+      assert_equal [@path], results.keys
     end
 
     it "respects max_depth" do
@@ -138,11 +218,35 @@ describe "Fdr.grep" do
 
       assert_equal [@path], results.keys
     end
+
+    it "keeps directory pruning active with min_depth" do
+      Dir.mkdir(File.join(@tmpdir, ".git"))
+      File.write(File.join(@tmpdir, ".gitignore"), "ignored/\n")
+      %w[.hidden ignored excluded visible].each do |directory|
+        Dir.mkdir(File.join(@tmpdir, directory))
+        File.write(File.join(@tmpdir, directory, "match.rb"), "needle\n")
+      end
+
+      results = Fdr.grep(
+        pattern: "needle",
+        paths: [@tmpdir],
+        min_depth: 2,
+        exclude: %w[excluded]
+      )
+
+      assert_equal [File.join(@tmpdir, "visible", "match.rb")], results.keys
+    end
   end
 
   describe "errors" do
     it "requires a pattern" do
       assert_raises(ArgumentError) { Fdr.grep(paths: [@tmpdir]) }
+    end
+
+    it "rejects the search-only type filter" do
+      assert_raises(ArgumentError) do
+        Fdr.grep(pattern: "needle", paths: [@tmpdir], type: "f")
+      end
     end
 
     it "raises for an invalid regex pattern" do
@@ -156,6 +260,14 @@ describe "Fdr.grep" do
     it "raises for a pattern spanning lines" do
       error = assert_raises(RegexpError) do
         Fdr.grep(pattern: "first\nNeedle", paths: [@tmpdir])
+      end
+
+      assert_match(/Grep failed/, error.message)
+    end
+
+    it "raises for a pattern requiring a NUL byte" do
+      error = assert_raises(RegexpError) do
+        Fdr.grep(pattern: '\x00', paths: [@tmpdir])
       end
 
       assert_match(/Grep failed/, error.message)

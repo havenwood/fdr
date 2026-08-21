@@ -135,6 +135,23 @@ describe "Symlink behavior" do
     end
   end
 
+  describe "symlink as the search root" do
+    it "omits the root link and returns its children" do
+      results = Fdr.search(paths: [@link_to_dir])
+
+      refute_includes results, @link_to_dir
+      assert(results.any? { |path| path.include?("file1.txt") })
+      assert(results.any? { |path| path.include?("file2.rb") })
+    end
+
+    it "omits the root link and returns its children with follow: true" do
+      results = Fdr.search(paths: [@link_to_dir], follow: true)
+
+      refute_includes results, @link_to_dir
+      assert(results.any? { |path| path.include?("file1.txt") })
+    end
+  end
+
   describe "combination of follow and type" do
     it 'type: "l" with follow: true finds no symlinks (they are followed)' do
       results = Fdr.search(paths: [@tmpdir], type: "l", follow: true, max_depth: 1)
@@ -177,17 +194,12 @@ describe "Symlink behavior" do
 
   describe "no_ignore with follow (cross-option behavior)" do
     before do
-      @tmpdir = Dir.mktmpdir("fdr_combo_test")
       Dir.mkdir(File.join(@tmpdir, ".git"))
 
       files = create_gitignore_and_ignored_dir(@tmpdir)
       @ignored_dir = files[:ignored_dir]
       @ignored_file = files[:ignored_file]
       @link_to_ignored = files[:link_to_ignored]
-    end
-
-    after do
-      FileUtils.rm_rf(@tmpdir) if @tmpdir && File.exist?(@tmpdir)
     end
 
     it "finds files in ignored directories when both no_ignore and follow are true" do
@@ -198,8 +210,8 @@ describe "Symlink behavior" do
         type: "f"
       )
 
-      assert(results.any? { |result| result.include?("file.txt") },
-        "should find file in ignored directory when no_ignore: true")
+      assert_includes results, @ignored_file,
+        "should find file in ignored directory when no_ignore: true"
     end
 
     it "follows symlinks to ignored directories with no_ignore" do
@@ -210,8 +222,8 @@ describe "Symlink behavior" do
         type: "f"
       )
 
-      assert(results.any? { |result| result.include?("link_to_ignored") && result.include?("file.txt") },
-        "should traverse through symlink to ignored directory")
+      assert_includes results, File.join(@link_to_ignored, "file.txt"),
+        "should traverse through symlink to ignored directory"
     end
   end
 end

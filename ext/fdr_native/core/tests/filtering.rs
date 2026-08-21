@@ -1,12 +1,14 @@
 //! Integration tests for file filtering functionality
 
 use fdr_core::{SearchConfig, search};
+use std::fs;
 use std::path::PathBuf;
+use tempfile::TempDir;
 
 #[test]
 fn search_with_extension_filters_correctly() {
     let config = SearchConfig {
-        extension: Some("toml".to_string()),
+        extension: vec!["toml".to_string()],
         paths: vec![PathBuf::from(".")],
         max_depth: Some(2),
         ..Default::default()
@@ -25,9 +27,28 @@ fn search_with_extension_filters_correctly() {
 }
 
 #[test]
+fn search_with_multiple_extensions() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    fs::write(temp_dir.path().join("one.rb"), "").expect("should write rb file");
+    fs::write(temp_dir.path().join("two.rs"), "").expect("should write rs file");
+    fs::write(temp_dir.path().join("three.txt"), "").expect("should write txt file");
+
+    let results = search(&SearchConfig {
+        paths: vec![temp_dir.path().to_path_buf()],
+        extension: vec![".rb".to_owned(), "rs".to_owned()],
+        ..Default::default()
+    })
+    .expect("search should succeed");
+
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|path| path.ends_with("one.rb")));
+    assert!(results.iter().any(|path| path.ends_with("two.rs")));
+}
+
+#[test]
 fn search_with_file_type_file() {
     let config = SearchConfig {
-        file_type: Some("f".to_string()),
+        file_type: vec!["f".to_string()],
         paths: vec![PathBuf::from(".")],
         max_depth: Some(1),
         ..Default::default()
@@ -45,7 +66,7 @@ fn search_with_file_type_file() {
 #[test]
 fn search_with_file_type_directory() {
     let config = SearchConfig {
-        file_type: Some("d".to_string()),
+        file_type: vec!["d".to_string()],
         paths: vec![PathBuf::from(".")],
         max_depth: Some(2),
         ..Default::default()
@@ -61,16 +82,35 @@ fn search_with_file_type_directory() {
 }
 
 #[test]
+fn search_with_multiple_file_types() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    fs::write(temp_dir.path().join("file"), "").expect("should write file");
+    fs::create_dir(temp_dir.path().join("directory")).expect("should create directory");
+
+    let results = search(&SearchConfig {
+        paths: vec![temp_dir.path().to_path_buf()],
+        file_type: vec!["file".to_owned(), "directory".to_owned()],
+        max_depth: Some(1),
+        ..Default::default()
+    })
+    .expect("search should succeed");
+
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|path| path.ends_with("file")));
+    assert!(results.iter().any(|path| path.ends_with("directory")));
+}
+
+#[test]
 fn search_with_file_type_aliases() {
     let file_config = SearchConfig {
-        file_type: Some("file".to_string()),
+        file_type: vec!["file".to_string()],
         paths: vec![PathBuf::from(".")],
         max_depth: Some(1),
         ..Default::default()
     };
 
     let dir_config = SearchConfig {
-        file_type: Some("directory".to_string()),
+        file_type: vec!["directory".to_string()],
         paths: vec![PathBuf::from(".")],
         max_depth: Some(1),
         ..Default::default()
@@ -130,6 +170,44 @@ fn search_with_min_depth_excludes_shallow_files() {
 }
 
 #[test]
+fn search_min_depth_preserves_hidden_ignore_and_exclude_pruning() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+    for directory in [".git", ".hidden", "ignored", "excluded", "visible"] {
+        fs::create_dir(temp_path.join(directory)).expect("should create fixture directory");
+    }
+    fs::write(temp_path.join(".gitignore"), "ignored/\n").expect("should write gitignore");
+    for path in [
+        ".hidden/secret.txt",
+        "ignored/ignored.txt",
+        "excluded/excluded.txt",
+        "visible/public.txt",
+    ] {
+        fs::write(temp_path.join(path), "fixture\n").expect("should write fixture");
+    }
+
+    let results = search(&SearchConfig {
+        paths: vec![temp_path.to_path_buf()],
+        min_depth: Some(2),
+        file_type: vec!["f".to_string()],
+        exclude: vec!["excluded".to_string()],
+        ..Default::default()
+    })
+    .expect("search should succeed");
+
+    assert_eq!(
+        results,
+        vec![
+            temp_path
+                .join("visible/public.txt")
+                .to_string_lossy()
+                .replace('\\', "/")
+        ],
+        "min_depth must not bypass directory pruning"
+    );
+}
+
+#[test]
 fn search_with_depth_range() {
     let config = SearchConfig {
         paths: vec![PathBuf::from(".")],
@@ -153,7 +231,7 @@ fn search_with_depth_range() {
 fn search_combines_extension_and_pattern() {
     let config = SearchConfig {
         pattern: Some("Cargo".to_string()),
-        extension: Some("toml".to_string()),
+        extension: vec!["toml".to_string()],
         paths: vec![PathBuf::from(".")],
         max_depth: Some(2),
         ..Default::default()
@@ -176,7 +254,7 @@ fn search_combines_extension_and_pattern() {
 fn search_combines_file_type_and_pattern() {
     let config = SearchConfig {
         pattern: Some("src".to_string()),
-        file_type: Some("d".to_string()),
+        file_type: vec!["d".to_string()],
         paths: vec![PathBuf::from(".")],
         max_depth: Some(2),
         ..Default::default()

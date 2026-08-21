@@ -9,7 +9,7 @@ rescue LoadError => e
     "Install Rust and reinstall fdr to build from source."
 end
 
-# Fast directory recursion for Ruby using Rust
+# File and content search for Ruby
 module Fdr
   class << self
     def search(
@@ -58,13 +58,13 @@ module Fdr
       paths: ["."],
       hidden: false,
       no_ignore: false,
-      case_sensitive: true,
+      case_sensitive: false,
+      content_case_sensitive: true,
       glob: false,
       full_path: false,
       follow: false,
       max_depth: nil,
       min_depth: nil,
-      type: nil,
       extension: nil,
       exclude: [],
       min_size: nil,
@@ -79,12 +79,12 @@ module Fdr
         hidden:,
         no_ignore:,
         case_sensitive:,
+        content_case_sensitive:,
         glob:,
         full_path:,
         follow:,
         max_depth:,
         min_depth:,
-        type:,
         extension:,
         exclude:,
         min_size:,
@@ -93,9 +93,6 @@ module Fdr
         changed_before:
       )
     end
-
-    alias_method :entries, :search
-    alias_method :scan, :search
 
     private :native_search, :native_grep
   end

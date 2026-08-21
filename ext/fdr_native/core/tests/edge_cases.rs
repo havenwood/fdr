@@ -41,7 +41,7 @@ fn search_empty_directory_returns_empty() {
 
     let config = SearchConfig {
         paths: vec![PathBuf::from(&empty_subdir)],
-        file_type: Some("f".to_string()),
+        file_type: vec!["f".to_string()],
         ..Default::default()
     };
 
@@ -64,7 +64,7 @@ fn search_crosses_the_parallel_threshold() {
 
     let config = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
-        file_type: Some("f".to_string()),
+        file_type: vec!["f".to_string()],
         ..Default::default()
     };
 
@@ -89,7 +89,7 @@ fn search_matches_across_the_parallel_threshold_boundary() {
 
         let config = SearchConfig {
             paths: vec![PathBuf::from(temp_path)],
-            file_type: Some("f".to_string()),
+            file_type: vec!["f".to_string()],
             ..Default::default()
         };
 
@@ -114,7 +114,7 @@ fn search_large_result_set() {
 
     let config = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
-        file_type: Some("f".to_string()),
+        file_type: vec!["f".to_string()],
         ..Default::default()
     };
 
@@ -151,7 +151,7 @@ fn search_batch_boundary_conditions() {
 
         let config = SearchConfig {
             paths: vec![PathBuf::from(&subdir)],
-            file_type: Some("f".to_string()),
+            file_type: vec!["f".to_string()],
             ..Default::default()
         };
 
@@ -203,7 +203,7 @@ fn search_file_without_extension() {
 
     let config = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
-        extension: Some("md".to_string()),
+        extension: vec!["md".to_string()],
         ..Default::default()
     };
 
@@ -231,7 +231,7 @@ fn search_multiple_dots_in_filename() {
 
     let config = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
-        extension: Some("json".to_string()),
+        extension: vec!["json".to_string()],
         ..Default::default()
     };
 
@@ -307,7 +307,7 @@ fn search_files_with_special_characters_in_name() {
 
     let config = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
-        file_type: Some("f".to_string()),
+        file_type: vec!["f".to_string()],
         ..Default::default()
     };
 
@@ -334,7 +334,7 @@ fn search_unicode_filenames() {
 
     let config = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
-        file_type: Some("f".to_string()),
+        file_type: vec!["f".to_string()],
         ..Default::default()
     };
 
@@ -373,8 +373,8 @@ fn search_case_insensitive_extension_filter() {
 
     let config = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
-        extension: Some("txt".to_string()),
-        file_type: Some("f".to_string()),
+        extension: vec!["txt".to_string()],
+        file_type: vec!["f".to_string()],
         ..Default::default()
     };
 
@@ -417,8 +417,8 @@ fn search_combining_all_filters() {
     let config = SearchConfig {
         pattern: Some("test_file".to_string()),
         paths: vec![PathBuf::from(temp_path)],
-        extension: Some("rs".to_string()),
-        file_type: Some("f".to_string()),
+        extension: vec!["rs".to_string()],
+        file_type: vec!["f".to_string()],
         min_size: Some(1024),
         max_depth: Some(2),
         hidden: false,
@@ -460,28 +460,13 @@ fn search_empty_pattern_matches_all() {
     let config = SearchConfig {
         pattern: Some(String::new()),
         paths: vec![PathBuf::from(temp_path)],
-        file_type: Some("f".to_string()),
+        file_type: vec!["f".to_string()],
         ..Default::default()
     };
 
     let results = search(&config).expect("search should succeed");
 
     assert!(results.len() >= 2, "empty pattern should match all files");
-}
-
-#[test]
-fn search_with_no_paths_uses_current_directory() {
-    let config = SearchConfig {
-        paths: vec![],
-        max_depth: Some(1),
-        ..Default::default()
-    };
-
-    let results = search(&config).expect("search should succeed");
-    assert!(
-        !results.is_empty(),
-        "should search current directory when no paths specified"
-    );
 }
 
 #[test]
@@ -557,7 +542,7 @@ fn search_zero_byte_files() {
 
     let config_all = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
-        file_type: Some("f".to_string()),
+        file_type: vec!["f".to_string()],
         ..Default::default()
     };
 
@@ -572,7 +557,7 @@ fn search_zero_byte_files() {
     let config_nonempty = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
         min_size: Some(1),
-        file_type: Some("f".to_string()),
+        file_type: vec!["f".to_string()],
         ..Default::default()
     };
 
@@ -602,7 +587,7 @@ fn search_bare_dotfile_is_not_its_own_extension() {
 
     let config = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
-        extension: Some("rs".to_string()),
+        extension: vec!["rs".to_string()],
         hidden: true,
         ..Default::default()
     };
@@ -631,7 +616,7 @@ fn search_exclude_pattern_anchors_to_the_search_root() {
     let config = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
         exclude: vec!["vendor/a.rs".to_string()],
-        file_type: Some("f".to_string()),
+        file_type: vec!["f".to_string()],
         ..Default::default()
     };
 

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "spec_helper"
+require "tmpdir"
 
 describe "Fdr glob patterns" do
   describe "glob option" do
@@ -15,6 +16,18 @@ describe "Fdr glob patterns" do
       refute_empty results, "should find .rb files with glob pattern"
       assert(results.all? { |result| result.end_with?(".rb") },
         "all results should match *.rb pattern")
+    end
+
+    it "matches glob patterns case-insensitively by default" do
+      Dir.mktmpdir("fdr-glob-case") do |dir|
+        File.write(File.join(dir, "README.MD"), "")
+
+        insensitive = Fdr.search(pattern: "readme.*", paths: [dir], glob: true)
+        sensitive = Fdr.search(pattern: "readme.*", paths: [dir], glob: true, case_sensitive: true)
+
+        refute_empty insensitive, "glob should ignore case by default"
+        assert_empty sensitive, "case_sensitive should apply to glob patterns"
+      end
     end
 
     it "supports wildcard matching with *" do
@@ -32,7 +45,7 @@ describe "Fdr glob patterns" do
 
     it "supports question mark wildcards for single characters" do
       results = Fdr.search(
-        pattern: "fdr.rb",
+        pattern: "fd?.rb",
         paths: ["lib"],
         glob: true,
         max_depth: 1
@@ -79,14 +92,11 @@ describe "Fdr glob patterns" do
 
     it "glob and regex produce different results for special chars" do
       # Glob `*` is a wildcard, while regex `*` repeats the preceding token.
-      glob_star = Fdr.search(
-        pattern: "fdr*.rb",
-        paths: ["lib"],
-        glob: true,
-        max_depth: 1
-      )
-      assert(glob_star.any? { |p| p.include?("fdr") },
-        "glob with * should find fdr-prefixed files")
+      glob_results = Fdr.search(pattern: "dr*", paths: ["lib"], glob: true, max_depth: 1)
+      regex_results = Fdr.search(pattern: "dr*", paths: ["lib"], glob: false, max_depth: 1)
+
+      assert_empty glob_results, "glob must match the whole name, so dr* matches nothing in lib"
+      refute_empty regex_results, "regex matches a substring, so dr* matches fdr files"
     end
   end
 
@@ -127,6 +137,19 @@ describe "Fdr glob patterns" do
       )
       assert(results.any? { |result| result.include?("fdr_native") },
         "should match **/fdr_native* pattern in full path")
+    end
+
+    it "applies glob to full paths under an absolute search root" do
+      Dir.mktmpdir("fdr_glob_full_path_test") do |tmpdir|
+        src = File.join(tmpdir, "src")
+        Dir.mkdir(src)
+        File.write(File.join(src, "main.rb"), "x")
+        File.write(File.join(tmpdir, "other.rb"), "x")
+
+        results = Fdr.search(pattern: "**/src/*.rb", paths: [tmpdir], glob: true, full_path: true)
+
+        assert_equal [File.join(src, "main.rb")], results
+      end
     end
 
     it "matches directory structure with glob and full_path" do
