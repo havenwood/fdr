@@ -132,7 +132,7 @@ fn build_extension_regex(config: &SearchConfig) -> Result<Option<Regex>, SearchE
 struct EntryFilters {
     pattern: Option<Regex>,
     extension: Option<Regex>,
-    file_type: Vec<String>,
+    file_type: Vec<FileTypeFilter>,
     /// Applied after walking so shallow ignored or excluded directories can prune.
     min_depth: Option<usize>,
     /// Base for absolute full-path pattern matching, as in fd.
@@ -162,7 +162,11 @@ impl EntryFilters {
         Ok(Self {
             pattern: build_pattern_regex(config)?,
             extension: build_extension_regex(config)?,
-            file_type: config.file_type.clone(),
+            file_type: config
+                .file_type
+                .iter()
+                .filter_map(|file_type| FileTypeFilter::parse(file_type))
+                .collect(),
             min_depth: config.min_depth,
             full_path_base,
             min_size: config.min_size,
@@ -174,22 +178,22 @@ impl EntryFilters {
 
     fn matches(&self, entry: &DirEntry) -> bool {
         let path = entry.path();
-        let search_str = self.full_path_base.as_deref().map_or_else(
-            || path.file_name().unwrap_or_default().to_string_lossy(),
-            |base| {
-                let relative = path.strip_prefix(".").unwrap_or(path);
-                if relative.is_absolute() {
-                    relative.to_string_lossy()
-                } else {
-                    std::borrow::Cow::Owned(base.join(relative).to_string_lossy().into_owned())
-                }
-            },
-        );
 
-        if let Some(regex) = self.pattern.as_ref()
-            && !regex.is_match(search_str.as_bytes())
-        {
-            return false;
+        if let Some(regex) = self.pattern.as_ref() {
+            let search_str = self.full_path_base.as_deref().map_or_else(
+                || path.file_name().unwrap_or_default().to_string_lossy(),
+                |base| {
+                    let relative = path.strip_prefix(".").unwrap_or(path);
+                    if relative.is_absolute() {
+                        relative.to_string_lossy()
+                    } else {
+                        std::borrow::Cow::Owned(base.join(relative).to_string_lossy().into_owned())
+                    }
+                },
+            );
+            if !regex.is_match(search_str.as_bytes()) {
+                return false;
+            }
         }
 
         // Always match extensions against file names, even in full-path mode.
@@ -208,7 +212,7 @@ impl EntryFilters {
             && !self
                 .file_type
                 .iter()
-                .any(|file_type| matches_file_type(entry, file_type))
+                .any(|file_type| file_type.matches(entry))
         {
             return false;
         }
@@ -267,14 +271,30 @@ impl EntryFilters {
 
 pub const FILE_TYPES: [&str; 7] = ["f", "file", "d", "dir", "directory", "l", "symlink"];
 
-fn matches_file_type(entry: &DirEntry, file_type: &str) -> bool {
-    let entry_file_type = entry.file_type();
+#[derive(Clone, Copy)]
+enum FileTypeFilter {
+    File,
+    Dir,
+    Symlink,
+}
 
-    match file_type {
-        "f" | "file" => entry_file_type.is_some_and(|t| t.is_file()),
-        "d" | "dir" | "directory" => entry_file_type.is_some_and(|t| t.is_dir()),
-        "l" | "symlink" => entry_file_type.is_some_and(|t| t.is_symlink()),
-        _ => true,
+impl FileTypeFilter {
+    /// `None` for a name outside `FILE_TYPES`, which leaves entries unfiltered.
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "f" | "file" => Some(Self::File),
+            "d" | "dir" | "directory" => Some(Self::Dir),
+            "l" | "symlink" => Some(Self::Symlink),
+            _ => None,
+        }
+    }
+
+    fn matches(self, entry: &DirEntry) -> bool {
+        entry.file_type().is_some_and(|entry_file_type| match self {
+            Self::File => entry_file_type.is_file(),
+            Self::Dir => entry_file_type.is_dir(),
+            Self::Symlink => entry_file_type.is_symlink(),
+        })
     }
 }
 
@@ -827,13 +847,10 @@ mod tests {
             },
             cancel: &cancel,
         };
-        let matcher = grep_regex::RegexMatcherBuilder::new()
+        let matcher = RegexMatcherBuilder::new()
             .build("needle")
             .expect("should compile regex");
-        let mut searcher = grep_searcher::SearcherBuilder::new()
-            .line_number(true)
-            .binary_detection(grep_searcher::BinaryDetection::quit(b'\0'))
-            .build();
+        let mut searcher = build_searcher();
         let mut collector = LineCollector {
             lines: Vec::new(),
             binary: false,
