@@ -6,36 +6,27 @@
 
 ## Installation
 
-Install `Fdr` from RubyGems:
+Install the gem:
 
 ```bash
 gem install fdr
 ```
 
-Or add it to your application's `Gemfile`, then run `bundle install`:
+Or add it to your `Gemfile`:
 
 ```ruby
 gem 'fdr'
 ```
 
-The extension is built from source at install time, which takes a few seconds.
-
 ### Requirements
 
 - Ruby 3.2+
 - Rust 1.88+
-
-Install Rust with [rustup](https://rustup.rs) if it isn't already available:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Distribution packages are often older than 1.88, so `rustup` is usually the way to go.
+- A C compiler and libclang
 
 ## Usage
 
-`Fdr.search` returns a path-sorted `Array` of matching paths.
+`Fdr.search` returns a path-sorted `Array` of matching paths. Like `fd`, hidden files and ignore-file entries (`.gitignore` and friends) are skipped unless `hidden: true` or `no_ignore: true` is passed. Patterns are [Rust regex](https://docs.rs/regex) Strings, or globs with `glob: true`; matching is case-insensitive by default. Invalid regexes raise `RegexpError`, while invalid globs and option values raise `ArgumentError`. `type` takes `'f'`/`'file'`, `'d'`/`'dir'`/`'directory'` or `'l'`/`'symlink'`. `min_size` and `max_size` are bytes, while `changed_within` and `changed_before` are seconds before now. Nonexistent `paths` and unreadable entries are silently skipped, so a search returns whatever was reachable. With `full_path: true`, patterns match against absolute paths, so globs need a `**/` prefix to match subpaths.
 
 ```ruby
 require 'fdr'
@@ -123,21 +114,19 @@ Fdr.grep(
 )
 ```
 
-Search is case-sensitive by default and works one line at a time, so patterns can't span lines. Binary files are skipped.
+`Fdr.grep` is case-sensitive by default (`case_sensitive` applies to both `pattern` and `name`) and works one line at a time, so patterns can't span lines. Binary files are skipped.
 
 ### Gaps
 
 Missing: `fd`'s owner filters, executable/empty/socket/pipe/device types, smart case and `.fdignore`, plus `rg`'s context lines, fixed-string and multiline matching, inverted matches and replacements. No `--crlf` either, so `needle$` won't match before a CRLF.
 
-Filenames that aren't valid UTF-8 come back with `U+FFFD` replacements, as in `fd`'s output, so they can't be reopened as returned. Input `paths` accept any byte sequence, including `Pathname` objects and non-UTF-8 strings. Colliding replacement paths in `Fdr.grep` share one result with merged line numbers.
+Filenames that aren't valid UTF-8 come back with `U+FFFD` replacements, like `fd`'s output. Input `paths` take any byte sequence, including `Pathname` objects and non-UTF-8 strings. Colliding replacement paths in `Fdr.grep` share one result with merged line numbers.
 
 ## Releasing
 
-1. Bump `lib/fdr/version.rb`, commit and tag.
-2. `git push && git push --tags`
-3. `bundle exec rake gem:verify`
-4. `gem push pkg/fdr-$(ruby -Ilib -rfdr/version -e 'print Fdr::VERSION').gem`
+1. Bump `lib/fdr/version.rb` and commit.
+2. `bundle exec rake release`, which verifies the packaged gem, tags the version, pushes the source and publishes to RubyGems.
 
 ## Attribution
 
-`Fdr` directly borrows code from `fd`, under an MIT license.
+`Fdr` incorporates code from `fd` under the MIT License.
