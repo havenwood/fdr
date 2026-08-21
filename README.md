@@ -1,41 +1,32 @@
 # Fdr
 
-`Fdr` is a fast file search gem for Ruby, implemented with a Rust native extension based on [fd](https://github.com/sharkdp/fd). Its Rust dependencies include ripgrep's [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore), [globset](https://github.com/BurntSushi/ripgrep/tree/master/crates/globset), [grep-regex](https://github.com/BurntSushi/ripgrep/tree/master/crates/regex) and [grep-searcher](https://github.com/BurntSushi/ripgrep/tree/master/crates/searcher) crates, plus [regex](https://github.com/rust-lang/regex) and [crossbeam-channel](https://github.com/crossbeam-rs/crossbeam).
+`Fdr` is a fast file search gem for Ruby, implemented with a Rust native extension directly derived from [fd](https://github.com/sharkdp/fd). Rust deps include ripgrep's [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore), [globset](https://github.com/BurntSushi/ripgrep/tree/master/crates/globset), [grep-regex](https://github.com/BurntSushi/ripgrep/tree/master/crates/regex) and [grep-searcher](https://github.com/BurntSushi/ripgrep/tree/master/crates/searcher) crates, plus [regex](https://github.com/rust-lang/regex) and [crossbeam-channel](https://github.com/crossbeam-rs/crossbeam).
 
-`Fdr` intentionally lacks an `fdr` executable, since `fd` is perfect for that job. If you need fast file searching in a CLI, use `fd`. If you need it from your Ruby code, use `Fdr`.
+`Fdr` doesn't ship with an `fdr` executable. Use `Fdr` from Ruby and the real `fd` from the command line.
 
 ## Installation
 
-Install `Fdr` from RubyGems:
+Install `Fdr`:
 
 ```bash
 gem install fdr
 ```
 
-Or add it to your application's `Gemfile`, then run `bundle install`:
+Or add it to your app and `bundle install`:
 
 ```ruby
 gem 'fdr'
 ```
 
-The extension is built from source at install time, which takes a few seconds.
-
 ### Requirements
 
 - Ruby 3.2+
 - Rust 1.88+
-
-Install Rust with [rustup](https://rustup.rs) if it isn't already available:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Distribution packages are often older than 1.88, so `rustup` is usually the way to go.
+- A C compiler and libclang for the build (Xcode Command Line Tools on macOS, `clang`/`libclang-dev` on Linux)
 
 ## Usage
 
-`Fdr.search` returns a path-sorted `Array` of matching paths.
+`Fdr.search` returns a path-sorted `Array` of matching paths. Like `fd`, hidden files and ignore-file entries (`.gitignore` and friends) are skipped unless `hidden: true` or `no_ignore: true` is passed. Patterns are [Rust regex](https://docs.rs/regex) Strings, or globs with `glob: true`; matching is case-insensitive by default. Invalid regexes raise `RegexpError`, while invalid globs and option values raise `ArgumentError`. `type` takes `'f'`/`'file'`, `'d'`/`'dir'`/`'directory'` or `'l'`/`'symlink'`. `min_size` and `max_size` are bytes, while `changed_within` and `changed_before` are seconds before now. Nonexistent `paths` and unreadable entries are silently skipped, so a search returns whatever was reachable. With `full_path: true`, patterns match against absolute paths, so globs need a `**/` prefix to match subpaths.
 
 ```ruby
 require 'fdr'
@@ -120,21 +111,19 @@ Fdr.grep(
 )
 ```
 
-Search is case-sensitive by default and works one line at a time, so patterns can't span lines. Binary files are skipped.
+`Fdr.grep` is case-sensitive by default (`case_sensitive` applies to both `pattern` and `name`) and works one line at a time, so patterns can't span lines. Binary files are skipped.
 
 ### Gaps
 
-Some non-CLI `fd` features `Fdr` lacks: owner filters, nonfile types, smart case switching and `.fdignore` support.
+Some non-CLI `fd` features `Fdr` lacks: owner filters, the executable/empty/socket/pipe/device file types, smart case switching and `.fdignore` support.
 
-Filenames that aren't valid UTF-8 come back with `U+FFFD` replacements, as in `fd`'s output, so they can't be reopened as returned. Input `paths` accept any byte sequence, including `Pathname` objects and non-UTF-8 strings. Colliding replacement paths in `Fdr.grep` share one result with merged line numbers.
+Filenames that aren't valid UTF-8 come back with `U+FFFD` replacements, like `fd`'s output. Input `paths` take any byte sequence, including `Pathname` objects and non-UTF-8 strings. Colliding replacement paths in `Fdr.grep` share one result with merged line numbers.
 
 ## Releasing
 
-1. Bump `lib/fdr/version.rb`, commit and tag.
-2. `git push && git push --tags`
-3. `bundle exec rake gem:verify`
-4. `gem push pkg/fdr-$(ruby -Ilib -rfdr/version -e 'print Fdr::VERSION').gem`
+1. Bump `lib/fdr/version.rb` and commit.
+2. `bundle exec rake release`, which verifies the packaged gem, tags the version, pushes the source and publishes to RubyGems.
 
 ## Attribution
 
-`Fdr` directly borrows code from `fd`, under an MIT license.
+`Fdr` directly borrows code from `fd` under an MIT license.
