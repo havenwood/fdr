@@ -45,7 +45,8 @@ module Fdr
     ?min_size: Integer?,
     ?max_size: Integer?,
     ?changed_within: Integer?,
-    ?changed_before: Integer?
+    ?changed_before: Integer?,
+    ?ignore_error: ::boolish
   ) -> Array[String]
 
   def self.grep: (
@@ -66,6 +67,7 @@ module Fdr
     ?min_size: Integer?,
     ?max_size: Integer?,
     ?changed_within: Integer?,
-    ?changed_before: Integer?
+    ?changed_before: Integer?,
+    ?ignore_error: ::boolish
   ) -> Hash[String, Hash[Integer, String]]
 end

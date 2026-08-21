@@ -72,6 +72,8 @@ Fdr.grep(
 
 Hidden files and directories are skipped unless `hidden: true` is passed.
 
+Missing or unreadable entries are skipped. Pass `ignore_error: false` to raise `Fdr::IOError` on the first one instead.
+
 Searches release the GVL, support `Timeout` and `Ctrl-C`, and run independently in threads and forks.
 
 `Fdr` covers the common ground. It leaves out `fd`'s owner and exotic type filters and smart case, and `rg`'s context lines, literal and multiline matching, inverted matches and replacements.

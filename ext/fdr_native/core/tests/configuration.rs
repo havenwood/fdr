@@ -158,7 +158,7 @@ fn search_min_depth_greater_than_max_depth() {
     let results = search(&config).expect("search should succeed");
     assert!(
         results.is_empty(),
-        "min_depth above max_depth should match nothing"
+        "an empty depth range should match nothing"
     );
 }
 
@@ -207,6 +207,7 @@ fn search_allows_all_options_combined() {
     let config = SearchConfig {
         pattern: Some("lib".to_string()),
         paths: vec![PathBuf::from(".")],
+        raise_on_error: false,
         hidden: true,
         no_ignore: false,
         case_sensitive: false,

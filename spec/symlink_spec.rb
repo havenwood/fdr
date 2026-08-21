@@ -60,7 +60,7 @@ describe "Symlink behavior" do
     it "finds symlinks themselves when type is not specified" do
       results = Fdr.search(paths: [@tmpdir], follow: false, max_depth: 1)
 
-      assert(results.any? { |path| File.identical?(path, @link_to_dir) || path == @link_to_dir })
+      assert_includes results, @link_to_dir
     end
 
     it "does not follow symlinked files" do
@@ -87,10 +87,10 @@ describe "Symlink behavior" do
       refute_empty results
     end
 
-    it "handles broken symlinks gracefully" do
+    it "lists broken symlinks, like fd" do
       results = Fdr.search(paths: [@tmpdir], follow: true)
 
-      assert_kind_of Array, results
+      assert_includes results, @broken_link
     end
   end
 
@@ -153,10 +153,11 @@ describe "Symlink behavior" do
   end
 
   describe "combination of follow and type" do
-    it 'type: "l" with follow: true finds no symlinks (they are followed)' do
+    it 'type: "l" with follow: true matches only broken symlinks' do
       results = Fdr.search(paths: [@tmpdir], type: "l", follow: true, max_depth: 1)
 
-      assert_empty results, "when following symlinks, they are not reported as symlinks"
+      assert_equal [@broken_link], results,
+        "followed symlinks take their target type, so only broken links remain"
     end
 
     it 'type: "l" with follow: false finds symlinks' do

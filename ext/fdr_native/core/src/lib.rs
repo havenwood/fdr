@@ -7,8 +7,8 @@ use ignore::{DirEntry, WalkBuilder, WalkState};
 use regex::bytes::{Regex, RegexBuilder};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
 #[allow(
@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct SearchConfig {
     pub pattern: Option<String>,
     pub paths: Vec<PathBuf>,
+    /// Inverted so unreadable entries remain skipped by default.
+    pub raise_on_error: bool,
     pub hidden: bool,
     pub no_ignore: bool,
     pub case_sensitive: bool,
@@ -176,7 +178,7 @@ impl EntryFilters {
         })
     }
 
-    fn matches(&self, entry: &DirEntry) -> bool {
+    fn matches(&self, entry: &WalkEntry) -> bool {
         let path = entry.path();
 
         if let Some(regex) = self.pattern.as_ref() {
@@ -220,7 +222,7 @@ impl EntryFilters {
         self.matches_metadata(entry)
     }
 
-    fn matches_metadata(&self, entry: &DirEntry) -> bool {
+    fn matches_metadata(&self, entry: &WalkEntry) -> bool {
         let sized = self.min_size.is_some() || self.max_size.is_some();
         let timed = self.changed_within.is_some() || self.changed_before.is_some();
 
@@ -228,7 +230,7 @@ impl EntryFilters {
             return true;
         }
 
-        let Ok(metadata) = entry.metadata() else {
+        let Some(metadata) = entry.metadata() else {
             return false;
         };
 
@@ -289,13 +291,100 @@ impl FileTypeFilter {
         }
     }
 
-    fn matches(self, entry: &DirEntry) -> bool {
+    fn matches(self, entry: &WalkEntry) -> bool {
         entry.file_type().is_some_and(|entry_file_type| match self {
             Self::File => entry_file_type.is_file(),
             Self::Dir => entry_file_type.is_dir(),
             Self::Symlink => entry_file_type.is_symlink(),
         })
     }
+}
+
+enum WalkEntry {
+    Normal(DirEntry),
+    BrokenSymlink {
+        path: PathBuf,
+        depth: Option<usize>,
+        metadata: std::fs::Metadata,
+    },
+}
+
+impl WalkEntry {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Normal(entry) => entry.path(),
+            Self::BrokenSymlink { path, .. } => path,
+        }
+    }
+
+    fn depth(&self) -> Option<usize> {
+        match self {
+            Self::Normal(entry) => Some(entry.depth()),
+            Self::BrokenSymlink { depth, .. } => *depth,
+        }
+    }
+
+    fn file_type(&self) -> Option<std::fs::FileType> {
+        match self {
+            Self::Normal(entry) => entry.file_type(),
+            Self::BrokenSymlink { metadata, .. } => Some(metadata.file_type()),
+        }
+    }
+
+    fn metadata(&self) -> Option<std::fs::Metadata> {
+        match self {
+            Self::Normal(entry) => entry.metadata().ok(),
+            Self::BrokenSymlink { metadata, .. } => Some(metadata.clone()),
+        }
+    }
+}
+
+/// Formats errors without the path `ignore` repeats.
+fn walk_error(error: &ignore::Error) -> SearchError {
+    let message = match (error, error.io_error()) {
+        (ignore::Error::WithPath { path, .. }, Some(io)) => format!("{}: {io}", path.display()),
+        _ => error.to_string(),
+    };
+
+    SearchError::Io(io::Error::other(message))
+}
+
+fn walk_entry(
+    entry: Result<DirEntry, ignore::Error>,
+    raise_on_error: bool,
+) -> Result<Option<WalkEntry>, SearchError> {
+    let error = match entry {
+        Ok(entry) => return Ok(Some(WalkEntry::Normal(entry))),
+        Err(error) => error,
+    };
+    let raised = raise_on_error.then(|| walk_error(&error));
+
+    broken_symlink_entry(error).map_or_else(
+        || raised.map_or(Ok(None), Err),
+        |recovered| Ok(Some(recovered)),
+    )
+}
+
+fn broken_symlink_entry(error: ignore::Error) -> Option<WalkEntry> {
+    let depth = error.depth();
+    let ignore::Error::WithPath { path, err } = error else {
+        return None;
+    };
+
+    let kind = err.io_error()?.kind();
+    if depth.is_some_and(|depth| depth > 0) && kind != io::ErrorKind::NotFound {
+        return None;
+    }
+
+    let metadata = path.symlink_metadata().ok()?;
+    metadata
+        .file_type()
+        .is_symlink()
+        .then_some(WalkEntry::BrokenSymlink {
+            path,
+            depth,
+            metadata,
+        })
 }
 
 fn configure_walker(
@@ -405,15 +494,14 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
     search_with_cancel(config, &AtomicBool::new(false))
 }
 
-fn search_entry(entry: &DirEntry, filters: &EntryFilters) -> Option<String> {
+fn search_entry(entry: &WalkEntry, filters: &EntryFilters) -> Option<String> {
     // Skip symlinked directory roots the same way in both walkers.
-    if entry.depth() == 0 && entry.path().is_dir() {
+    if entry.depth() == Some(0) && entry.path().is_dir() {
         return None;
     }
 
-    if filters
-        .min_depth
-        .is_some_and(|min_depth| entry.depth() < min_depth)
+    if let Some(min_depth) = filters.min_depth
+        && entry.depth().is_none_or(|depth| depth < min_depth)
     {
         return None;
     }
@@ -429,6 +517,7 @@ fn serial_search(
     builder: &WalkBuilder,
     filters: &EntryFilters,
     cancel: &AtomicBool,
+    raise_on_error: bool,
 ) -> Result<Option<Vec<String>>, SearchError> {
     let mut results = Vec::new();
 
@@ -440,7 +529,7 @@ fn serial_search(
             return Err(SearchError::Cancelled);
         }
 
-        let Ok(entry) = entry else {
+        let Some(entry) = walk_entry(entry, raise_on_error)? else {
             continue;
         };
 
@@ -467,18 +556,20 @@ pub fn search_with_cancel(
         return Ok(Vec::new());
     };
 
-    if let Some(results) = serial_search(&builder, &filters, cancel)? {
+    if let Some(results) = serial_search(&builder, &filters, cancel, config.raise_on_error)? {
         return Ok(results);
     }
 
     let filters = Arc::new(filters);
     let (tx, rx) = unbounded();
+    let failure = Mutex::new(None);
 
     let walker = builder.build_parallel();
 
     walker.run(|| {
         let tx = tx.clone();
         let filters = Arc::clone(&filters);
+        let failure = &failure;
 
         let mut batch = ResultBatch::new(tx);
 
@@ -487,8 +578,13 @@ pub fn search_with_cancel(
                 return WalkState::Quit;
             }
 
-            let Ok(entry) = entry else {
-                return WalkState::Continue;
+            let entry = match walk_entry(entry, config.raise_on_error) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return WalkState::Continue,
+                Err(error) => {
+                    record(failure, error);
+                    return WalkState::Quit;
+                }
             };
 
             if let Some(path) = search_entry(&entry, &filters) {
@@ -503,6 +599,9 @@ pub fn search_with_cancel(
     if cancel.load(Ordering::Relaxed) {
         return Err(SearchError::Cancelled);
     }
+    if let Some(error) = lock(&failure).take() {
+        return Err(error);
+    }
 
     let batches: Vec<Vec<String>> = rx.iter().collect();
     let total_size: usize = batches.iter().map(Vec::len).sum();
@@ -515,6 +614,20 @@ pub fn search_with_cancel(
     results.sort_unstable();
 
     Ok(results)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Keeps the first walk error, since the parallel walkers race.
+fn record(slot: &Mutex<Option<SearchError>>, error: SearchError) {
+    let mut slot = lock(slot);
+    if slot.is_none() {
+        *slot = Some(error);
+    }
 }
 
 struct CancellableReader<'a, R> {
@@ -581,23 +694,31 @@ fn build_searcher() -> Searcher {
         .build()
 }
 
-/// Whether an entry is a file `grep` should scan.
-fn grep_candidate(entry: &DirEntry, filters: &EntryFilters) -> bool {
+fn grep_candidate(
+    entry: &WalkEntry,
+    filters: &EntryFilters,
+    raise_on_error: bool,
+) -> Result<bool, SearchError> {
     if !entry
         .file_type()
         .is_some_and(|file_type| file_type.is_file())
     {
-        return false;
+        if raise_on_error && entry.depth() == Some(0) && !entry.path().is_dir() {
+            return Err(SearchError::Io(io::Error::other(format!(
+                "{}: not a regular file",
+                entry.path().display()
+            ))));
+        }
+        return Ok(false);
     }
 
-    if filters
-        .min_depth
-        .is_some_and(|min_depth| entry.depth() < min_depth)
+    if let Some(min_depth) = filters.min_depth
+        && entry.depth().is_none_or(|depth| depth < min_depth)
     {
-        return false;
+        return Ok(false);
     }
 
-    filters.matches(entry)
+    Ok(filters.matches(entry))
 }
 
 /// Matching lines in `path`, or `None` when it is binary, unreadable, cancelled,
@@ -638,6 +759,7 @@ fn serial_grep(
     matcher: &RegexMatcher,
     filters: &EntryFilters,
     cancel: &AtomicBool,
+    raise_on_error: bool,
 ) -> Result<Option<Vec<GrepResult>>, SearchError> {
     let mut searcher = build_searcher();
     let mut results = Vec::new();
@@ -651,11 +773,11 @@ fn serial_grep(
             return Err(SearchError::Cancelled);
         }
 
-        let Ok(entry) = entry else {
+        let Some(entry) = walk_entry(entry, raise_on_error)? else {
             continue;
         };
 
-        if !grep_candidate(&entry, filters) {
+        if !grep_candidate(&entry, filters, raise_on_error)? {
             continue;
         }
 
@@ -700,19 +822,27 @@ pub fn grep_with_cancel(
         return Ok(Vec::new());
     };
 
-    if let Some(results) = serial_grep(&builder, &matcher, &filters, cancel)? {
+    if let Some(results) = serial_grep(
+        &builder,
+        &matcher,
+        &filters,
+        cancel,
+        config.search.raise_on_error,
+    )? {
         return Ok(results);
     }
 
     let matcher = Arc::new(matcher);
     let filters = Arc::new(filters);
     let (tx, rx) = unbounded();
+    let failure = Mutex::new(None);
     let walker = builder.build_parallel();
 
     walker.run(|| {
         let matcher = Arc::clone(&matcher);
         let filters = Arc::clone(&filters);
         let tx = tx.clone();
+        let failure = &failure;
         let mut searcher = build_searcher();
 
         Box::new(move |entry| {
@@ -720,11 +850,22 @@ pub fn grep_with_cancel(
                 return WalkState::Quit;
             }
 
-            let Ok(entry) = entry else {
-                return WalkState::Continue;
+            let entry = match walk_entry(entry, config.search.raise_on_error) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return WalkState::Continue,
+                Err(error) => {
+                    record(failure, error);
+                    return WalkState::Quit;
+                }
             };
-
-            if !grep_candidate(&entry, &filters) {
+            let candidate = match grep_candidate(&entry, &filters, config.search.raise_on_error) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    record(failure, error);
+                    return WalkState::Quit;
+                }
+            };
+            if !candidate {
                 return WalkState::Continue;
             }
 
@@ -739,6 +880,9 @@ pub fn grep_with_cancel(
     drop(tx);
     if cancel.load(Ordering::Relaxed) {
         return Err(SearchError::Cancelled);
+    }
+    if let Some(error) = lock(&failure).take() {
+        return Err(error);
     }
 
     let mut results: Vec<GrepResult> = rx.iter().collect();

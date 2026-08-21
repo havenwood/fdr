@@ -36,6 +36,7 @@ static MAX_SIZE: LazyId = LazyId::new("max_size");
 static CHANGED_WITHIN: LazyId = LazyId::new("changed_within");
 static CHANGED_BEFORE: LazyId = LazyId::new("changed_before");
 static NAME: LazyId = LazyId::new("name");
+static IGNORE_ERROR: LazyId = LazyId::new("ignore_error");
 
 /// Rejects before coercion so caller `to_str` and `to_ary` errors remain intact.
 fn reject_type(ruby: &Ruby, value: Value, target: &str) -> Error {
@@ -70,6 +71,13 @@ fn extract_optional_arg<T: TryConvert>(hash: RHash, key: &LazyId) -> Result<Opti
         .filter(|val| !val.is_nil())
         .map(TryConvert::try_convert)
         .transpose()
+}
+
+fn extract_boolish(hash: RHash, key: &LazyId, default: bool) -> Result<bool, Error> {
+    hash.get(**key)
+        .map(bool::try_convert)
+        .transpose()
+        .map(|value| value.unwrap_or(default))
 }
 
 /// Runs `func` without the GVL and must not call Ruby. Interrupts call
@@ -421,6 +429,7 @@ fn build_search_config(
     Ok(SearchConfig {
         pattern: extract_string(ruby, kwargs, pattern_key)?,
         paths: extract_paths(ruby, kwargs)?,
+        raise_on_error: !extract_boolish(kwargs, &IGNORE_ERROR, true)?,
         hidden: extract_optional_arg(kwargs, &HIDDEN)?.unwrap_or_default(),
         no_ignore: extract_optional_arg(kwargs, &NO_IGNORE)?.unwrap_or_default(),
         case_sensitive: extract_optional_arg(kwargs, &CASE_SENSITIVE)?.unwrap_or_default(),
@@ -534,11 +543,7 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
         ));
     }
     let search = build_search_config(ruby, kwargs, &NAME, Vec::new())?;
-    let content_case_sensitive = kwargs
-        .get(*CONTENT_CASE_SENSITIVE)
-        .map(bool::try_convert)
-        .transpose()?
-        .unwrap_or(true);
+    let content_case_sensitive = extract_boolish(kwargs, &CONTENT_CASE_SENSITIVE, true)?;
 
     if depth_range_is_empty(&search) {
         return Ok(ruby.hash_new());

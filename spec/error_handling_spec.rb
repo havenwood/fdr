@@ -32,6 +32,71 @@ describe "Fdr error handling" do
     end
   end
 
+  describe "unreadable entries" do
+    def with_unreadable
+      Dir.mktmpdir("fdr-unreadable") do |dir|
+        secret = File.join(dir, "secret")
+        Dir.mkdir(secret)
+        File.write(File.join(secret, "hidden.txt"), "needle\n")
+        File.write(File.join(dir, "ok.txt"), "needle\n")
+        File.chmod(0, secret)
+        begin
+          yield dir
+        ensure
+          File.chmod(0o755, secret)
+        end
+      end
+    end
+
+    it "skips what it cannot read by default, as fd does" do
+      with_unreadable do |dir|
+        assert_includes Fdr.search(paths: [dir]), File.join(dir, "ok.txt")
+        assert_equal [File.join(dir, "ok.txt")], Fdr.grep(pattern: "needle", paths: [dir]).keys
+      end
+    end
+
+    it "raises for an unreadable entry when ignore_error is false" do
+      with_unreadable do |dir|
+        error = assert_raises(Fdr::IOError) do
+          Fdr.search(paths: [dir], ignore_error: false).to_a
+        end
+
+        assert_match(/secret/, error.message)
+        assert_raises(Fdr::IOError) do
+          Fdr.grep(pattern: "needle", paths: [dir], ignore_error: false).to_a
+        end
+      end
+    end
+
+    it "treats nil ignore_error as falsey" do
+      with_unreadable do |dir|
+        assert_raises(Fdr::IOError) do
+          Fdr.search(paths: [dir], ignore_error: nil).to_a
+        end
+        assert_raises(Fdr::IOError) do
+          Fdr.grep(pattern: "needle", paths: [dir], ignore_error: nil).to_a
+        end
+      end
+    end
+
+    it "does not raise on a readable tree when ignore_error is false" do
+      refute_empty Fdr.search(paths: ["lib"], ignore_error: false).to_a
+    end
+    it "raises for an explicit non-file when ignore_error is false" do
+      Dir.mktmpdir("fdr-non-file") do |dir|
+        fifo = File.join(dir, "fifo")
+        File.mkfifo(fifo)
+
+        assert_empty Fdr.grep(pattern: "needle", paths: [fifo]).to_a
+        assert_empty Fdr.grep(pattern: "needle", paths: [dir], ignore_error: false).to_a
+        error = assert_raises(Fdr::IOError) do
+          Fdr.grep(pattern: "needle", paths: [fifo], ignore_error: false).to_a
+        end
+        assert_match(/fifo: not a regular file/, error.message)
+      end
+    end
+  end
+
   describe "invalid patterns" do
     it "handles empty pattern by matching all files" do
       empty_pattern = Fdr.search(pattern: "", paths: ["lib"], max_depth: 1)

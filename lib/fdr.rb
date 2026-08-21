@@ -29,7 +29,8 @@ module Fdr
       min_size: nil,
       max_size: nil,
       changed_within: nil,
-      changed_before: nil
+      changed_before: nil,
+      ignore_error: true
     )
       native_search(
         pattern:,
@@ -48,7 +49,8 @@ module Fdr
         min_size:,
         max_size:,
         changed_within:,
-        changed_before:
+        changed_before:,
+        ignore_error:
       )
     end
 
@@ -70,7 +72,8 @@ module Fdr
       min_size: nil,
       max_size: nil,
       changed_within: nil,
-      changed_before: nil
+      changed_before: nil,
+      ignore_error: true
     )
       native_grep(
         pattern:,
@@ -90,7 +93,8 @@ module Fdr
         min_size:,
         max_size:,
         changed_within:,
-        changed_before:
+        changed_before:,
+        ignore_error:
       )
     end
 
