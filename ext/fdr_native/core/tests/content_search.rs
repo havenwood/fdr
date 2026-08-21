@@ -399,3 +399,27 @@ fn grep_rejects_patterns_matching_a_line_terminator() {
         "a pattern spanning lines should return an error"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn grep_skips_broken_symlinks_when_following() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+    fs::write(temp_path.join("real.txt"), "needle\n").expect("should write fixture");
+    std::os::unix::fs::symlink("missing_target", temp_path.join("dangling.txt"))
+        .expect("should create symlink");
+
+    let results = grep(&needle_in(SearchConfig {
+        follow: true,
+        ..search_under(temp_path)
+    }))
+    .expect("grep should skip broken symlinks");
+
+    assert_eq!(results.len(), 1, "should match only the readable file");
+    assert!(
+        results
+            .first()
+            .is_some_and(|result| result.path.ends_with("real.txt")),
+        "the match should come from the real file"
+    );
+}

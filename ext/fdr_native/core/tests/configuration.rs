@@ -157,8 +157,8 @@ fn search_min_depth_greater_than_max_depth() {
 
     let results = search(&config).expect("search should succeed");
     assert!(
-        !results.is_empty(),
-        "with max_depth=2, should find results up to that depth"
+        results.is_empty(),
+        "an empty depth range should match nothing"
     );
 }
 

@@ -634,3 +634,145 @@ fn search_sizes_symlinks_by_the_link_not_the_target() {
         "should apply size filters only to regular files"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn search_lists_broken_symlinks_when_following() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+
+    fs::write(temp_path.join("present.txt"), "content").expect("should create file");
+    std::os::unix::fs::symlink("missing_target", temp_path.join("dangling.txt"))
+        .expect("should create symlink");
+
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(temp_path)],
+        follow: true,
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(
+        results.iter().any(|path| path.ends_with("dangling.txt")),
+        "follow should still list a broken symlink, as in fd"
+    );
+    assert!(
+        results.iter().any(|path| path.ends_with("present.txt")),
+        "follow should list regular files"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn search_type_symlink_with_follow_matches_only_broken_links() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+
+    fs::write(temp_path.join("present.txt"), "content").expect("should create file");
+    fs::create_dir(temp_path.join("subdir")).expect("should create dir");
+    std::os::unix::fs::symlink("present.txt", temp_path.join("good_file_link"))
+        .expect("should create symlink");
+    std::os::unix::fs::symlink("subdir", temp_path.join("good_dir_link"))
+        .expect("should create symlink");
+    std::os::unix::fs::symlink("missing_target", temp_path.join("dangling.txt"))
+        .expect("should create symlink");
+
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(temp_path)],
+        file_type: Some("l".to_string()),
+        follow: true,
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert_eq!(
+        results.len(),
+        1,
+        "followed good symlinks take their target's type, as in fd -L -t l"
+    );
+    assert!(
+        results.iter().any(|path| path.ends_with("dangling.txt")),
+        "a broken symlink cannot be followed, so it stays a symlink"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn search_finds_broken_symlinks_across_the_parallel_threshold() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+
+    for index in 0..1500 {
+        let file = temp_path.join(format!("file_{index:04}.txt"));
+        File::create(&file).expect("should create file");
+    }
+    std::os::unix::fs::symlink("missing_target", temp_path.join("dangling.txt"))
+        .expect("should create symlink");
+
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(temp_path)],
+        follow: true,
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert_eq!(
+        results.len(),
+        1501,
+        "the parallel walker should also recover broken symlinks"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn search_min_depth_applies_to_broken_symlinks() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+
+    fs::create_dir(temp_path.join("subdir")).expect("should create dir");
+    std::os::unix::fs::symlink("missing_target", temp_path.join("shallow_link"))
+        .expect("should create symlink");
+    std::os::unix::fs::symlink("missing_target", temp_path.join("subdir/deep_link"))
+        .expect("should create symlink");
+
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(temp_path)],
+        follow: true,
+        min_depth: Some(2),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(
+        results.iter().any(|path| path.ends_with("deep_link")),
+        "should keep a broken symlink at min_depth"
+    );
+    assert!(
+        !results.iter().any(|path| path.ends_with("shallow_link")),
+        "min_depth should drop a shallow broken symlink, unlike fd's drop-all"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn search_sizes_exclude_broken_symlinks_when_following() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+
+    fs::write(temp_path.join("present.txt"), "content").expect("should create file");
+    std::os::unix::fs::symlink("missing_target", temp_path.join("dangling.txt"))
+        .expect("should create symlink");
+
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(temp_path)],
+        follow: true,
+        min_size: Some(1),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(
+        !results.iter().any(|path| path.ends_with("dangling.txt")),
+        "size filters apply only to regular files, as in fd -L -S"
+    );
+}

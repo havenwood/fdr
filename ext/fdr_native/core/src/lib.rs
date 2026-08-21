@@ -173,7 +173,7 @@ impl EntryFilters {
         })
     }
 
-    fn matches(&self, entry: &DirEntry) -> bool {
+    fn matches(&self, entry: &WalkEntry) -> bool {
         let path = entry.path();
 
         if let Some(regex) = self.pattern.as_ref() {
@@ -215,7 +215,7 @@ impl EntryFilters {
         self.matches_metadata(entry)
     }
 
-    fn matches_metadata(&self, entry: &DirEntry) -> bool {
+    fn matches_metadata(&self, entry: &WalkEntry) -> bool {
         let sized = self.min_size.is_some() || self.max_size.is_some();
         let timed = self.changed_within.is_some() || self.changed_before.is_some();
 
@@ -223,7 +223,7 @@ impl EntryFilters {
             return true;
         }
 
-        let Ok(metadata) = entry.metadata() else {
+        let Some(metadata) = entry.metadata() else {
             return false;
         };
 
@@ -286,13 +286,85 @@ impl FileTypeFilter {
         }
     }
 
-    fn matches(self, entry: &DirEntry) -> bool {
+    fn matches(self, entry: &WalkEntry) -> bool {
         entry.file_type().is_some_and(|entry_file_type| match self {
             Self::File => entry_file_type.is_file(),
             Self::Dir => entry_file_type.is_dir(),
             Self::Symlink => entry_file_type.is_symlink(),
         })
     }
+}
+
+/// A normal entry or a recovered broken symlink.
+enum WalkEntry {
+    Normal(DirEntry),
+    BrokenSymlink {
+        path: PathBuf,
+        depth: Option<usize>,
+        metadata: std::fs::Metadata,
+    },
+}
+
+impl WalkEntry {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Normal(entry) => entry.path(),
+            Self::BrokenSymlink { path, .. } => path,
+        }
+    }
+
+    fn depth(&self) -> Option<usize> {
+        match self {
+            Self::Normal(entry) => Some(entry.depth()),
+            Self::BrokenSymlink { depth, .. } => *depth,
+        }
+    }
+
+    fn file_type(&self) -> Option<std::fs::FileType> {
+        match self {
+            Self::Normal(entry) => entry.file_type(),
+            Self::BrokenSymlink { metadata, .. } => Some(metadata.file_type()),
+        }
+    }
+
+    fn metadata(&self) -> Option<std::fs::Metadata> {
+        match self {
+            Self::Normal(entry) => entry.metadata().ok(),
+            Self::BrokenSymlink { metadata, .. } => Some(metadata.clone()),
+        }
+    }
+}
+
+fn walk_entry(entry: Result<DirEntry, ignore::Error>) -> Option<WalkEntry> {
+    match entry {
+        Ok(entry) => Some(WalkEntry::Normal(entry)),
+        Err(error) => broken_symlink_entry(error),
+    }
+}
+
+/// Recovers a broken symlink entry from a `follow_links` walker error.
+fn broken_symlink_entry(error: ignore::Error) -> Option<WalkEntry> {
+    let depth = error.depth();
+    let ignore::Error::WithPath { path, err } = error else {
+        return None;
+    };
+
+    if err
+        .io_error()
+        .is_none_or(|io_error| io_error.kind() != std::io::ErrorKind::NotFound)
+    {
+        return None;
+    }
+
+    let metadata = path.symlink_metadata().ok()?;
+    metadata
+        .file_type()
+        .is_symlink()
+        .then_some(WalkEntry::BrokenSymlink {
+            path,
+            depth,
+            metadata,
+        })
 }
 
 fn configure_walker(
@@ -401,16 +473,15 @@ pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
 }
 
 /// Path to report for an entry, or `None` when it is filtered out.
-fn search_entry(entry: &DirEntry, filters: &EntryFilters) -> Option<String> {
+fn search_entry(entry: &WalkEntry, filters: &EntryFilters) -> Option<String> {
     // Path::is_dir follows symlinks, so a symlink-to-dir root is skipped
     // consistently by the serial and parallel walkers.
-    if entry.depth() == 0 && entry.path().is_dir() {
+    if entry.depth() == Some(0) && entry.path().is_dir() {
         return None;
     }
 
-    if filters
-        .min_depth
-        .is_some_and(|min_depth| entry.depth() < min_depth)
+    if let Some(min_depth) = filters.min_depth
+        && entry.depth().is_none_or(|depth| depth < min_depth)
     {
         return None;
     }
@@ -437,7 +508,7 @@ fn serial_search(
             return Err(SearchError::Cancelled);
         }
 
-        let Ok(entry) = entry else {
+        let Some(entry) = walk_entry(entry) else {
             continue;
         };
 
@@ -484,7 +555,7 @@ pub fn search_with_cancel(
                 return WalkState::Quit;
             }
 
-            let Ok(entry) = entry else {
+            let Some(entry) = walk_entry(entry) else {
                 return WalkState::Continue;
             };
 
@@ -569,8 +640,8 @@ fn build_searcher() -> Searcher {
         .build()
 }
 
-/// Whether an entry is a file `grep` should scan.
-fn grep_candidate(entry: &DirEntry, filters: &EntryFilters) -> bool {
+/// Whether a walker entry is a file `grep` should scan.
+fn grep_candidate(entry: &WalkEntry, filters: &EntryFilters) -> bool {
     if !entry
         .file_type()
         .is_some_and(|file_type| file_type.is_file())
@@ -578,9 +649,8 @@ fn grep_candidate(entry: &DirEntry, filters: &EntryFilters) -> bool {
         return false;
     }
 
-    if filters
-        .min_depth
-        .is_some_and(|min_depth| entry.depth() < min_depth)
+    if let Some(min_depth) = filters.min_depth
+        && entry.depth().is_none_or(|depth| depth < min_depth)
     {
         return false;
     }
@@ -642,6 +712,7 @@ fn serial_grep(
         let Ok(entry) = entry else {
             continue;
         };
+        let entry = WalkEntry::Normal(entry);
 
         if !grep_candidate(&entry, filters) {
             continue;
@@ -706,6 +777,7 @@ pub fn grep_with_cancel(
             let Ok(entry) = entry else {
                 return WalkState::Continue;
             };
+            let entry = WalkEntry::Normal(entry);
 
             if !grep_candidate(&entry, &filters) {
                 return WalkState::Continue;
