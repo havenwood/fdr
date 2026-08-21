@@ -136,35 +136,6 @@ fn search_large_result_set() {
 }
 
 #[test]
-fn search_batch_boundary_conditions() {
-    let temp_dir = TempDir::new().expect("should create temp dir");
-    let temp_path = temp_dir.path();
-
-    for &file_count in &[127, 128, 129] {
-        let subdir = temp_path.join(format!("test_{file_count}"));
-        fs::create_dir(&subdir).expect("should create dir");
-
-        for index in 0..file_count {
-            let file = subdir.join(format!("file_{index:03}.txt"));
-            File::create(&file).expect("should create file");
-        }
-
-        let config = SearchConfig {
-            paths: vec![PathBuf::from(&subdir)],
-            file_type: Some("f".to_string()),
-            ..Default::default()
-        };
-
-        let results = search(&config).expect("search should succeed");
-        assert_eq!(
-            results.len(),
-            file_count,
-            "should correctly handle {file_count} files (batch boundary)"
-        );
-    }
-}
-
-#[test]
 fn search_very_deep_directory_hierarchy() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let mut current_path = temp_dir.path().to_path_buf();

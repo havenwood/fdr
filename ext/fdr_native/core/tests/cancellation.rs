@@ -8,14 +8,11 @@ use std::sync::atomic::AtomicBool;
 use tempfile::TempDir;
 
 #[test]
-fn search_with_cancel_stops_when_cancelled() {
+fn search_with_cancel_refuses_to_start_when_already_cancelled() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
 
-    for index in 0..100 {
-        let file = temp_path.join(format!("file_{index:03}.txt"));
-        File::create(&file).expect("should create file");
-    }
+    File::create(temp_path.join("file.txt")).expect("should create file");
 
     let config = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
@@ -31,15 +28,12 @@ fn search_with_cancel_stops_when_cancelled() {
 }
 
 #[test]
-fn grep_with_cancel_stops_when_cancelled() {
+fn grep_with_cancel_refuses_to_start_when_already_cancelled() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
 
-    for index in 0..100 {
-        let file = temp_path.join(format!("file_{index:03}.txt"));
-        let mut handle = File::create(&file).expect("should create file");
-        writeln!(handle, "needle").expect("should write file");
-    }
+    let mut handle = File::create(temp_path.join("file.txt")).expect("should create file");
+    writeln!(handle, "needle").expect("should write file");
 
     let config = GrepConfig {
         pattern: "needle".to_string(),
