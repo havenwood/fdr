@@ -268,19 +268,11 @@ fn core_error(ruby: &Ruby, operation: &str, error: &SearchError) -> Error {
     }
 }
 
-fn depth_range_is_empty(config: &SearchConfig) -> bool {
-    matches!((config.min_depth, config.max_depth), (Some(min), Some(max)) if min > max)
-}
-
 fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
     let kwargs = args_scan.keywords;
     let file_type = extract_file_type(ruby, kwargs)?;
     let config = build_search_config(ruby, kwargs, &PATTERN, file_type)?;
-
-    if depth_range_is_empty(&config) {
-        return Ok(ruby.ary_new());
-    }
 
     let cancel = Arc::new(AtomicBool::new(false));
     let results = interruptible(ruby, &cancel, move |cancel| {
@@ -305,10 +297,6 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
     let search = build_search_config(ruby, kwargs, &NAME, None)?;
     let content_case_sensitive =
         extract_optional_arg(kwargs, &CONTENT_CASE_SENSITIVE)?.unwrap_or(true);
-
-    if depth_range_is_empty(&search) {
-        return Ok(ruby.hash_new());
-    }
 
     let config = GrepConfig {
         pattern,

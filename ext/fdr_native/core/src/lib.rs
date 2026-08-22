@@ -412,6 +412,10 @@ fn configure_walker(
     Ok(())
 }
 
+fn depth_range_is_empty(config: &SearchConfig) -> bool {
+    matches!((config.min_depth, config.max_depth), (Some(min), Some(max)) if min > max)
+}
+
 /// `ignore` reads a bare `-` as stdin, so name the file explicitly.
 fn stdin_safe(path: &Path) -> std::borrow::Cow<'_, Path> {
     if path == Path::new("-") {
@@ -549,6 +553,9 @@ pub fn search_with_cancel(
     let Some(builder) = build_walker(config)? else {
         return Ok(Vec::new());
     };
+    if depth_range_is_empty(config) {
+        return Ok(Vec::new());
+    }
 
     if let Some(results) = serial_search(&builder, &filters, cancel)? {
         return Ok(results);
@@ -768,6 +775,9 @@ pub fn grep_with_cancel(
     let Some(builder) = build_walker(&config.search)? else {
         return Ok(Vec::new());
     };
+    if depth_range_is_empty(&config.search) {
+        return Ok(Vec::new());
+    }
 
     if let Some(results) = serial_grep(&builder, &matcher, &filters, cancel)? {
         return Ok(results);
