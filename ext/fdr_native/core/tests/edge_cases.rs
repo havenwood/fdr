@@ -1,9 +1,20 @@
 //! Integration tests for edge cases and boundary conditions
 
-use fdr_core::{SearchConfig, search};
+use fdr_core::{SearchConfig, SearchError, search as search_bytes};
 use std::fs::{self, File};
 use std::path::PathBuf;
 use tempfile::TempDir;
+
+fn lossy(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
+fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
+    Ok(search_bytes(config)?
+        .iter()
+        .map(|path| lossy(path))
+        .collect())
+}
 
 #[cfg(target_os = "linux")]
 #[test]

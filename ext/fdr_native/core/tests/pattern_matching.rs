@@ -1,7 +1,18 @@
 //! Integration tests for pattern matching functionality
 
-use fdr_core::{SearchConfig, search};
+use fdr_core::{SearchConfig, SearchError, search as search_bytes};
 use std::path::PathBuf;
+
+fn lossy(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
+fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
+    Ok(search_bytes(config)?
+        .iter()
+        .map(|path| lossy(path))
+        .collect())
+}
 
 #[test]
 fn search_without_pattern_finds_all_files() {

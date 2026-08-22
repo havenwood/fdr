@@ -6,7 +6,9 @@ use fdr_core::{
 };
 use magnus::scan_args::scan_args;
 use magnus::value::LazyId;
-use magnus::{Error, RArray, RHash, Ruby, Symbol, TryConvert, Value, function, prelude::*};
+use magnus::{
+    Error, RArray, RHash, RString, Ruby, Symbol, TryConvert, Value, function, prelude::*,
+};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr;
@@ -247,6 +249,14 @@ fn build_search_config(
     })
 }
 
+/// Raw path bytes tagged with the filesystem encoding, as `Dir.glob` does.
+fn path_string(ruby: &Ruby, path: &[u8]) -> Result<RString, Error> {
+    let string = ruby.str_from_slice(path);
+    string.enc_associate(ruby.filesystem_encoding())?;
+
+    Ok(string)
+}
+
 fn core_error(ruby: &Ruby, operation: &str, error: &SearchError) -> Error {
     match error {
         SearchError::Cancelled => Error::new(
@@ -279,8 +289,13 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
         search_with_cancel(&config, cancel)
     })?
     .map_err(|err| core_error(ruby, "Search", &err))?;
+    let array = ruby.ary_new_capa(results.len());
 
-    Ok(ruby.ary_from_vec(results))
+    for path in &results {
+        array.push(path_string(ruby, path)?)?;
+    }
+
+    Ok(array)
 }
 
 fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
@@ -312,7 +327,7 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
 
     for result in results {
         ruby_results.aset(
-            ruby.str_new(&result.path),
+            path_string(ruby, &result.path)?,
             ruby.ary_from_vec(result.line_numbers),
         )?;
     }

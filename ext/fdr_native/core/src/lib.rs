@@ -57,7 +57,7 @@ impl Default for GrepConfig {
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct GrepResult {
-    pub path: String,
+    pub path: Vec<u8>,
     pub line_numbers: Vec<u64>,
 }
 
@@ -431,10 +431,6 @@ fn configure_walker(
     Ok(())
 }
 
-fn depth_range_is_empty(config: &SearchConfig) -> bool {
-    matches!((config.min_depth, config.max_depth), (Some(min), Some(max)) if min > max)
-}
-
 /// `ignore` reads a bare `-` as stdin, so name the file explicitly.
 fn stdin_safe(path: &Path) -> std::borrow::Cow<'_, Path> {
     if path == Path::new("-") {
@@ -442,6 +438,10 @@ fn stdin_safe(path: &Path) -> std::borrow::Cow<'_, Path> {
     } else {
         std::borrow::Cow::Borrowed(path)
     }
+}
+
+fn depth_range_is_empty(config: &SearchConfig) -> bool {
+    matches!((config.min_depth, config.max_depth), (Some(min), Some(max)) if min > max)
 }
 
 fn build_walker(config: &SearchConfig) -> Result<Option<WalkBuilder>, SearchError> {
@@ -474,19 +474,19 @@ const GREP_SERIAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Wrapper for batched result sending with automatic flush on drop.
 struct ResultBatch {
-    batch: Vec<String>,
-    sender: crossbeam_channel::Sender<Vec<String>>,
+    batch: Vec<Vec<u8>>,
+    sender: crossbeam_channel::Sender<Vec<Vec<u8>>>,
 }
 
 impl ResultBatch {
-    fn new(sender: crossbeam_channel::Sender<Vec<String>>) -> Self {
+    fn new(sender: crossbeam_channel::Sender<Vec<Vec<u8>>>) -> Self {
         Self {
             batch: Vec::with_capacity(BATCH_SIZE),
             sender,
         }
     }
 
-    fn push(&mut self, item: String) {
+    fn push(&mut self, item: Vec<u8>) {
         self.batch.push(item);
         if self.batch.len() >= BATCH_SIZE {
             self.flush();
@@ -507,12 +507,12 @@ impl Drop for ResultBatch {
     }
 }
 
-pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
+pub fn search(config: &SearchConfig) -> Result<Vec<Vec<u8>>, SearchError> {
     search_with_cancel(config, &AtomicBool::new(false))
 }
 
 /// Path to report for an entry, or `None` when it is filtered out.
-fn search_entry(entry: &WalkEntry, filters: &EntryFilters) -> Option<String> {
+fn search_entry(entry: &WalkEntry, filters: &EntryFilters) -> Option<Vec<u8>> {
     // Path::is_dir follows symlinks, so a symlink-to-dir root is skipped
     // consistently by the serial and parallel walkers.
     if entry.depth() == Some(0) && entry.path().is_dir() {
@@ -529,14 +529,14 @@ fn search_entry(entry: &WalkEntry, filters: &EntryFilters) -> Option<String> {
         return None;
     }
 
-    Some(path_to_string(entry.path()))
+    Some(path_to_bytes(entry.path()))
 }
 
 fn serial_search(
     builder: &WalkBuilder,
     filters: &EntryFilters,
     cancel: &AtomicBool,
-) -> Result<Option<Vec<String>>, SearchError> {
+) -> Result<Option<Vec<Vec<u8>>>, SearchError> {
     let mut results = Vec::new();
     let mut directories = 0;
 
@@ -551,7 +551,10 @@ fn serial_search(
         let Some(entry) = walk_entry(entry) else {
             continue;
         };
-        if entry.file_type().is_some_and(|file_type| file_type.is_dir()) {
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+        {
             directories += 1;
         }
 
@@ -572,7 +575,7 @@ fn serial_search(
 pub fn search_with_cancel(
     config: &SearchConfig,
     cancel: &AtomicBool,
-) -> Result<Vec<String>, SearchError> {
+) -> Result<Vec<Vec<u8>>, SearchError> {
     let filters = EntryFilters::new(config)?;
     let Some(builder) = build_walker(config)? else {
         return Ok(Vec::new());
@@ -618,7 +621,7 @@ pub fn search_with_cancel(
         return Err(SearchError::Cancelled);
     }
 
-    let batches: Vec<Vec<String>> = rx.iter().collect();
+    let batches: Vec<Vec<Vec<u8>>> = rx.iter().collect();
     let total_size: usize = batches.iter().map(Vec::len).sum();
     let mut results = Vec::with_capacity(total_size);
 
@@ -729,7 +732,7 @@ fn grep_file(
         && !collector.line_numbers.is_empty()
     {
         Some(GrepResult {
-            path: path_to_string(path),
+            path: path_to_bytes(path),
             line_numbers: collector.line_numbers,
         })
     } else {
@@ -852,8 +855,17 @@ pub fn grep_with_cancel(
     Ok(results)
 }
 
-fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+/// Raw OS bytes, so the path still opens the file.
+fn path_to_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
 }
 
 fn merge_colliding_paths(results: &mut Vec<GrepResult>) {
@@ -878,32 +890,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn path_to_string_preserves_utf8() {
-        assert_eq!(path_to_string(Path::new("lib/fdr.rb")), "lib/fdr.rb");
+    fn path_to_bytes_preserves_utf8() {
+        assert_eq!(path_to_bytes(Path::new("lib/fdr.rb")), b"lib/fdr.rb");
     }
 
     #[cfg(unix)]
     #[test]
-    fn path_to_string_replaces_invalid_utf8() {
+    fn path_to_bytes_preserves_invalid_utf8() {
         use std::os::unix::ffi::OsStrExt;
 
         let path = Path::new(std::ffi::OsStr::from_bytes(b"bad\xffname.txt"));
-        assert_eq!(path_to_string(path), "bad\u{FFFD}name.txt");
+        assert_eq!(path_to_bytes(path), b"bad\xffname.txt");
     }
 
     #[test]
     fn merge_colliding_paths_merges_line_numbers_of_equal_paths() {
         let mut results = vec![
             GrepResult {
-                path: "a\u{FFFD}.txt".into(),
+                path: b"a\xff.txt".to_vec(),
                 line_numbers: vec![2, 3],
             },
             GrepResult {
-                path: "a\u{FFFD}.txt".into(),
+                path: b"a\xff.txt".to_vec(),
                 line_numbers: vec![3, 7],
             },
             GrepResult {
-                path: "b.txt".into(),
+                path: b"b.txt".to_vec(),
                 line_numbers: vec![1],
             },
         ];
@@ -914,11 +926,11 @@ mod tests {
             results,
             vec![
                 GrepResult {
-                    path: "a\u{FFFD}.txt".into(),
+                    path: b"a\xff.txt".to_vec(),
                     line_numbers: vec![2, 3, 7],
                 },
                 GrepResult {
-                    path: "b.txt".into(),
+                    path: b"b.txt".to_vec(),
                     line_numbers: vec![1],
                 },
             ]

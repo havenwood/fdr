@@ -1,9 +1,28 @@
 //! Integration tests for file content search
 
-use fdr_core::{GrepConfig, SearchConfig, grep};
+use fdr_core::{GrepConfig, SearchConfig, SearchError, grep as grep_bytes};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+fn lossy(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
+struct LossyGrep {
+    path: String,
+    line_numbers: Vec<u64>,
+}
+
+fn grep(config: &GrepConfig) -> Result<Vec<LossyGrep>, SearchError> {
+    Ok(grep_bytes(config)?
+        .into_iter()
+        .map(|result| LossyGrep {
+            path: lossy(&result.path),
+            line_numbers: result.line_numbers,
+        })
+        .collect())
+}
 
 fn search_under(path: &Path) -> SearchConfig {
     SearchConfig {
