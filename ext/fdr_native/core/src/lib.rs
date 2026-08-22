@@ -392,6 +392,12 @@ fn configure_walker(
         // silently anchor slash-containing patterns to the process cwd.
         let mut overrides = ignore::overrides::OverrideBuilder::new(root);
         for pattern in &config.exclude {
+            // A blank glob becomes a bare `!`, which excludes the whole tree.
+            if pattern.trim().is_empty() {
+                return Err(SearchError::InvalidInput(
+                    "exclude patterns cannot be blank".to_owned(),
+                ));
+            }
             overrides
                 .add(&format!("!{pattern}"))
                 .map_err(|error| SearchError::InvalidInput(error.to_string()))?;
