@@ -479,11 +479,15 @@ fn build_walker(config: &SearchConfig) -> Result<Option<WalkBuilder>, SearchErro
 /// Batch size for result collection (same as fd's default).
 const BATCH_SIZE: usize = 256;
 
-/// Small trees avoid the parallel walker's polling overhead.
-const PARALLEL_THRESHOLD: usize = 1024;
+/// `ignore` parallelizes over directories, so entry count is not a useful cue.
+const DIRECTORY_THRESHOLD: usize = 64;
 
-/// Grep switches earlier because each entry scans file contents.
-const GREP_PARALLEL_THRESHOLD: usize = 64;
+fn parallel_search_required(directories: usize) -> bool {
+    directories >= DIRECTORY_THRESHOLD
+}
+
+/// Grep scans contents per entry, so threads pay off sooner than for search.
+const GREP_PARALLEL_THRESHOLD: usize = 512;
 
 /// Limits discarded work during serial grep pre-scan.
 const GREP_SERIAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -553,9 +557,10 @@ fn serial_search(
     raise_on_error: bool,
 ) -> Result<Option<Vec<String>>, SearchError> {
     let mut results = Vec::new();
+    let mut directories = 0;
 
-    for (visited, entry) in builder.build().enumerate() {
-        if visited >= PARALLEL_THRESHOLD {
+    for entry in builder.build() {
+        if parallel_search_required(directories) {
             return Ok(None);
         }
         if cancel.load(Ordering::Relaxed) {
@@ -565,6 +570,12 @@ fn serial_search(
         let Some(entry) = walk_entry(entry, raise_on_error)? else {
             continue;
         };
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+        {
+            directories += 1;
+        }
 
         if let Some(path) = search_entry(&entry, filters) {
             results.push(path);
@@ -955,6 +966,49 @@ fn glob_to_regex(glob: &str) -> Result<String, globset::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    #[cfg(unix)]
+    fn parallel_search_restarts_without_losing_entries() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp_dir = TempDir::new().expect("should create temp dir");
+        let temp_path = temp_dir.path();
+
+        for index in 0..DIRECTORY_THRESHOLD {
+            let directory = temp_path.join(format!("dir_{index:04}"));
+            std::fs::create_dir(&directory).expect("should create directory");
+            std::fs::File::create(directory.join("file.txt")).expect("should create file");
+        }
+        let dangling = temp_path.join("dangling.txt");
+        std::os::unix::fs::symlink("missing_target", &dangling).expect("should create symlink");
+
+        let config = SearchConfig {
+            paths: vec![temp_path.to_path_buf()],
+            follow: true,
+            ..Default::default()
+        };
+        let filters = EntryFilters::new(&config).expect("should build filters");
+        let builder = build_walker(&config)
+            .expect("should build walker")
+            .expect("paths should produce a walker");
+
+        assert!(
+            serial_search(&builder, &filters, &AtomicBool::new(false), false)
+                .expect("serial pre-scan should succeed")
+                .is_none(),
+            "the directory threshold should select the parallel walker"
+        );
+
+        let results = search(&config).expect("parallel search should succeed");
+        assert_eq!(results.len(), DIRECTORY_THRESHOLD * 2 + 1);
+        assert!(
+            results
+                .iter()
+                .any(|path| AsRef::<[u8]>::as_ref(path) == dangling.as_os_str().as_bytes())
+        );
+    }
 
     #[cfg(unix)]
     #[test]

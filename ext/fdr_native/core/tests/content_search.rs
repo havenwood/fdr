@@ -527,8 +527,8 @@ fn grep_skips_broken_symlinks_when_following() {
     assert_eq!(results.len(), 1, "should match only the readable file");
     assert!(
         results
-             .first()
-             .is_some_and(|result| result.path.ends_with("real.txt")),
+            .first()
+            .is_some_and(|result| result.path.ends_with("real.txt")),
         "the match should come from the real file"
     );
 }
