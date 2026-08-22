@@ -113,6 +113,20 @@ describe "Fdr search options" do
       assert_includes results, "lib/fdr.rb"
     end
 
+    it "accepts a path responding to to_path" do
+      path = Object.new
+      def path.to_path = "lib"
+
+      assert_includes Fdr.search(paths: [path], max_depth: 1), "lib/fdr.rb"
+    end
+
+    it "accepts a paths value responding to to_ary" do
+      paths = Object.new
+      def paths.to_ary = ["lib"]
+
+      assert_includes Fdr.search(paths:, max_depth: 1), "lib/fdr.rb"
+    end
+
     it "limits results to specified paths only" do
       lib_only = Fdr.search(extension: "rb", paths: ["lib"], max_depth: 1)
       spec_only = Fdr.search(extension: "rb", paths: ["spec"], max_depth: 1)
@@ -250,6 +264,21 @@ describe "Fdr search options" do
 
       assert without_ignore.size > with_ignore.size,
         "no_ignore should find more files than respecting .gitignore"
+    end
+  end
+
+  describe "a search path named `-`" do
+    # Runs in a child so the chdir cannot disturb the parallel suite.
+    it "searches the file, not stdin" do
+      Dir.mktmpdir("fdr-dash") do |dir|
+        File.write(File.join(dir, "-"), "content")
+        script = "require 'fdr'; print Fdr.search(paths: ['-']).inspect"
+        lib = File.expand_path("../lib", __dir__)
+        output, status = Open3.capture2(Gem.ruby, "-I#{lib}", "-e", script, chdir: dir)
+
+        assert_predicate status, :success?
+        assert_equal ["./-"].inspect, output
+      end
     end
   end
 end

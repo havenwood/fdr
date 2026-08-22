@@ -429,6 +429,15 @@ fn build_overrides(
         .map_err(|error| SearchError::InvalidInput(error.to_string()))
 }
 
+/// Adds `./` to bare `-` because `ignore` treats it as stdin.
+fn stdin_safe(path: &Path) -> std::borrow::Cow<'_, Path> {
+    if path == Path::new("-") {
+        std::borrow::Cow::Owned(PathBuf::from("./-"))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
 /// Uses half the cores because directory I/O, not CPU, limits walking.
 fn walk_threads() -> usize {
     std::thread::available_parallelism()
@@ -448,10 +457,10 @@ fn build_walker(config: &SearchConfig) -> Result<Option<WalkBuilder>, SearchErro
     let Some((first_path, rest)) = config.paths.split_first() else {
         return Ok(None);
     };
-    let mut builder = WalkBuilder::new(first_path);
+    let mut builder = WalkBuilder::new(stdin_safe(first_path));
 
     for path in rest {
-        builder.add(path);
+        builder.add(stdin_safe(path));
     }
 
     configure_walker(&mut builder, config);

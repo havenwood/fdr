@@ -72,7 +72,7 @@ Fdr.grep(
 
 Hidden files and directories are skipped unless `hidden: true` is passed.
 
-Missing or unreadable entries are skipped. Pass `ignore_error: false` to raise `Fdr::IOError` on the first one instead.
+Missing or unreadable entries are skipped. Pass `ignore_error: false` to raise `Fdr::IOError` on the first one instead. A bare `'-'` names the file `./-` rather than standard input.
 
 Searches release the GVL, support `Timeout` and `Ctrl-C`, and run independently in threads and forks.
 
