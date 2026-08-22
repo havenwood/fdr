@@ -443,11 +443,12 @@ fn build_walker(config: &SearchConfig) -> Result<Option<WalkBuilder>, SearchErro
 /// Batch size for result collection (same as fd's default).
 const BATCH_SIZE: usize = 256;
 
-/// Small trees avoid the parallel walker's polling overhead.
-const PARALLEL_THRESHOLD: usize = 1024;
+/// Parallelism scales with directories, not entries. Low because bailing
+/// discards the walk so far.
+const DIRECTORY_THRESHOLD: usize = 64;
 
-/// Grep switches earlier because each entry scans file contents.
-const GREP_PARALLEL_THRESHOLD: usize = 64;
+/// Grep scans contents per entry, so threads pay off sooner than for search.
+const GREP_PARALLEL_THRESHOLD: usize = 512;
 
 /// Serial grep's byte limit bounds discarded pre-scan work.
 const GREP_SERIAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -518,9 +519,10 @@ fn serial_search(
     cancel: &AtomicBool,
 ) -> Result<Option<Vec<String>>, SearchError> {
     let mut results = Vec::new();
+    let mut directories = 0;
 
-    for (visited, entry) in builder.build().enumerate() {
-        if visited >= PARALLEL_THRESHOLD {
+    for entry in builder.build() {
+        if directories >= DIRECTORY_THRESHOLD {
             return Ok(None);
         }
         if cancel.load(Ordering::Relaxed) {
@@ -530,6 +532,9 @@ fn serial_search(
         let Some(entry) = walk_entry(entry) else {
             continue;
         };
+        if entry.file_type().is_some_and(|file_type| file_type.is_dir()) {
+            directories += 1;
+        }
 
         if let Some(path) = search_entry(&entry, filters) {
             results.push(path);
