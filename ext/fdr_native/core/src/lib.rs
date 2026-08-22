@@ -135,6 +135,7 @@ struct EntryFilters {
     min_depth: Option<usize>,
     /// Base for absolute full-path pattern matching, as in fd.
     full_path_base: Option<PathBuf>,
+    follow: bool,
     min_size: Option<u64>,
     max_size: Option<u64>,
     /// Earliest modification time allowed by `changed_within`.
@@ -166,6 +167,7 @@ impl EntryFilters {
             file_type: config.file_type.as_deref().and_then(FileTypeFilter::parse),
             min_depth: config.min_depth,
             full_path_base,
+            follow: config.follow,
             min_size: config.min_size,
             max_size: config.max_size,
             changed_within: config.changed_within.map(cutoff),
@@ -207,12 +209,29 @@ impl EntryFilters {
         }
 
         if let Some(file_type) = self.file_type
-            && !file_type.matches(entry)
+            && !self
+                .entry_metadata(entry)
+                .is_some_and(|metadata| file_type.matches(metadata.file_type()))
         {
             return false;
         }
 
         self.matches_metadata(entry)
+    }
+
+    /// Stats roots by `follow`, since the walkers disagree at depth 0.
+    fn entry_metadata(&self, entry: &WalkEntry) -> Option<std::fs::Metadata> {
+        match entry {
+            WalkEntry::Normal(_) if entry.depth() == Some(0) => {
+                let path = entry.path();
+                if self.follow {
+                    path.metadata().ok()
+                } else {
+                    path.symlink_metadata().ok()
+                }
+            }
+            _ => entry.metadata(),
+        }
     }
 
     fn matches_metadata(&self, entry: &WalkEntry) -> bool {
@@ -223,7 +242,7 @@ impl EntryFilters {
             return true;
         }
 
-        let Some(metadata) = entry.metadata() else {
+        let Some(metadata) = self.entry_metadata(entry) else {
             return false;
         };
 
@@ -286,12 +305,12 @@ impl FileTypeFilter {
         }
     }
 
-    fn matches(self, entry: &WalkEntry) -> bool {
-        entry.file_type().is_some_and(|entry_file_type| match self {
-            Self::File => entry_file_type.is_file(),
-            Self::Dir => entry_file_type.is_dir(),
-            Self::Symlink => entry_file_type.is_symlink(),
-        })
+    fn matches(self, file_type: std::fs::FileType) -> bool {
+        match self {
+            Self::File => file_type.is_file(),
+            Self::Dir => file_type.is_dir(),
+            Self::Symlink => file_type.is_symlink(),
+        }
     }
 }
 

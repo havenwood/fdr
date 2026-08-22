@@ -3,6 +3,7 @@
 require_relative "spec_helper"
 require "tmpdir"
 require "fileutils"
+require "timeout"
 
 def create_gitignore_and_ignored_dir(tmpdir)
   ignored_dir = File.join(tmpdir, "ignored_dir")
@@ -150,7 +151,40 @@ describe "Symlink behavior" do
       refute_includes results, @link_to_dir
       assert(results.any? { |path| path.include?("file1.txt") })
     end
+
+    it 'finds a file symlink root with type: "l"' do
+      results = Fdr.search(paths: [@link_to_file], type: "l")
+
+      assert_equal [@link_to_file], results
+    end
+
+    it "sizes a file symlink root by the link, not its target" do
+      big = File.join(@tmpdir, "big.txt")
+      link = File.join(@tmpdir, "big_link")
+      File.write(big, "x" * 21_000)
+      File.symlink(big, link)
+
+      assert_empty Fdr.search(paths: [link], min_size: 20_000)
+      assert_equal [link], Fdr.search(paths: [link], min_size: 20_000, follow: true)
+    end
+
+    it "answers the same for a symlink root on both sides of the parallel threshold" do
+      big = File.join(@tmpdir, "big.txt")
+      link = File.join(@tmpdir, "big_link")
+      pad = File.join(@tmpdir, "pad")
+      File.write(big, "x" * 21_000)
+      File.symlink(big, link)
+      Dir.mkdir(pad)
+
+      serial = Fdr.search(paths: [pad, link], min_size: 20_000, follow: true)
+      1_200.times { |i| File.write(File.join(pad, "f#{i}"), "") }
+      parallel = Fdr.search(paths: [pad, link], min_size: 20_000, follow: true)
+
+      assert_equal [link], serial
+      assert_equal [link], parallel - Fdr.search(paths: [pad], min_size: 20_000, follow: true)
+    end
   end
+
 
   describe "combination of follow and type" do
     it 'type: "l" with follow: true matches only broken symlinks' do
