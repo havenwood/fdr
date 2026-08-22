@@ -3,6 +3,7 @@
 require_relative "spec_helper"
 require "tmpdir"
 require "fileutils"
+require "timeout"
 
 def create_gitignore_and_ignored_dir(tmpdir)
   ignored_dir = File.join(tmpdir, "ignored_dir")
@@ -149,6 +150,70 @@ describe "Symlink behavior" do
 
       refute_includes results, @link_to_dir
       assert(results.any? { |path| path.include?("file1.txt") })
+    end
+
+    it 'finds a file symlink root with type: "l"' do
+      results = Fdr.search(paths: [@link_to_file], type: "l")
+
+      assert_equal [@link_to_file], results
+    end
+
+    it "sizes a file symlink root by the link, not its target" do
+      big = File.join(@tmpdir, "big.txt")
+      link = File.join(@tmpdir, "big_link")
+      File.write(big, "x" * 21_000)
+      File.symlink(big, link)
+
+      assert_empty Fdr.search(paths: [link], min_size: 20_000)
+      assert_equal [link], Fdr.search(paths: [link], min_size: 20_000, follow: true)
+    end
+
+    it "answers the same for a symlink root on both sides of the parallel threshold" do
+      big = File.join(@tmpdir, "big.txt")
+      link = File.join(@tmpdir, "big_link")
+      pad = File.join(@tmpdir, "pad")
+      File.write(big, "x" * 21_000)
+      File.symlink(big, link)
+      Dir.mkdir(pad)
+
+      serial = Fdr.search(paths: [pad, link], min_size: 20_000, follow: true)
+      70.times { |i| Dir.mkdir(File.join(pad, "d#{i}")) }
+      parallel = Fdr.search(paths: [pad, link], min_size: 20_000, follow: true)
+
+      assert_equal [link], serial
+      assert_equal [link], parallel
+    end
+  end
+
+  describe "symlink cycles with follow: true" do
+    it "terminates on a self-referential directory link in either walker" do
+      cycle = File.join(@tmpdir, "cycle")
+      Dir.mkdir(cycle)
+      File.write(File.join(cycle, "file.txt"), "content")
+      File.symlink(cycle, File.join(cycle, "loop"))
+
+      serial = Timeout.timeout(15) { Fdr.search(paths: [cycle], follow: true) }
+      70.times { |i| Dir.mkdir(File.join(cycle, "d#{i}")) }
+      parallel = Timeout.timeout(15) { Fdr.search(paths: [cycle], follow: true) }
+
+      assert(serial.any? { |path| path.end_with?("file.txt") })
+      assert(parallel.any? { |path| path.end_with?("file.txt") })
+    end
+
+    it "terminates on a two-directory cycle in either walker" do
+      first = File.join(@tmpdir, "first")
+      second = File.join(@tmpdir, "second")
+      Dir.mkdir(first)
+      Dir.mkdir(second)
+      File.symlink(second, File.join(first, "to_second"))
+      File.symlink(first, File.join(second, "to_first"))
+
+      serial = Timeout.timeout(15) { Fdr.search(paths: [first], follow: true) }
+      70.times { |i| Dir.mkdir(File.join(second, "d#{i}")) }
+      parallel = Timeout.timeout(15) { Fdr.search(paths: [first], follow: true) }
+
+      assert_kind_of Array, serial
+      assert_operator parallel.size, :>=, serial.size
     end
   end
 
