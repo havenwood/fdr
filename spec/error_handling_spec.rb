@@ -350,6 +350,12 @@ describe "Fdr error handling" do
   end
 
   describe "invalid options" do
+    it "raises for a blank exclude glob, even with no paths" do
+      assert_raises(ArgumentError) { Fdr.search(paths: ["lib"], exclude: [""]) }
+      assert_raises(ArgumentError) { Fdr.search(paths: ["lib"], exclude: ["  "]) }
+      assert_raises(ArgumentError) { Fdr.search(paths: [], exclude: [""]) }
+    end
+
     it "raises error for unknown file types" do
       error = assert_raises(ArgumentError) do
         Fdr.search(type: "invalid", paths: ["."], max_depth: 1)

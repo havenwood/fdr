@@ -387,38 +387,46 @@ fn broken_symlink_entry(error: ignore::Error) -> Option<WalkEntry> {
         })
 }
 
-fn configure_walker(
-    builder: &mut WalkBuilder,
-    config: &SearchConfig,
-    root: &Path,
-) -> Result<(), SearchError> {
+fn configure_walker(builder: &mut WalkBuilder, config: &SearchConfig) {
     builder
         .hidden(!config.hidden)
         .ignore(!config.no_ignore)
         .git_ignore(!config.no_ignore)
         .git_global(!config.no_ignore)
         .git_exclude(!config.no_ignore)
+        .parents(!config.no_ignore)
         .follow_links(config.follow)
         .max_depth(config.max_depth)
         .threads(walk_threads());
+}
 
-    if !config.exclude.is_empty() {
-        // Exclude globs anchor to the first search path, as in fd; "." would
-        // silently anchor slash-containing patterns to the process cwd.
-        let mut overrides = ignore::overrides::OverrideBuilder::new(root);
-        for pattern in &config.exclude {
-            overrides
-                .add(&format!("!{pattern}"))
-                .map_err(|error| SearchError::InvalidInput(error.to_string()))?;
-        }
-        builder.overrides(
-            overrides
-                .build()
-                .map_err(|error| SearchError::InvalidInput(error.to_string()))?,
-        );
+/// Anchors excludes to the first root because "." would anchor slash patterns to cwd.
+fn build_overrides(
+    config: &SearchConfig,
+    root: &Path,
+) -> Result<Option<ignore::overrides::Override>, SearchError> {
+    if config.exclude.is_empty() {
+        return Ok(None);
     }
 
-    Ok(())
+    let mut overrides = ignore::overrides::OverrideBuilder::new(root);
+
+    for pattern in &config.exclude {
+        // A blank glob becomes a bare `!`, which excludes the whole tree.
+        if pattern.trim().is_empty() {
+            return Err(SearchError::InvalidInput(
+                "exclude patterns cannot be blank".to_owned(),
+            ));
+        }
+        overrides
+            .add(&format!("!{pattern}"))
+            .map_err(|error| SearchError::InvalidInput(error.to_string()))?;
+    }
+
+    overrides
+        .build()
+        .map(Some)
+        .map_err(|error| SearchError::InvalidInput(error.to_string()))
 }
 
 /// Uses half the cores because directory I/O, not CPU, limits walking.
@@ -429,6 +437,14 @@ fn walk_threads() -> usize {
 }
 
 fn build_walker(config: &SearchConfig) -> Result<Option<WalkBuilder>, SearchError> {
+    // Build before empty paths return so bad globs still fail.
+    let overrides = build_overrides(
+        config,
+        config
+            .paths
+            .first()
+            .map_or_else(|| Path::new("."), |path| path),
+    )?;
     let Some((first_path, rest)) = config.paths.split_first() else {
         return Ok(None);
     };
@@ -438,7 +454,11 @@ fn build_walker(config: &SearchConfig) -> Result<Option<WalkBuilder>, SearchErro
         builder.add(path);
     }
 
-    configure_walker(&mut builder, config, first_path)?;
+    configure_walker(&mut builder, config);
+
+    if let Some(overrides) = overrides {
+        builder.overrides(overrides);
+    }
 
     Ok(Some(builder))
 }
