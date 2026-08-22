@@ -185,6 +185,31 @@ describe "Symlink behavior" do
     end
   end
 
+  describe "symlink cycles with follow: true" do
+    it "terminates on a self-referential directory link" do
+      cycle = File.join(@tmpdir, "cycle")
+      Dir.mkdir(cycle)
+      File.write(File.join(cycle, "file.txt"), "content")
+      File.symlink(cycle, File.join(cycle, "loop"))
+
+      results = Timeout.timeout(15) { Fdr.search(paths: [cycle], follow: true) }
+
+      assert(results.any? { |path| path.end_with?("file.txt") })
+    end
+
+    it "terminates on a two-directory cycle" do
+      first = File.join(@tmpdir, "first")
+      second = File.join(@tmpdir, "second")
+      Dir.mkdir(first)
+      Dir.mkdir(second)
+      File.symlink(second, File.join(first, "to_second"))
+      File.symlink(first, File.join(second, "to_first"))
+
+      results = Timeout.timeout(15) { Fdr.search(paths: [first], follow: true) }
+
+      assert_kind_of Array, results
+    end
+  end
 
   describe "combination of follow and type" do
     it 'type: "l" with follow: true matches only broken symlinks' do
