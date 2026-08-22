@@ -412,14 +412,23 @@ fn configure_walker(
     Ok(())
 }
 
+/// `ignore` reads a bare `-` as stdin, so name the file explicitly.
+fn stdin_safe(path: &Path) -> std::borrow::Cow<'_, Path> {
+    if path == Path::new("-") {
+        std::borrow::Cow::Owned(PathBuf::from("./-"))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
 fn build_walker(config: &SearchConfig) -> Result<Option<WalkBuilder>, SearchError> {
     let Some((first_path, rest)) = config.paths.split_first() else {
         return Ok(None);
     };
-    let mut builder = WalkBuilder::new(first_path);
+    let mut builder = WalkBuilder::new(stdin_safe(first_path));
 
     for path in rest {
-        builder.add(path);
+        builder.add(stdin_safe(path));
     }
 
     configure_walker(&mut builder, config, first_path)?;
