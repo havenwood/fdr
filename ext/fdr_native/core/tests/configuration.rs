@@ -1,7 +1,18 @@
 //! Integration tests for search configuration
 
-use fdr_core::{GrepConfig, SearchConfig, grep, search};
+use fdr_core::{GrepConfig, SearchConfig, SearchError, grep, search as search_bytes};
 use std::path::PathBuf;
+
+fn lossy(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
+fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
+    Ok(search_bytes(config)?
+        .iter()
+        .map(|path| lossy(path))
+        .collect())
+}
 
 #[test]
 fn search_config_default_values() {

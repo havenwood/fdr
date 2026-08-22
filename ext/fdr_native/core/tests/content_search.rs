@@ -1,9 +1,34 @@
 //! Integration tests for file content search
 
-use fdr_core::{GrepConfig, SearchConfig, grep};
+use fdr_core::{GrepConfig, SearchConfig, SearchError, grep as grep_bytes};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+fn lossy(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
+struct LossyGrep {
+    path: String,
+    line_numbers: Vec<u64>,
+    lines: Vec<(u64, String)>,
+}
+
+fn grep(config: &GrepConfig) -> Result<Vec<LossyGrep>, SearchError> {
+    Ok(grep_bytes(config)?
+        .into_iter()
+        .map(|result| LossyGrep {
+            path: lossy(&result.path),
+            line_numbers: result.lines.iter().map(|(number, _)| *number).collect(),
+            lines: result
+                .lines
+                .iter()
+                .map(|(number, text)| (*number, lossy(text)))
+                .collect(),
+        })
+        .collect())
+}
 
 fn search_under(path: &Path) -> SearchConfig {
     SearchConfig {
@@ -29,7 +54,7 @@ fn grep_defaults_to_case_sensitive_content_and_case_insensitive_names() {
 }
 
 #[test]
-fn grep_groups_one_based_matching_lines_by_file() {
+fn grep_groups_one_based_line_numbers_by_file() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let path = temp_dir.path().join("example.rb");
     fs::write(&path, "first\nneedle\nthird\nneedle twice needle\n").expect("should write fixture");
@@ -40,11 +65,8 @@ fn grep_groups_one_based_matching_lines_by_file() {
     let result = results.first().expect("should find one file");
     assert_eq!(result.path, path.to_string_lossy());
     assert_eq!(
-        result.lines,
-        vec![
-            (2, b"needle".to_vec()),
-            (4, b"needle twice needle".to_vec())
-        ],
+        result.line_numbers,
+        vec![2, 4],
         "a line matching twice should be reported once"
     );
 }
@@ -66,11 +88,8 @@ fn grep_honors_content_case_sensitivity() {
     let insensitive_result = insensitive
         .first()
         .expect("should find insensitive matches");
-    assert_eq!(sensitive_result.lines, vec![(2, b"needle".to_vec())]);
-    assert_eq!(
-        insensitive_result.lines,
-        vec![(1, b"Needle".to_vec()), (2, b"needle".to_vec())]
-    );
+    assert_eq!(sensitive_result.line_numbers, vec![2]);
+    assert_eq!(insensitive_result.line_numbers, vec![1, 2]);
 }
 
 #[test]
@@ -407,6 +426,30 @@ fn grep_rejects_patterns_matching_a_line_terminator() {
 }
 
 #[test]
+#[cfg(unix)]
+fn grep_skips_broken_symlinks_when_following() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+    fs::write(temp_path.join("real.txt"), "needle\n").expect("should write fixture");
+    std::os::unix::fs::symlink("missing_target", temp_path.join("dangling.txt"))
+        .expect("should create symlink");
+
+    let results = grep(&needle_in(SearchConfig {
+        follow: true,
+        ..search_under(temp_path)
+    }))
+    .expect("grep should skip broken symlinks");
+
+    assert_eq!(results.len(), 1, "should match only the readable file");
+    assert!(
+        results
+            .first()
+            .is_some_and(|result| result.path.ends_with("real.txt")),
+        "the match should come from the real file"
+    );
+}
+
+#[test]
 fn grep_returns_matching_line_text_without_its_terminator() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
@@ -416,14 +459,19 @@ fn grep_returns_matching_line_text_without_its_terminator() {
     )
     .expect("should write fixture");
 
-    let results = grep(&needle_in(search_under(temp_path))).expect("grep should succeed");
+    let results = grep(&GrepConfig {
+        pattern: "needle".to_string(),
+        search: search_under(temp_path),
+        ..Default::default()
+    })
+    .expect("grep should succeed");
 
     let result = results.first().expect("should match one file");
     assert_eq!(
         result.lines,
         vec![
-            (2, b"needle here".to_vec()),
-            (4, b"another needle".to_vec())
+            (2, "needle here".to_string()),
+            (4, "another needle".to_string())
         ]
     );
 }
@@ -434,10 +482,18 @@ fn grep_reports_a_line_with_two_matches_once() {
     let temp_path = temp_dir.path();
     fs::write(temp_path.join("a.txt"), "needle and needle again\n").expect("should write fixture");
 
-    let results = grep(&needle_in(search_under(temp_path))).expect("grep should succeed");
+    let results = grep(&GrepConfig {
+        pattern: "needle".to_string(),
+        search: search_under(temp_path),
+        ..Default::default()
+    })
+    .expect("grep should succeed");
 
     let result = results.first().expect("should match one file");
-    assert_eq!(result.lines, vec![(1, b"needle and needle again".to_vec())]);
+    assert_eq!(
+        result.lines,
+        vec![(1, "needle and needle again".to_string())]
+    );
 }
 
 #[test]
@@ -446,12 +502,17 @@ fn grep_trims_a_carriage_return_and_handles_a_missing_final_newline() {
     let temp_path = temp_dir.path();
     fs::write(temp_path.join("a.txt"), "needle one\r\nneedle two").expect("should write fixture");
 
-    let results = grep(&needle_in(search_under(temp_path))).expect("grep should succeed");
+    let results = grep(&GrepConfig {
+        pattern: "needle".to_string(),
+        search: search_under(temp_path),
+        ..Default::default()
+    })
+    .expect("grep should succeed");
 
     let result = results.first().expect("should match one file");
     assert_eq!(
         result.lines,
-        vec![(1, b"needle one".to_vec()), (2, b"needle two".to_vec())]
+        vec![(1, "needle one".to_string()), (2, "needle two".to_string())]
     );
 }
 
@@ -475,7 +536,7 @@ fn grep_matches_anchors_before_lf_and_crlf_terminators() {
     let result = results.first().expect("should match one file");
     assert_eq!(
         result.lines,
-        vec![(1, b"needle".to_vec()), (3, b"needle".to_vec())]
+        vec![(1, "needle".to_string()), (3, "needle".to_string())]
     );
 }
 
@@ -485,12 +546,20 @@ fn grep_keeps_a_trailing_carriage_return_that_is_not_a_terminator() {
     let temp_path = temp_dir.path();
     fs::write(temp_path.join("a.txt"), "one needle\r\ntwo needle\r").expect("should write fixture");
 
-    let results = grep(&needle_in(search_under(temp_path))).expect("grep should succeed");
+    let results = grep(&GrepConfig {
+        pattern: "needle".to_string(),
+        search: search_under(temp_path),
+        ..Default::default()
+    })
+    .expect("grep should succeed");
 
     let result = results.first().expect("should match one file");
     assert_eq!(
         result.lines,
-        vec![(1, b"one needle".to_vec()), (2, b"two needle\r".to_vec())]
+        vec![
+            (1, "one needle".to_string()),
+            (2, "two needle\r".to_string())
+        ]
     );
 }
 
@@ -500,35 +569,13 @@ fn grep_keeps_a_byte_order_mark_in_the_line_text() {
     let temp_path = temp_dir.path();
     fs::write(temp_path.join("a.txt"), "\u{feff}needle here\n").expect("should write fixture");
 
-    let results = grep(&needle_in(search_under(temp_path))).expect("grep should succeed");
+    let results = grep(&GrepConfig {
+        pattern: "needle".to_string(),
+        search: search_under(temp_path),
+        ..Default::default()
+    })
+    .expect("grep should succeed");
 
     let result = results.first().expect("should match one file");
-    assert_eq!(
-        result.lines,
-        vec![(1, "\u{feff}needle here".as_bytes().to_vec())]
-    );
-}
-
-#[test]
-#[cfg(unix)]
-fn grep_skips_broken_symlinks_when_following() {
-    let temp_dir = TempDir::new().expect("should create temp dir");
-    let temp_path = temp_dir.path();
-    fs::write(temp_path.join("real.txt"), "needle\n").expect("should write fixture");
-    std::os::unix::fs::symlink("missing_target", temp_path.join("dangling.txt"))
-        .expect("should create symlink");
-
-    let results = grep(&needle_in(SearchConfig {
-        follow: true,
-        ..search_under(temp_path)
-    }))
-    .expect("grep should skip broken symlinks");
-
-    assert_eq!(results.len(), 1, "should match only the readable file");
-    assert!(
-        results
-            .first()
-            .is_some_and(|result| result.path.ends_with("real.txt")),
-        "the match should come from the real file"
-    );
+    assert_eq!(result.lines, vec![(1, "\u{feff}needle here".to_string())]);
 }

@@ -57,7 +57,7 @@ impl Default for GrepConfig {
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct GrepResult {
-    pub path: String,
+    pub path: Vec<u8>,
     /// Matching lines as `(one-based number, text without its terminator)`.
     pub lines: Vec<(u64, Vec<u8>)>,
 }
@@ -457,10 +457,6 @@ fn build_overrides(
         .map_err(|error| SearchError::InvalidInput(error.to_string()))
 }
 
-fn depth_range_is_empty(config: &SearchConfig) -> bool {
-    matches!((config.min_depth, config.max_depth), (Some(min), Some(max)) if min > max)
-}
-
 /// Adds `./` to bare `-` because `ignore` treats it as stdin.
 fn stdin_safe(path: &Path) -> std::borrow::Cow<'_, Path> {
     if path == Path::new("-") {
@@ -468,6 +464,10 @@ fn stdin_safe(path: &Path) -> std::borrow::Cow<'_, Path> {
     } else {
         std::borrow::Cow::Borrowed(path)
     }
+}
+
+fn depth_range_is_empty(config: &SearchConfig) -> bool {
+    matches!((config.min_depth, config.max_depth), (Some(min), Some(max)) if min > max)
 }
 
 /// Uses half the cores because directory I/O, not CPU, limits walking.
@@ -522,19 +522,19 @@ const GREP_SERIAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Wrapper for batched result sending with automatic flush on drop.
 struct ResultBatch {
-    batch: Vec<String>,
-    sender: crossbeam_channel::Sender<Vec<String>>,
+    batch: Vec<Vec<u8>>,
+    sender: crossbeam_channel::Sender<Vec<Vec<u8>>>,
 }
 
 impl ResultBatch {
-    fn new(sender: crossbeam_channel::Sender<Vec<String>>) -> Self {
+    fn new(sender: crossbeam_channel::Sender<Vec<Vec<u8>>>) -> Self {
         Self {
             batch: Vec::with_capacity(BATCH_SIZE),
             sender,
         }
     }
 
-    fn push(&mut self, item: String) {
+    fn push(&mut self, item: Vec<u8>) {
         self.batch.push(item);
         if self.batch.len() >= BATCH_SIZE {
             self.flush();
@@ -555,11 +555,11 @@ impl Drop for ResultBatch {
     }
 }
 
-pub fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
+pub fn search(config: &SearchConfig) -> Result<Vec<Vec<u8>>, SearchError> {
     search_with_cancel(config, &AtomicBool::new(false))
 }
 
-fn search_entry(entry: &WalkEntry, filters: &EntryFilters) -> Option<String> {
+fn search_entry(entry: &WalkEntry, filters: &EntryFilters) -> Option<Vec<u8>> {
     // Skip symlinked directory roots the same way in both walkers.
     if entry.depth() == Some(0) && entry.path().is_dir() {
         return None;
@@ -575,7 +575,7 @@ fn search_entry(entry: &WalkEntry, filters: &EntryFilters) -> Option<String> {
         return None;
     }
 
-    Some(path_to_string(entry.path()))
+    Some(path_to_bytes(entry.path()))
 }
 
 fn serial_search(
@@ -583,7 +583,7 @@ fn serial_search(
     filters: &EntryFilters,
     cancel: &AtomicBool,
     raise_on_error: bool,
-) -> Result<Option<Vec<String>>, SearchError> {
+) -> Result<Option<Vec<Vec<u8>>>, SearchError> {
     let mut results = Vec::new();
     let mut directories = 0;
 
@@ -622,7 +622,7 @@ fn serial_search(
 pub fn search_with_cancel(
     config: &SearchConfig,
     cancel: &AtomicBool,
-) -> Result<Vec<String>, SearchError> {
+) -> Result<Vec<Vec<u8>>, SearchError> {
     let filters = EntryFilters::new(config)?;
     let Some(builder) = build_walker(config)? else {
         return Ok(Vec::new());
@@ -678,7 +678,7 @@ pub fn search_with_cancel(
         return Err(error);
     }
 
-    let batches: Vec<Vec<String>> = rx.iter().collect();
+    let batches: Vec<Vec<Vec<u8>>> = rx.iter().collect();
     let total_size: usize = batches.iter().map(Vec::len).sum();
     let mut results = Vec::with_capacity(total_size);
 
@@ -821,7 +821,7 @@ fn grep_file(
         && !collector.lines.is_empty()
     {
         Some(GrepResult {
-            path: path_to_string(path),
+            path: path_to_bytes(path),
             lines: collector.lines,
         })
     } else {
@@ -970,8 +970,17 @@ pub fn grep_with_cancel(
     Ok(results)
 }
 
-fn path_to_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+/// Raw OS bytes, so the path still opens the file.
+fn path_to_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
 }
 
 fn merge_colliding_paths(results: &mut Vec<GrepResult>) {
@@ -1040,26 +1049,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn path_to_string_replaces_invalid_utf8() {
+    fn path_to_bytes_preserves_invalid_utf8() {
         use std::os::unix::ffi::OsStrExt;
 
         let path = Path::new(std::ffi::OsStr::from_bytes(b"bad\xffname.txt"));
-        assert_eq!(path_to_string(path), "bad\u{FFFD}name.txt");
+        assert_eq!(path_to_bytes(path), b"bad\xffname.txt");
     }
 
     #[test]
     fn merge_colliding_paths_merges_line_numbers_of_equal_paths() {
         let mut results = vec![
             GrepResult {
-                path: "a\u{FFFD}.txt".into(),
+                path: b"a\xff.txt".to_vec(),
                 lines: vec![(2, b"two".to_vec()), (3, b"three".to_vec())],
             },
             GrepResult {
-                path: "a\u{FFFD}.txt".into(),
+                path: b"a\xff.txt".to_vec(),
                 lines: vec![(3, b"three".to_vec()), (7, b"seven".to_vec())],
             },
             GrepResult {
-                path: "b.txt".into(),
+                path: b"b.txt".to_vec(),
                 lines: vec![(1, b"one".to_vec())],
             },
         ];
@@ -1070,7 +1079,7 @@ mod tests {
             results,
             vec![
                 GrepResult {
-                    path: "a\u{FFFD}.txt".into(),
+                    path: b"a\xff.txt".to_vec(),
                     lines: vec![
                         (2, b"two".to_vec()),
                         (3, b"three".to_vec()),
@@ -1078,7 +1087,7 @@ mod tests {
                     ],
                 },
                 GrepResult {
-                    path: "b.txt".into(),
+                    path: b"b.txt".to_vec(),
                     lines: vec![(1, b"one".to_vec())],
                 },
             ]

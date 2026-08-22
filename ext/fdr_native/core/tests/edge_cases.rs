@@ -1,9 +1,20 @@
 //! Integration tests for edge cases and boundary conditions
 
-use fdr_core::{SearchConfig, search};
+use fdr_core::{SearchConfig, SearchError, search as search_bytes};
 use std::fs::{self, File};
 use std::path::PathBuf;
 use tempfile::TempDir;
+
+fn lossy(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
+fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
+    Ok(search_bytes(config)?
+        .iter()
+        .map(|path| lossy(path))
+        .collect())
+}
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -22,12 +33,12 @@ fn search_includes_non_utf8_filenames() {
         ..Default::default()
     };
 
-    let results = search(&config).expect("search should succeed");
+    let results = search_bytes(&config).expect("search should succeed");
     assert_eq!(results.len(), 1, "non-UTF-8 filename should be emitted");
     let result = results.first().expect("should have one result");
     assert!(
-        result.ends_with("bad\u{FFFD}name.txt"),
-        "invalid bytes should be replaced, got {result:?}"
+        result.ends_with(b"bad\xffname.txt"),
+        "raw bytes should survive, got {result:?}"
     );
 }
 
@@ -603,7 +614,7 @@ fn search_lists_a_root_symlink_whose_target_cannot_be_stat() {
     for name in ["unreachable", "loop_a"] {
         let config = SearchConfig {
             paths: vec![temp_path.join(name)],
-            file_type: Some("l".to_string()),
+            file_type: vec!["l".to_string()],
             ..Default::default()
         };
 
@@ -683,7 +694,7 @@ fn search_type_symlink_with_follow_matches_only_broken_links() {
 
     let config = SearchConfig {
         paths: vec![PathBuf::from(temp_path)],
-        file_type: Some("l".to_string()),
+        file_type: vec!["l".to_string()],
         follow: true,
         ..Default::default()
     };

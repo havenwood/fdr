@@ -1,9 +1,20 @@
 //! Integration tests for file filtering functionality
 
-use fdr_core::{SearchConfig, search};
+use fdr_core::{SearchConfig, SearchError, search as search_bytes};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
+
+fn lossy(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
+fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
+    Ok(search_bytes(config)?
+        .iter()
+        .map(|path| lossy(path))
+        .collect())
+}
 
 #[test]
 fn search_with_extension_filters_correctly() {
@@ -163,9 +174,10 @@ fn search_with_min_depth_excludes_shallow_files() {
 
     let results = search(&config).expect("search should succeed");
 
+    assert!(!results.is_empty(), "fixture should match something");
     for path in &results {
         let depth = path.matches(std::path::MAIN_SEPARATOR).count();
-        assert!(depth >= 1, "path should be at depth >= 2: {path}");
+        assert!(depth >= 2, "path should be at depth >= 2: {path}");
     }
 }
 
