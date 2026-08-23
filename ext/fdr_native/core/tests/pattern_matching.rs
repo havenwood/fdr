@@ -46,6 +46,24 @@ fn search_with_regex_pattern_matches_correctly() {
 }
 
 #[test]
+#[cfg(unix)]
+fn search_regex_dot_matches_newline_in_filename() {
+    let temp_dir = tempfile::TempDir::new().expect("should create temp dir");
+    for name in ["nlXname", "nl\nname"] {
+        std::fs::write(temp_dir.path().join(name), "x").expect("should write fixture");
+    }
+
+    let results = search(&SearchConfig {
+        pattern: Some("^nl.name$".to_string()),
+        paths: vec![temp_dir.path().to_path_buf()],
+        ..Default::default()
+    })
+    .expect("search should succeed");
+
+    assert_eq!(results.len(), 2);
+}
+
+#[test]
 fn search_glob_star_does_not_cross_a_path_separator() {
     let temp_dir = tempfile::TempDir::new().expect("should create temp dir");
     let direct = temp_dir.path().join("file.rs");
@@ -187,6 +205,48 @@ fn search_glob_with_subdirectory() {
             "should match .rs files in src directory: {path}"
         );
     }
+}
+
+#[test]
+fn search_empty_glob_matches_every_entry() {
+    let entries = |glob| {
+        search(&SearchConfig {
+            pattern: Some(String::new()),
+            glob,
+            paths: vec![PathBuf::from(".")],
+            max_depth: Some(1),
+            ..Default::default()
+        })
+        .expect("search should succeed")
+    };
+
+    // An empty glob compiles to `^$`. fd treats it as no pattern at all.
+    assert_eq!(entries(true), entries(false));
+    assert!(!entries(true).is_empty(), "should match every entry");
+}
+
+#[test]
+fn search_recursive_glob_spans_a_path_component_holding_a_newline() {
+    let temp_dir = tempfile::TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+    let nested = temp_path.join("d\ne");
+    std::fs::create_dir(&nested).expect("should create directory");
+    std::fs::write(nested.join("inner.txt"), "x").expect("should write fixture");
+
+    let results = search(&SearchConfig {
+        pattern: Some("**/*.txt".to_string()),
+        glob: true,
+        full_path: true,
+        paths: vec![PathBuf::from(temp_path)],
+        ..Default::default()
+    })
+    .expect("search should succeed");
+
+    assert_eq!(
+        results.len(),
+        1,
+        "`**` should cross a newline in a path: {results:?}"
+    );
 }
 
 #[test]

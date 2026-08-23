@@ -13,6 +13,16 @@ class PackageSpec < Minitest::Test
     assert_includes @gemspec.files, "ext/fdr_native/Cargo.lock"
   end
 
+  def test_includes_native_build_script
+    assert_includes @gemspec.files, "ext/fdr_native/ffi/build.rs"
+  end
+
+  def test_native_workers_do_not_call_ruby_gc_via_the_allocator
+    ffi = File.read(File.expand_path("../ext/fdr_native/ffi/src/lib.rs", __dir__))
+
+    refute_includes ffi, "rb_sys::set_global_tracking_allocator!();"
+  end
+
   def test_includes_rbs_signature
     assert_includes @gemspec.files, "sig/fdr.rbs"
   end

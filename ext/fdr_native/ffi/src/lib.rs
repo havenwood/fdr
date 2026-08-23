@@ -17,6 +17,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 
+// rb-sys's tracking allocator calls Ruby's GC API. Search workers allocate on
+// native threads without the GVL, so the process allocator must remain in use.
+
 static PATTERN: LazyId = LazyId::new("pattern");
 static PATHS: LazyId = LazyId::new("paths");
 static HIDDEN: LazyId = LazyId::new("hidden");
@@ -48,10 +51,36 @@ fn reject_type(ruby: &Ruby, value: Value, target: &str) -> Error {
     )
 }
 
-fn coercible(value: Value, coercions: &[&str]) -> bool {
-    coercions
-        .iter()
-        .any(|name| value.respond_to(*name, false).unwrap_or(false))
+fn coercible(value: Value, coercions: &[&str]) -> Result<bool, Error> {
+    for name in coercions {
+        if value.respond_to(*name, true)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Accepts valid UTF-8 binary strings that magnus cannot transcode while
+/// preserving coercion errors.
+fn to_utf8(ruby: &Ruby, value: Value, name: &str) -> Result<String, Error> {
+    let Some(string) = RString::from_value(value) else {
+        return String::try_convert(value);
+    };
+    let invalid = || {
+        fdr_error(
+            ruby,
+            "InvalidOption",
+            ruby.exception_arg_error(),
+            format!("{name} must be valid UTF-8"),
+        )
+    };
+
+    if string.enc_get() == ruby.ascii8bit_encindex() {
+        return String::from_utf8(string.to_bytes().into()).map_err(|_| invalid());
+    }
+
+    string.to_string().map_err(|_| invalid())
 }
 
 fn extract_string(ruby: &Ruby, hash: RHash, key: &LazyId) -> Result<Option<String>, Error> {
@@ -59,11 +88,11 @@ fn extract_string(ruby: &Ruby, hash: RHash, key: &LazyId) -> Result<Option<Strin
         return Ok(None);
     };
 
-    if !value.is_kind_of(ruby.class_string()) && !coercible(value, &["to_str"]) {
+    if !value.is_kind_of(ruby.class_string()) && !coercible(value, &["to_str"])? {
         return Err(reject_type(ruby, value, "String"));
     }
 
-    String::try_convert(value).map(Some)
+    to_utf8(ruby, value, LazyId::get_inner_with(key, ruby).name()?).map(Some)
 }
 
 fn extract_optional_arg<T: TryConvert>(hash: RHash, key: &LazyId) -> Result<Option<T>, Error> {
@@ -259,29 +288,49 @@ fn interruptible<R: Send + 'static>(
     }
 }
 
-fn extract_array<T: TryConvert>(hash: RHash, key: &LazyId) -> Result<Option<Vec<T>>, Error> {
-    let Some(array) = extract_optional_arg::<RArray>(hash, key)? else {
-        return Ok(None);
-    };
+fn convert_array<T: TryConvert>(array: RArray) -> Result<Vec<T>, Error> {
+    let len = array.len();
+    let mut values = Vec::with_capacity(len);
 
-    array
-        .into_iter()
-        .map(TryConvert::try_convert)
-        .collect::<Result<Vec<T>, Error>>()
-        .map(Some)
+    for index in 0..len {
+        values.push(array.entry(index.cast_signed())?);
+    }
+
+    Ok(values)
 }
 
-fn strings_from_array(ruby: &Ruby, array: RArray) -> Result<Vec<String>, Error> {
-    array
-        .into_iter()
-        .map(|element| {
-            if !element.is_kind_of(ruby.class_string()) && !coercible(element, &["to_str"]) {
-                return Err(reject_type(ruby, element, "String"));
-            }
+/// Rejects non-strings like `paths` so they raise `Fdr::Error`.
+fn extract_strings(ruby: &Ruby, hash: RHash, key: &LazyId) -> Result<Vec<String>, Error> {
+    let Some(value) = hash.get(**key).filter(|value| !value.is_nil()) else {
+        return Ok(Vec::new());
+    };
 
-            String::try_convert(element)
-        })
-        .collect()
+    if !value.is_kind_of(ruby.class_array()) && !coercible(value, &["to_ary"])? {
+        return Err(reject_type(ruby, value, "Array"));
+    }
+
+    strings_from_array(ruby, RArray::try_convert(value)?, key)
+}
+
+fn strings_from_array(ruby: &Ruby, array: RArray, key: &LazyId) -> Result<Vec<String>, Error> {
+    let len = array.len();
+
+    for index in 0..len {
+        let element: Value = array.entry(index.cast_signed())?;
+        if !element.is_kind_of(ruby.class_string()) && !coercible(element, &["to_str"])? {
+            return Err(reject_type(ruby, element, "String"));
+        }
+    }
+
+    let name = LazyId::get_inner_with(key, ruby).name()?;
+    let mut values = Vec::with_capacity(len);
+
+    for index in 0..len {
+        let element: Value = array.entry(index.cast_signed())?;
+        values.push(to_utf8(ruby, element, name)?);
+    }
+
+    Ok(values)
 }
 
 fn extract_string_or_strings(ruby: &Ruby, hash: RHash, key: &LazyId) -> Result<Vec<String>, Error> {
@@ -289,14 +338,16 @@ fn extract_string_or_strings(ruby: &Ruby, hash: RHash, key: &LazyId) -> Result<V
         return Ok(Vec::new());
     };
 
-    if value.is_kind_of(ruby.class_string()) || coercible(value, &["to_str"]) {
-        return String::try_convert(value).map(|value| vec![value]);
+    let name = LazyId::get_inner_with(key, ruby).name()?;
+
+    if value.is_kind_of(ruby.class_string()) || coercible(value, &["to_str"])? {
+        return to_utf8(ruby, value, name).map(|value| vec![value]);
     }
-    if !value.is_kind_of(ruby.class_array()) && !coercible(value, &["to_ary"]) {
+    if !value.is_kind_of(ruby.class_array()) && !coercible(value, &["to_ary"])? {
         return Err(reject_type(ruby, value, "String or Array"));
     }
 
-    strings_from_array(ruby, RArray::try_convert(value)?)
+    strings_from_array(ruby, RArray::try_convert(value)?, key)
 }
 
 fn extract_paths(ruby: &Ruby, hash: RHash) -> Result<Vec<std::path::PathBuf>, Error> {
@@ -304,24 +355,22 @@ fn extract_paths(ruby: &Ruby, hash: RHash) -> Result<Vec<std::path::PathBuf>, Er
         return Ok(Vec::new());
     };
 
-    if !value.is_kind_of(ruby.class_array()) && !coercible(value, &["to_ary"]) {
+    if !value.is_kind_of(ruby.class_array()) && !coercible(value, &["to_ary"])? {
         return Err(reject_type(ruby, value, "Array"));
     }
 
     let array = RArray::try_convert(value)?;
+    let len = array.len();
 
-    array
-        .into_iter()
-        .map(|element| {
-            if !element.is_kind_of(ruby.class_string())
-                && !coercible(element, &["to_str", "to_path"])
-            {
-                return Err(reject_type(ruby, element, "String"));
-            }
+    for index in 0..len {
+        let element: Value = array.entry(index.cast_signed())?;
+        if !element.is_kind_of(ruby.class_string()) && !coercible(element, &["to_str", "to_path"])?
+        {
+            return Err(reject_type(ruby, element, "String"));
+        }
+    }
 
-            TryConvert::try_convert(element)
-        })
-        .collect::<Result<Vec<_>, Error>>()
+    convert_array(array)
 }
 
 /// Extracts an optional non-negative `Integer`, rejecting `Float` and other
@@ -372,7 +421,7 @@ fn file_type_name(ruby: &Ruby, value: Value) -> Result<String, Error> {
     let file_type = if let Some(symbol) = Symbol::from_value(value) {
         symbol.name()?.into_owned()
     } else {
-        String::try_convert(value)?
+        to_utf8(ruby, value, "type")?
     };
 
     if FILE_TYPES.contains(&file_type.as_str()) {
@@ -397,20 +446,22 @@ fn extract_file_types(ruby: &Ruby, kwargs: RHash) -> Result<Vec<String>, Error> 
 
     if Symbol::from_value(value).is_some()
         || value.is_kind_of(ruby.class_string())
-        || coercible(value, &["to_str"])
+        || coercible(value, &["to_str"])?
     {
         return file_type_name(ruby, value).map(|file_type| vec![file_type]);
     }
-    if !value.is_kind_of(ruby.class_array()) && !coercible(value, &["to_ary"]) {
+    if !value.is_kind_of(ruby.class_array()) && !coercible(value, &["to_ary"])? {
         return Err(reject_type(ruby, value, "String, Symbol, or Array"));
     }
 
     let array = RArray::try_convert(value)?;
-    let mut file_types = Vec::with_capacity(array.len());
-    for element in array {
+    let len = array.len();
+    let mut file_types = Vec::with_capacity(len);
+    for index in 0..len {
+        let element: Value = array.entry(index.cast_signed())?;
         if Symbol::from_value(element).is_none()
             && !element.is_kind_of(ruby.class_string())
-            && !coercible(element, &["to_str"])
+            && !coercible(element, &["to_str"])?
         {
             return Err(reject_type(ruby, element, "String or Symbol"));
         }
@@ -440,7 +491,7 @@ fn build_search_config(
         min_depth: non_negative(ruby, kwargs, &MIN_DEPTH, "min_depth")?,
         file_type,
         extension: extract_string_or_strings(ruby, kwargs, &EXTENSION)?,
-        exclude: extract_array(kwargs, &EXCLUDE)?.unwrap_or_default(),
+        exclude: extract_strings(ruby, kwargs, &EXCLUDE)?,
         min_size: non_negative(ruby, kwargs, &MIN_SIZE, "min_size")?,
         max_size: non_negative(ruby, kwargs, &MAX_SIZE, "max_size")?,
         changed_within: non_negative(ruby, kwargs, &CHANGED_WITHIN, "changed_within")?,
@@ -460,12 +511,18 @@ fn fdr_error(ruby: &Ruby, name: &str, fallback: ExceptionClass, message: String)
     Error::new(fdr_class(ruby, name, fallback), message)
 }
 
-/// Raw path bytes tagged with the filesystem encoding, as `Dir.glob` does.
-fn path_string(ruby: &Ruby, path: &[u8]) -> Result<RString, Error> {
-    let string = ruby.str_from_slice(path);
-    string.enc_associate(ruby.filesystem_encoding())?;
+/// Raw path in the filesystem encoding, or binary under an ASCII locale.
+fn path_string(ruby: &Ruby, path: &[u8]) -> RString {
+    if !path.is_ascii() && ruby.filesystem_encindex() == ruby.usascii_encindex() {
+        return ruby.enc_str_new(path, ruby.ascii8bit_encoding());
+    }
 
-    Ok(string)
+    ruby.enc_str_new(path, ruby.filesystem_encoding())
+}
+
+/// Raw line in the external encoding, as with `File.readlines`.
+fn line_string(ruby: &Ruby, line: &[u8]) -> RString {
+    ruby.enc_str_new(line, ruby.default_external_encoding())
 }
 
 fn core_error(ruby: &Ruby, operation: &str, error: &SearchError) -> Error {
@@ -495,14 +552,6 @@ fn core_error(ruby: &Ruby, operation: &str, error: &SearchError) -> Error {
     }
 }
 
-/// Raw line bytes tagged with the external encoding, as `File.readlines` does.
-fn line_string(ruby: &Ruby, line: &[u8]) -> Result<RString, Error> {
-    let string = ruby.str_from_slice(line);
-    string.enc_associate(ruby.default_external_encoding())?;
-
-    Ok(string)
-}
-
 fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
     let kwargs = args_scan.keywords;
@@ -516,8 +565,8 @@ fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
     .map_err(|err| core_error(ruby, "Search", &err))?;
     let array = ruby.ary_new_capa(results.len());
 
-    for path in &results {
-        array.push(path_string(ruby, path)?)?;
+    for path in results {
+        array.push(path_string(ruby, &path))?;
     }
 
     Ok(array)
@@ -565,11 +614,11 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
     for result in results {
         let lines = ruby.hash_new_capa(result.lines.len());
 
-        for (number, text) in &result.lines {
-            lines.aset(*number, line_string(ruby, text)?)?;
+        for (number, text) in result.lines {
+            lines.aset(number, line_string(ruby, &text))?;
         }
 
-        ruby_results.aset(path_string(ruby, &result.path)?, lines)?;
+        ruby_results.aset(path_string(ruby, &result.path), lines)?;
     }
 
     Ok(ruby_results)
@@ -577,6 +626,10 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
+    // SAFETY: no Ruby VALUE is cached or crosses threads; the walk runs on
+    // plain Rust data, which `Send + 'static` on `interruptible` enforces.
+    unsafe { rb_sys::rb_ext_ractor_safe(true) };
+
     let fdr_module = ruby.define_module("Fdr")?;
     let error = fdr_module.define_module("Error")?;
 

@@ -107,6 +107,34 @@ describe "Fdr search options" do
         "all results should be from lib directory")
     end
 
+    it "accepts binary-encoded strings for every string option" do
+      binary = "fdr".b
+
+      assert_equal Fdr.search(pattern: "fdr", paths: ["lib"]),
+        Fdr.search(pattern: binary, paths: ["lib"])
+      assert_equal Fdr.search(extension: "rb", paths: ["lib"]),
+        Fdr.search(extension: "rb".b, paths: ["lib"])
+      assert_equal Fdr.search(extension: "rb", paths: ["lib"]),
+        Fdr.search(extension: ["rb".b], paths: ["lib"])
+      assert_equal Fdr.search(exclude: %w[version.rb], paths: ["lib"]),
+        Fdr.search(exclude: ["version.rb".b], paths: ["lib"])
+      assert_equal Fdr.search(type: "f", paths: ["lib"]),
+        Fdr.search(type: "f".b, paths: ["lib"])
+      assert_equal Fdr.search(type: "f", paths: ["lib"]),
+        Fdr.search(type: ["f".b], paths: ["lib"])
+    end
+
+    it "raises Fdr::InvalidOption for a string option that is not valid UTF-8" do
+      invalid = "caf\xE9".b
+
+      {pattern: invalid, extension: invalid, exclude: [invalid], type: invalid}.each do |key, value|
+        error = assert_raises(Fdr::InvalidOption) { Fdr.search(paths: ["lib"], **{key => value}) }
+
+        assert_kind_of Fdr::Error, error
+        assert_includes error.message, key.to_s
+      end
+    end
+
     it "accepts Pathname paths" do
       results = Fdr.search(paths: [Pathname.new("lib")], max_depth: 1)
 

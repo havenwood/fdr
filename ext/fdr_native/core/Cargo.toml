@@ -12,9 +12,7 @@ publish = false
 workspace = true
 
 [dependencies]
-crossbeam-channel = "0.5"
 globset = "0.4"
-grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"

@@ -248,11 +248,8 @@ fn search_with_invalid_file_type() {
         ..Default::default()
     };
 
-    let results = search(&config).expect("should handle invalid file type");
-    assert!(
-        !results.is_empty(),
-        "unknown file type defaults to matching all (returns true for unknown types)"
-    );
+    let error = search(&config).expect_err("unknown file type should be rejected");
+    assert!(matches!(error, SearchError::InvalidInput(_)));
 }
 
 #[test]

@@ -2,6 +2,7 @@
 
 require_relative "spec_helper"
 require "fileutils"
+require "open3"
 require "timeout"
 require "tmpdir"
 
@@ -168,5 +169,42 @@ describe "Fdr concurrency" do
     end
 
     assert_kind_of Hash, thread.value, "spurious wakeups should not abort the grep"
+  end
+
+  # Run in a child with YJIT off because it skips Ractor checks for C calls.
+  it "searches and greps from Ractors" do
+    script = <<~RUBY
+      require "fdr"
+      Warning[:experimental] = false
+      Thread.report_on_exception = false
+
+      ractors = Array.new(4) do
+        Ractor.new(ARGV[0]) do |path|
+          search = Fdr.search(pattern: "file1", paths: [path], extension: "txt")
+          grep = Fdr.grep(pattern: "needle", paths: [path])
+          invalid_pattern = begin
+            Fdr.search(pattern: "[", paths: [path])
+            false
+          rescue Fdr::InvalidPattern
+            true
+          end
+          [search.length, grep.length, invalid_pattern]
+        end
+      end
+
+      print ractors.map { |r| r.respond_to?(:value) ? r.value : r.take }.inspect
+    RUBY
+    output, status = Open3.capture2(
+      {"RUBYOPT" => nil, "RUBYLIB" => nil, "RUBY_YJIT_ENABLE" => nil, "RUBY_ZJIT_ENABLE" => nil},
+      Gem.ruby,
+      "--disable-yjit",
+      "-I#{File.expand_path("../lib", __dir__)}",
+      "-e",
+      script,
+      @dir
+    )
+
+    assert_predicate status, :success?
+    assert_equal ([[110, 200, true]] * 4).inspect, output
   end
 end

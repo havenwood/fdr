@@ -262,6 +262,23 @@ fn grep_filters_by_filename_pattern() {
 }
 
 #[test]
+#[cfg(unix)]
+fn grep_filename_regex_dot_matches_newline() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    for name in ["nlXname", "nl\nname"] {
+        fs::write(temp_dir.path().join(name), "needle\n").expect("should write fixture");
+    }
+
+    let results = grep(&needle_in(SearchConfig {
+        pattern: Some("^nl.name$".to_string()),
+        ..search_under(temp_dir.path())
+    }))
+    .expect("grep should succeed");
+
+    assert_eq!(results.len(), 2);
+}
+
+#[test]
 fn grep_respects_depth_limits() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
@@ -517,7 +534,7 @@ fn grep_trims_a_carriage_return_and_handles_a_missing_final_newline() {
 }
 
 #[test]
-fn grep_matches_anchors_before_lf_and_crlf_terminators() {
+fn grep_anchors_before_an_lf_terminator_only() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
     fs::write(
@@ -533,11 +550,30 @@ fn grep_matches_anchors_before_lf_and_crlf_terminators() {
     })
     .expect("grep should succeed");
 
+    // `rg`'s default: the CR is content, so `$` does not anchor before it.
     let result = results.first().expect("should match one file");
-    assert_eq!(
-        result.lines,
-        vec![(1, "needle".to_string()), (3, "needle".to_string())]
-    );
+    assert_eq!(result.lines, vec![(1, "needle".to_string())]);
+}
+
+#[test]
+fn grep_matches_a_carriage_return_as_ordinary_content() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+    fs::write(temp_path.join("a.txt"), "a\rb\n").expect("should write fixture");
+
+    for pattern in ["a.b", "a[^x]b", r"a\rb"] {
+        let results = grep(&GrepConfig {
+            pattern: pattern.to_string(),
+            search: search_under(temp_path),
+            ..Default::default()
+        })
+        .expect("a carriage return should be a legal pattern byte");
+
+        let result = results
+            .first()
+            .expect("a carriage return should be matchable content");
+        assert_eq!(result.lines, vec![(1, "a\rb".to_string())], "{pattern}");
+    }
 }
 
 #[test]
@@ -564,7 +600,7 @@ fn grep_keeps_a_trailing_carriage_return_that_is_not_a_terminator() {
 }
 
 #[test]
-fn grep_keeps_a_byte_order_mark_in_the_line_text() {
+fn grep_skips_a_byte_order_mark_in_the_line_text() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
     fs::write(temp_path.join("a.txt"), "\u{feff}needle here\n").expect("should write fixture");
@@ -577,5 +613,41 @@ fn grep_keeps_a_byte_order_mark_in_the_line_text() {
     .expect("grep should succeed");
 
     let result = results.first().expect("should match one file");
-    assert_eq!(result.lines, vec![(1, "\u{feff}needle here".to_string())]);
+    assert_eq!(result.lines, vec![(1, "needle here".to_string())]);
+}
+
+#[test]
+fn grep_anchors_the_first_line_of_a_file_with_a_byte_order_mark() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+    fs::write(temp_path.join("a.txt"), "\u{feff}needle here\n").expect("should write fixture");
+
+    let results = grep(&GrepConfig {
+        pattern: "^needle".to_string(),
+        search: search_under(temp_path),
+        ..Default::default()
+    })
+    .expect("grep should succeed");
+
+    let result = results
+        .first()
+        .expect("a byte order mark should not hide the first line from `^`");
+    assert_eq!(result.line_numbers, vec![1]);
+}
+
+#[test]
+fn grep_keeps_matches_found_before_a_later_nul_byte() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let temp_path = temp_dir.path();
+    let mut contents = b"needle alpha\n".to_vec();
+    contents.extend(std::iter::repeat_n(b'x', 200_000));
+    contents.extend_from_slice(b"\n\0needle omega\n");
+    fs::write(temp_path.join("late.bin"), contents).expect("should write fixture");
+
+    let results = grep(&needle_in(search_under(temp_path))).expect("grep should succeed");
+
+    let result = results
+        .first()
+        .expect("a NUL past the first buffer should not discard earlier matches");
+    assert_eq!(result.lines, vec![(1, "needle alpha".to_string())]);
 }

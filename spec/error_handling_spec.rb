@@ -20,6 +20,13 @@ describe "Fdr error handling" do
       assert_empty results
     end
 
+    it "returns no results for an empty paths array with full_path" do
+      results = Fdr.search(pattern: "needle", paths: [], full_path: true)
+
+      assert_kind_of Array, results
+      assert_empty results
+    end
+
     it "defaults omitted paths to the current directory" do
       results = Fdr.search(max_depth: 1)
 
@@ -281,12 +288,17 @@ describe "Fdr error handling" do
 
   describe "error classes" do
     it "tags the errors it raises itself while keeping their stdlib class" do
-      {
-        Fdr::InvalidPattern => [RegexpError, -> { Fdr.search(pattern: "[", paths: ["lib"]) }],
-        Fdr::InvalidOption => [ArgumentError, -> { Fdr.search(type: "nope", paths: ["lib"]) }],
-        Fdr::InvalidType => [TypeError, -> { Fdr.search(paths: nil) }],
-        Fdr::OutOfRange => [RangeError, -> { Fdr.search(max_depth: 2**64, paths: ["lib"]) }]
-      }.each do |fdr_class, (stdlib_class, call)|
+      [
+        [Fdr::InvalidPattern, RegexpError, -> { Fdr.search(pattern: "[", paths: ["lib"]) }],
+        [Fdr::InvalidOption, ArgumentError, -> { Fdr.search(type: "nope", paths: ["lib"]) }],
+        [Fdr::InvalidOption, ArgumentError, -> { Fdr.search(type: %w[f nope], paths: ["lib"]) }],
+        [Fdr::InvalidType, TypeError, -> { Fdr.search(paths: nil) }],
+        [Fdr::InvalidType, TypeError, -> { Fdr.search(exclude: [42], paths: ["lib"]) }],
+        [Fdr::InvalidType, TypeError, -> { Fdr.search(type: 42, paths: ["lib"]) }],
+        [Fdr::InvalidType, TypeError, -> { Fdr.search(type: [:f, 42], paths: ["lib"]) }],
+        [Fdr::InvalidType, TypeError, -> { Fdr.search(extension: [42], paths: ["lib"]) }],
+        [Fdr::OutOfRange, RangeError, -> { Fdr.search(max_depth: 2**64, paths: ["lib"]) }]
+      ].each do |fdr_class, stdlib_class, call|
         error = assert_raises(fdr_class) { call.call }
 
         assert_kind_of Fdr::Error, error
@@ -347,6 +359,48 @@ describe "Fdr error handling" do
       refute_kind_of Fdr::Error, error
       assert_equal "caller's problem", error.message
     end
+
+    it "accepts private implicit conversion methods" do
+      stringish = Class.new do
+        define_method(:to_str) { "fdr" }
+        private :to_str
+      end
+      arrayish = Class.new do
+        define_method(:to_ary) { ["lib"] }
+        private :to_ary
+      end
+      pathish = Class.new do
+        define_method(:to_path) { "lib" }
+        private :to_path
+      end
+      extensions = Class.new do
+        define_method(:to_ary) { ["rb"] }
+        private :to_ary
+      end
+
+      assert_equal Fdr.search(pattern: "fdr", paths: ["lib"]),
+        Fdr.search(pattern: stringish.new, paths: ["lib"])
+      assert_equal Fdr.search(paths: ["lib"]), Fdr.search(paths: arrayish.new)
+      assert_equal Fdr.search(paths: ["lib"]), Fdr.search(paths: [pathish.new])
+      assert_equal Fdr.search(paths: ["lib"], extension: "rb"),
+        Fdr.search(paths: ["lib"], extension: extensions.new)
+    end
+
+    it "leaves an exception raised by respond_to_missing? intact" do
+      boom = Class.new(ArgumentError)
+      raiser = Class.new do
+        define_method(:respond_to_missing?) do |name, include_private|
+          raise boom, "caller's problem" if name == :to_str
+
+          super(name, include_private)
+        end
+      end
+
+      error = assert_raises(boom) { Fdr.search(pattern: raiser.new, paths: ["lib"]) }
+
+      refute_kind_of Fdr::Error, error
+      assert_equal "caller's problem", error.message
+    end
   end
 
   describe "invalid options" do
@@ -368,16 +422,6 @@ describe "Fdr error handling" do
         Fdr.search(type: :invalid, paths: ["."], max_depth: 1)
       end
       assert_match(/type must be one of/, error.message)
-    end
-
-    it "validates array members" do
-      [
-        [Fdr::InvalidOption, -> { Fdr.search(type: %w[f invalid], paths: ["lib"]) }],
-        [Fdr::InvalidType, -> { Fdr.search(type: [:f, 42], paths: ["lib"]) }],
-        [Fdr::InvalidType, -> { Fdr.search(extension: [42], paths: ["lib"]) }]
-      ].each do |error_class, call|
-        assert_raises(error_class) { call.call }
-      end
     end
 
     it "strips leading dots from extension" do

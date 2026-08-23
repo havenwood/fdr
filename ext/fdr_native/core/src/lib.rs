@@ -1,14 +1,14 @@
-use crossbeam_channel::unbounded;
 use globset::GlobBuilder;
-use grep_matcher::LineTerminator;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use regex::bytes::{Regex, RegexBuilder};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Sender, channel};
 
 #[derive(Debug, Default)]
 #[allow(
@@ -66,7 +66,7 @@ pub struct GrepResult {
 pub enum SearchError {
     InvalidRegex(String),
     InvalidInput(String),
-    Io(std::io::Error),
+    Io(io::Error),
     Cancelled,
 }
 
@@ -82,21 +82,37 @@ impl std::fmt::Display for SearchError {
     }
 }
 
-impl std::error::Error for SearchError {}
+impl From<io::Error> for SearchError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl std::error::Error for SearchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 fn build_pattern_regex(config: &SearchConfig) -> Result<Option<Regex>, SearchError> {
-    let Some(ref pat) = config.pattern else {
+    let Some(pat) = &config.pattern else {
         return Ok(None);
     };
 
-    let regex_pattern = if config.glob {
-        glob_to_regex(pat).map_err(|error| SearchError::InvalidInput(error.to_string()))?
+    // Treat the empty glob's unmatchable `^$` as no pattern, like fd.
+    let glob = if config.glob && !pat.is_empty() {
+        Some(build_glob(pat).map_err(|error| SearchError::InvalidInput(error.to_string()))?)
     } else {
-        pat.clone()
+        None
     };
+    let regex_pattern = glob.as_ref().map_or(pat.as_str(), |glob| glob.regex());
 
-    let regex = RegexBuilder::new(&regex_pattern)
+    let regex = RegexBuilder::new(regex_pattern)
         .case_insensitive(!config.case_sensitive)
+        .dot_matches_new_line(true)
         .build()
         .map_err(|error| {
             if config.glob {
@@ -137,7 +153,7 @@ struct EntryFilters {
     file_type: Vec<FileTypeFilter>,
     /// Applied after walking so shallow ignored or excluded directories can prune.
     min_depth: Option<usize>,
-    /// Base for absolute full-path pattern matching, as in fd.
+    full_path: bool,
     full_path_base: Option<PathBuf>,
     follow: bool,
     min_size: Option<u64>,
@@ -148,8 +164,9 @@ struct EntryFilters {
 
 impl EntryFilters {
     fn new(config: &SearchConfig) -> Result<Self, SearchError> {
-        let full_path_base = if config.full_path && config.pattern.is_some() {
-            Some(std::env::current_dir().map_err(SearchError::Io)?)
+        let full_path = config.full_path && config.pattern.is_some();
+        let full_path_base = if full_path && config.paths.iter().any(|path| path.is_relative()) {
+            Some(std::env::current_dir()?)
         } else {
             None
         };
@@ -168,9 +185,11 @@ impl EntryFilters {
             file_type: config
                 .file_type
                 .iter()
-                .filter_map(|file_type| FileTypeFilter::parse(file_type))
-                .collect(),
+                .map(|file_type| file_type.parse::<FileTypeFilter>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(SearchError::InvalidInput)?,
             min_depth: config.min_depth,
+            full_path,
             full_path_base,
             follow: config.follow,
             min_size: config.min_size,
@@ -184,30 +203,26 @@ impl EntryFilters {
         let path = entry.path();
 
         if let Some(regex) = self.pattern.as_ref() {
-            let search_str = self.full_path_base.as_deref().map_or_else(
-                || path.file_name().unwrap_or_default().to_string_lossy(),
-                |base| {
-                    let relative = path.strip_prefix(".").unwrap_or(path);
-                    if relative.is_absolute() {
-                        relative.to_string_lossy()
-                    } else {
-                        std::borrow::Cow::Owned(base.join(relative).to_string_lossy().into_owned())
+            // Raw OS bytes, so non-UTF-8 names match themselves.
+            let search_bytes = if self.full_path {
+                let relative = path.strip_prefix(".").unwrap_or(path);
+                match self.full_path_base.as_deref() {
+                    Some(base) if relative.is_relative() => {
+                        std::borrow::Cow::Owned(base.join(relative).into_os_string().into_vec())
                     }
-                },
-            );
-            if !regex.is_match(search_str.as_bytes()) {
+                    _ => std::borrow::Cow::Borrowed(relative.as_os_str().as_bytes()),
+                }
+            } else {
+                std::borrow::Cow::Borrowed(path.file_name().unwrap_or_default().as_bytes())
+            };
+            if !regex.is_match(&search_bytes) {
                 return false;
             }
         }
 
         // Always match extensions against file names, even in full-path mode.
         if let Some(ext_regex) = self.extension.as_ref()
-            && !ext_regex.is_match(
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .as_bytes(),
-            )
+            && !ext_regex.is_match(path.file_name().unwrap_or_default().as_bytes())
         {
             return false;
         }
@@ -308,17 +323,23 @@ enum FileTypeFilter {
     Symlink,
 }
 
-impl FileTypeFilter {
-    /// `None` for a name outside `FILE_TYPES`, which leaves entries unfiltered.
-    fn parse(name: &str) -> Option<Self> {
+impl std::str::FromStr for FileTypeFilter {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
         match name {
-            "f" | "file" => Some(Self::File),
-            "d" | "dir" | "directory" => Some(Self::Dir),
-            "l" | "symlink" => Some(Self::Symlink),
-            _ => None,
+            "f" | "file" => Ok(Self::File),
+            "d" | "dir" | "directory" => Ok(Self::Dir),
+            "l" | "symlink" => Ok(Self::Symlink),
+            _ => Err(format!(
+                "file type must be one of {}, got {name}",
+                FILE_TYPES.join(", ")
+            )),
         }
     }
+}
 
+impl FileTypeFilter {
     fn matches(self, file_type: std::fs::FileType) -> bool {
         match self {
             Self::File => file_type.is_file(),
@@ -341,6 +362,13 @@ impl WalkEntry {
     fn path(&self) -> &Path {
         match self {
             Self::Normal(entry) => entry.path(),
+            Self::BrokenSymlink { path, .. } => path,
+        }
+    }
+
+    fn into_path(self) -> PathBuf {
+        match self {
+            Self::Normal(entry) => entry.into_path(),
             Self::BrokenSymlink { path, .. } => path,
         }
     }
@@ -523,18 +551,21 @@ const GREP_SERIAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// Wrapper for batched result sending with automatic flush on drop.
 struct ResultBatch {
     batch: Vec<Vec<u8>>,
-    sender: crossbeam_channel::Sender<Vec<Vec<u8>>>,
+    sender: Sender<Vec<Vec<u8>>>,
 }
 
 impl ResultBatch {
-    fn new(sender: crossbeam_channel::Sender<Vec<Vec<u8>>>) -> Self {
+    fn new(sender: Sender<Vec<Vec<u8>>>) -> Self {
         Self {
-            batch: Vec::with_capacity(BATCH_SIZE),
+            batch: Vec::new(),
             sender,
         }
     }
 
     fn push(&mut self, item: Vec<u8>) {
+        if self.batch.capacity() == 0 {
+            self.batch.reserve(BATCH_SIZE);
+        }
         self.batch.push(item);
         if self.batch.len() >= BATCH_SIZE {
             self.flush();
@@ -543,8 +574,7 @@ impl ResultBatch {
 
     fn flush(&mut self) {
         if !self.batch.is_empty() {
-            let batch = std::mem::replace(&mut self.batch, Vec::with_capacity(BATCH_SIZE));
-            drop(self.sender.send(batch));
+            drop(self.sender.send(std::mem::take(&mut self.batch)));
         }
     }
 }
@@ -559,7 +589,7 @@ pub fn search(config: &SearchConfig) -> Result<Vec<Vec<u8>>, SearchError> {
     search_with_cancel(config, &AtomicBool::new(false))
 }
 
-fn search_entry(entry: &WalkEntry, filters: &EntryFilters) -> Option<Vec<u8>> {
+fn search_entry(entry: WalkEntry, filters: &EntryFilters) -> Option<Vec<u8>> {
     // Skip symlinked directory roots the same way in both walkers.
     if entry.depth() == Some(0) && entry.path().is_dir() {
         return None;
@@ -571,11 +601,11 @@ fn search_entry(entry: &WalkEntry, filters: &EntryFilters) -> Option<Vec<u8>> {
         return None;
     }
 
-    if !filters.matches(entry) {
+    if !filters.matches(&entry) {
         return None;
     }
 
-    Some(path_to_bytes(entry.path()))
+    Some(path_into_bytes(entry.into_path()))
 }
 
 fn serial_search(
@@ -605,7 +635,7 @@ fn serial_search(
             directories += 1;
         }
 
-        if let Some(path) = search_entry(&entry, filters) {
+        if let Some(path) = search_entry(entry, filters) {
             results.push(path);
         }
     }
@@ -635,15 +665,14 @@ pub fn search_with_cancel(
         return Ok(results);
     }
 
-    let filters = Arc::new(filters);
-    let (tx, rx) = unbounded();
+    let (tx, rx) = channel();
     let failure = Mutex::new(None);
 
     let walker = builder.build_parallel();
 
     walker.run(|| {
         let tx = tx.clone();
-        let filters = Arc::clone(&filters);
+        let filters = &filters;
         let failure = &failure;
 
         let mut batch = ResultBatch::new(tx);
@@ -662,7 +691,7 @@ pub fn search_with_cancel(
                 }
             };
 
-            if let Some(path) = search_entry(&entry, &filters) {
+            if let Some(path) = search_entry(entry, filters) {
                 batch.push(path);
             }
 
@@ -678,9 +707,10 @@ pub fn search_with_cancel(
         return Err(error);
     }
 
-    let batches: Vec<Vec<Vec<u8>>> = rx.iter().collect();
+    let mut batches: Vec<Vec<Vec<u8>>> = rx.into_iter().collect();
     let total_size: usize = batches.iter().map(Vec::len).sum();
-    let mut results = Vec::with_capacity(total_size);
+    let mut results = batches.pop().unwrap_or_default();
+    results.reserve_exact(total_size - results.len());
 
     for batch in batches {
         results.extend(batch);
@@ -722,7 +752,6 @@ impl<R: Read> Read for CancellableReader<'_, R> {
 
 struct LineCollector {
     lines: Vec<(u64, Vec<u8>)>,
-    binary: bool,
 }
 
 impl grep_searcher::Sink for LineCollector {
@@ -744,15 +773,6 @@ impl grep_searcher::Sink for LineCollector {
         }
         Ok(true)
     }
-
-    fn binary_data(
-        &mut self,
-        _searcher: &Searcher,
-        _binary_byte_offset: u64,
-    ) -> std::io::Result<bool> {
-        self.binary = true;
-        Ok(false)
-    }
 }
 
 pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
@@ -762,11 +782,22 @@ pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
 fn build_searcher() -> Searcher {
     SearcherBuilder::new()
         .line_number(true)
-        .line_terminator(LineTerminator::crlf())
         .binary_detection(BinaryDetection::quit(b'\0'))
         // Keep the file's own bytes: sniffing strips a BOM and transcodes UTF-16.
         .bom_sniffing(false)
         .build()
+}
+
+/// Skips a UTF-8 BOM for `^` without transcoding UTF-16.
+fn skip_utf8_bom(file: &mut std::fs::File) -> io::Result<()> {
+    const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+    let mut head = [0_u8; 3];
+    if file.read_exact(&mut head).is_ok() && head == BOM {
+        return Ok(());
+    }
+
+    file.seek(io::SeekFrom::Start(0)).map(drop)
 }
 
 fn grep_candidate(
@@ -796,19 +827,18 @@ fn grep_candidate(
     Ok(filters.matches(entry))
 }
 
-/// Matching lines in `path`, or `None` when it is binary, unreadable, cancelled,
-/// or has no match.
+/// Matching lines in `path`, or `None` when it is unreadable, cancelled, or has
+/// no match. Binary detection stops the scan at the first NUL, so matches found
+/// before it are kept, as in `rg`.
 fn grep_file(
     searcher: &mut Searcher,
     matcher: &RegexMatcher,
-    path: &Path,
+    path: PathBuf,
     cancel: &AtomicBool,
 ) -> Option<GrepResult> {
-    let mut collector = LineCollector {
-        lines: Vec::new(),
-        binary: false,
-    };
-    let file = std::fs::File::open(path).ok()?;
+    let mut collector = LineCollector { lines: Vec::new() };
+    let mut file = std::fs::File::open(&path).ok()?;
+    skip_utf8_bom(&mut file).ok()?;
     let reader = CancellableReader {
         inner: file,
         cancel,
@@ -817,11 +847,10 @@ fn grep_file(
     if searcher
         .search_reader(matcher, reader, &mut collector)
         .is_ok()
-        && !collector.binary
         && !collector.lines.is_empty()
     {
         Some(GrepResult {
-            path: path_to_bytes(path),
+            path: path_into_bytes(path),
             lines: collector.lines,
         })
     } else {
@@ -861,7 +890,7 @@ fn serial_grep(
             return Ok(None);
         }
 
-        if let Some(result) = grep_file(&mut searcher, matcher, entry.path(), cancel) {
+        if let Some(result) = grep_file(&mut searcher, matcher, entry.into_path(), cancel) {
             results.push(result);
         }
     }
@@ -885,9 +914,10 @@ pub fn grep_with_cancel(
         .case_insensitive(!config.content_case_sensitive)
         .unicode(true)
         .octal(false)
-        .multi_line(true)
         .dot_matches_new_line(false)
-        .crlf(true)
+        // `rg`'s default: a lone CR stays ordinary content, so `$` anchors
+        // before LF only.
+        .line_terminator(Some(b'\n'))
         .ban_byte(Some(b'\0'));
     let matcher = matcher_builder
         .build(&config.pattern)
@@ -910,15 +940,13 @@ pub fn grep_with_cancel(
         return Ok(results);
     }
 
-    let matcher = Arc::new(matcher);
-    let filters = Arc::new(filters);
-    let (tx, rx) = unbounded();
+    let (tx, rx) = channel();
     let failure = Mutex::new(None);
     let walker = builder.build_parallel();
 
     walker.run(|| {
-        let matcher = Arc::clone(&matcher);
-        let filters = Arc::clone(&filters);
+        let matcher = &matcher;
+        let filters = &filters;
         let tx = tx.clone();
         let failure = &failure;
         let mut searcher = build_searcher();
@@ -947,7 +975,7 @@ pub fn grep_with_cancel(
                 return WalkState::Continue;
             }
 
-            if let Some(result) = grep_file(&mut searcher, matcher.as_ref(), entry.path(), cancel) {
+            if let Some(result) = grep_file(&mut searcher, matcher, entry.into_path(), cancel) {
                 drop(tx.send(result));
             }
 
@@ -963,7 +991,7 @@ pub fn grep_with_cancel(
         return Err(error);
     }
 
-    let mut results: Vec<GrepResult> = rx.iter().collect();
+    let mut results: Vec<GrepResult> = rx.into_iter().collect();
     results.sort_unstable();
     merge_colliding_paths(&mut results);
 
@@ -971,16 +999,8 @@ pub fn grep_with_cancel(
 }
 
 /// Raw OS bytes, so the path still opens the file.
-fn path_to_bytes(path: &Path) -> Vec<u8> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
-    }
-    #[cfg(not(unix))]
-    {
-        path.to_string_lossy().into_owned().into_bytes()
-    }
+fn path_into_bytes(path: PathBuf) -> Vec<u8> {
+    path.into_os_string().into_vec()
 }
 
 fn merge_colliding_paths(results: &mut Vec<GrepResult>) {
@@ -994,10 +1014,8 @@ fn merge_colliding_paths(results: &mut Vec<GrepResult>) {
     });
 }
 
-fn glob_to_regex(glob: &str) -> Result<String, globset::Error> {
-    let glob_pattern = GlobBuilder::new(glob).literal_separator(true).build()?;
-
-    Ok(glob_pattern.regex().to_string())
+fn build_glob(glob: &str) -> Result<globset::Glob, globset::Error> {
+    GlobBuilder::new(glob).literal_separator(true).build()
 }
 
 #[cfg(test)]
@@ -1049,22 +1067,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn path_to_bytes_preserves_invalid_utf8() {
-        use std::os::unix::ffi::OsStrExt;
+    fn path_into_bytes_preserves_invalid_utf8() {
+        use std::os::unix::ffi::OsStringExt;
 
-        let path = Path::new(std::ffi::OsStr::from_bytes(b"bad\xffname.txt"));
-        assert_eq!(path_to_bytes(path), b"bad\xffname.txt");
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"bad\xffname.txt".to_vec()));
+        assert_eq!(path_into_bytes(path), b"bad\xffname.txt");
     }
 
     #[test]
     fn merge_colliding_paths_merges_line_numbers_of_equal_paths() {
         let mut results = vec![
             GrepResult {
-                path: b"a\xff.txt".to_vec(),
+                path: b"a.txt".to_vec(),
                 lines: vec![(2, b"two".to_vec()), (3, b"three".to_vec())],
             },
             GrepResult {
-                path: b"a\xff.txt".to_vec(),
+                path: b"a.txt".to_vec(),
                 lines: vec![(3, b"three".to_vec()), (7, b"seven".to_vec())],
             },
             GrepResult {
@@ -1079,7 +1097,7 @@ mod tests {
             results,
             vec![
                 GrepResult {
-                    path: b"a\xff.txt".to_vec(),
+                    path: b"a.txt".to_vec(),
                     lines: vec![
                         (2, b"two".to_vec()),
                         (3, b"three".to_vec()),
@@ -1093,6 +1111,7 @@ mod tests {
             ]
         );
     }
+
     #[test]
     fn grep_reader_checks_cancellation_between_buffers() {
         struct CancelAfterFirstRead<'a> {
@@ -1125,10 +1144,7 @@ mod tests {
             .build("needle")
             .expect("should compile regex");
         let mut searcher = build_searcher();
-        let mut collector = LineCollector {
-            lines: Vec::new(),
-            binary: false,
-        };
+        let mut collector = LineCollector { lines: Vec::new() };
 
         let error = searcher
             .search_reader(&matcher, reader, &mut collector)
