@@ -24,7 +24,7 @@ gem 'fdr'
 
 `Fdr.search` returns path-sorted matches prefixed by each search root (`.` by default, producing `./...`). `pattern` is a case-insensitive [Rust regular expression](https://docs.rs/regex) unless `glob: true`.
 
-Both honor `.gitignore` and `.ignore`, which use gitignore syntax and `no_ignore: true` disables.
+Both honor `.gitignore` and `.ignore`, plus `.fdignore` for `Fdr.search` and `.rgignore` for `Fdr.grep`, which outrank the rest. All use gitignore syntax and `no_ignore: true` disables every one of them.
 
 Sizes are bytes and times are seconds ago, for `min_size`, `max_size`, `changed_within` and `changed_before`.
 

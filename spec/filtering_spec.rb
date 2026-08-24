@@ -96,6 +96,51 @@ describe "Fdr filtering" do
     end
   end
 
+  describe "ignore files" do
+    def ignore_tree
+      Dir.mktmpdir("fdr-ignore") do |dir|
+        # `.gitignore` only applies inside a repository, unlike the others.
+        Dir.mkdir(File.join(dir, ".git"))
+        File.write(File.join(dir, ".gitignore"), "git.txt\n")
+        File.write(File.join(dir, ".ignore"), "plain.txt\n")
+        File.write(File.join(dir, ".fdignore"), "fd.txt\n")
+        File.write(File.join(dir, ".rgignore"), "rg.txt\n")
+        %w[git.txt plain.txt fd.txt rg.txt keep.txt].each do |name|
+          File.write(File.join(dir, name), "needle\n")
+        end
+        yield dir
+      end
+    end
+
+    def basenames(paths) = paths.map { File.basename(_1) }.sort
+
+    it "honors .fdignore for search and .rgignore for grep" do
+      ignore_tree do |dir|
+        assert_equal %w[keep.txt rg.txt], basenames(Fdr.search(paths: [dir], type: "f"))
+        assert_equal %w[fd.txt keep.txt], basenames(Fdr.grep(pattern: "needle", paths: [dir]).keys)
+      end
+    end
+
+    it "honors .gitignore and .ignore for both" do
+      ignore_tree do |dir|
+        found = basenames(Fdr.search(paths: [dir], type: "f")) +
+          basenames(Fdr.grep(pattern: "needle", paths: [dir]).keys)
+
+        refute_includes found, "git.txt"
+        refute_includes found, "plain.txt"
+      end
+    end
+
+    it "disables every ignore file with no_ignore" do
+      ignore_tree do |dir|
+        results = basenames(Fdr.search(paths: [dir], type: "f", no_ignore: true, hidden: true))
+
+        assert_equal %w[.fdignore .gitignore .ignore .rgignore fd.txt git.txt keep.txt
+          plain.txt rg.txt], results
+      end
+    end
+  end
+
   describe "exclude globs" do
     # `ignore` supports a single override root, so a slash-containing glob
     # anchors to the first path only. `fd -E` behaves the same way.

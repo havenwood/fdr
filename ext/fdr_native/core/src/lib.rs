@@ -505,7 +505,10 @@ fn walk_threads() -> usize {
         .div_ceil(2)
 }
 
-fn build_walker(config: &SearchConfig) -> Result<Option<WalkBuilder>, SearchError> {
+fn build_walker(
+    config: &SearchConfig,
+    tool_ignore_filename: &str,
+) -> Result<Option<WalkBuilder>, SearchError> {
     // Build before empty paths return so bad globs still fail.
     let overrides = build_overrides(
         config,
@@ -524,6 +527,10 @@ fn build_walker(config: &SearchConfig) -> Result<Option<WalkBuilder>, SearchErro
     }
 
     configure_walker(&mut builder, config);
+
+    if !config.no_ignore {
+        builder.add_custom_ignore_filename(tool_ignore_filename);
+    }
 
     if let Some(overrides) = overrides {
         builder.overrides(overrides);
@@ -654,7 +661,7 @@ pub fn search_with_cancel(
     cancel: &AtomicBool,
 ) -> Result<Vec<Vec<u8>>, SearchError> {
     let filters = EntryFilters::new(config)?;
-    let Some(builder) = build_walker(config)? else {
+    let Some(builder) = build_walker(config, ".fdignore")? else {
         return Ok(Vec::new());
     };
     if depth_range_is_empty(config) {
@@ -923,7 +930,7 @@ pub fn grep_with_cancel(
         .build(&config.pattern)
         .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
     let filters = EntryFilters::new(&config.search)?;
-    let Some(builder) = build_walker(&config.search)? else {
+    let Some(builder) = build_walker(&config.search, ".rgignore")? else {
         return Ok(Vec::new());
     };
     if depth_range_is_empty(&config.search) {
@@ -1045,7 +1052,7 @@ mod tests {
             ..Default::default()
         };
         let filters = EntryFilters::new(&config).expect("should build filters");
-        let builder = build_walker(&config)
+        let builder = build_walker(&config, ".fdignore")
             .expect("should build walker")
             .expect("paths should produce a walker");
 

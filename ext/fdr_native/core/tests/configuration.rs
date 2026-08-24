@@ -1,7 +1,9 @@
 //! Integration tests for search configuration
 
 use fdr_core::{GrepConfig, SearchConfig, SearchError, grep, search as search_bytes};
+use std::fs;
 use std::path::PathBuf;
+use tempfile::TempDir;
 
 fn lossy(path: &[u8]) -> String {
     String::from_utf8_lossy(path).into_owned()
@@ -56,6 +58,73 @@ fn grep_with_empty_paths_returns_empty() {
     .expect("grep should succeed");
 
     assert!(results.is_empty(), "no paths should mean no grep roots");
+}
+
+#[test]
+fn search_and_grep_use_their_own_ignore_files() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let root = temp_dir.path();
+    let inner = root.join("inner");
+    fs::create_dir(root.join(".git")).expect("should create git directory");
+    fs::create_dir(&inner).expect("should create search directory");
+    fs::write(root.join(".fdignore"), "fd.txt\n!shared.txt\n").expect("should write fdignore");
+    fs::write(root.join(".rgignore"), "rg.txt\n!shared.txt\n").expect("should write rgignore");
+    fs::write(inner.join(".gitignore"), "shared.txt\n").expect("should write gitignore");
+    // Also in the search root, so `no_ignore` is not masked by parent suppression.
+    fs::write(inner.join(".fdignore"), "fd.txt\n!shared.txt\n").expect("should write fdignore");
+    fs::write(inner.join(".rgignore"), "rg.txt\n!shared.txt\n").expect("should write rgignore");
+    for name in ["fd.txt", "rg.txt", "shared.txt"] {
+        fs::write(inner.join(name), "needle\n").expect("should write fixture");
+    }
+
+    let path = |name| inner.join(name).to_string_lossy().into_owned();
+    let expected_search = vec![path("rg.txt"), path("shared.txt")];
+    let expected_grep = vec![path("fd.txt"), path("shared.txt")];
+    let expected_all = vec![path("fd.txt"), path("rg.txt"), path("shared.txt")];
+
+    let searched = search(&SearchConfig {
+        paths: vec![inner.clone()],
+        ..Default::default()
+    })
+    .expect("search should succeed");
+    let grepped = grep(&GrepConfig {
+        pattern: "needle".to_string(),
+        search: SearchConfig {
+            paths: vec![inner.clone()],
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .expect("grep should succeed")
+    .iter()
+    .map(|result| lossy(&result.path))
+    .collect::<Vec<_>>();
+
+    assert_eq!(searched, expected_search);
+    assert_eq!(grepped, expected_grep);
+
+    let searched = search(&SearchConfig {
+        paths: vec![inner.clone()],
+        no_ignore: true,
+        ..Default::default()
+    })
+    .expect("unrestricted search should succeed");
+    let grepped = grep(&GrepConfig {
+        pattern: "needle".to_string(),
+        search: SearchConfig {
+            paths: vec![inner],
+            no_ignore: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .expect("unrestricted grep should succeed")
+    .iter()
+    .map(|result| lossy(&result.path))
+    .collect::<Vec<_>>();
+
+    assert_eq!(searched, expected_all);
+    assert_eq!(grepped, expected_all);
 }
 
 #[test]
