@@ -20,6 +20,8 @@ pub struct SearchConfig {
     pub paths: Vec<PathBuf>,
     /// Inverted so unreadable entries remain skipped by default.
     pub raise_on_error: bool,
+    /// Extra gitignore-format files at lowest precedence, even with `no_ignore`.
+    pub ignore_file: Vec<PathBuf>,
     pub hidden: bool,
     pub no_ignore: bool,
     pub case_sensitive: bool,
@@ -405,6 +407,14 @@ fn walk_error(error: &ignore::Error) -> SearchError {
     SearchError::Io(io::Error::other(message))
 }
 
+fn ignore_file_error(error: &ignore::Error) -> SearchError {
+    if error.is_io() {
+        walk_error(error)
+    } else {
+        SearchError::InvalidInput(error.to_string())
+    }
+}
+
 fn walk_entry(
     entry: Result<DirEntry, ignore::Error>,
     raise_on_error: bool,
@@ -505,9 +515,26 @@ fn walk_threads() -> usize {
         .div_ceil(2)
 }
 
+/// Rejects relative environment paths to avoid reading from cwd.
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+/// `fd`'s global, lowest-precedence ignore file. `rg` has no equivalent.
+fn fd_global_ignore() -> Option<PathBuf> {
+    let config = absolute_env_path("XDG_CONFIG_HOME")
+        .or_else(|| absolute_env_path("HOME").map(|home| home.join(".config")))?;
+    let path = config.join("fd").join("ignore");
+
+    path.is_file().then_some(path)
+}
+
 fn build_walker(
     config: &SearchConfig,
     tool_ignore_filename: &str,
+    global_ignore: Option<&Path>,
 ) -> Result<Option<WalkBuilder>, SearchError> {
     // Build before empty paths return so bad globs still fail.
     let overrides = build_overrides(
@@ -530,6 +557,20 @@ fn build_walker(
 
     if !config.no_ignore {
         builder.add_custom_ignore_filename(tool_ignore_filename);
+
+        if let Some(path) = global_ignore {
+            // A broken global file should not fail every search.
+            drop(builder.add_ignore(path));
+        }
+    }
+
+    // Explicit ignore files still apply with `no_ignore`, like `fd` and `rg`.
+    for path in &config.ignore_file {
+        if let Some(error) = builder.add_ignore(path)
+            && config.raise_on_error
+        {
+            return Err(ignore_file_error(&error));
+        }
     }
 
     if let Some(overrides) = overrides {
@@ -661,7 +702,7 @@ pub fn search_with_cancel(
     cancel: &AtomicBool,
 ) -> Result<Vec<Vec<u8>>, SearchError> {
     let filters = EntryFilters::new(config)?;
-    let Some(builder) = build_walker(config, ".fdignore")? else {
+    let Some(builder) = build_walker(config, ".fdignore", fd_global_ignore().as_deref())? else {
         return Ok(Vec::new());
     };
     if depth_range_is_empty(config) {
@@ -930,7 +971,7 @@ pub fn grep_with_cancel(
         .build(&config.pattern)
         .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
     let filters = EntryFilters::new(&config.search)?;
-    let Some(builder) = build_walker(&config.search, ".rgignore")? else {
+    let Some(builder) = build_walker(&config.search, ".rgignore", None)? else {
         return Ok(Vec::new());
     };
     if depth_range_is_empty(&config.search) {
@@ -1052,7 +1093,7 @@ mod tests {
             ..Default::default()
         };
         let filters = EntryFilters::new(&config).expect("should build filters");
-        let builder = build_walker(&config, ".fdignore")
+        let builder = build_walker(&config, ".fdignore", None)
             .expect("should build walker")
             .expect("paths should produce a walker");
 

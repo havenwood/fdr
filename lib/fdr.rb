@@ -30,11 +30,14 @@ module Fdr
       max_size: nil,
       changed_within: nil,
       changed_before: nil,
-      ignore_error: true
+      ignore_error: true,
+      ignore_file: []
     )
       native_search(
         pattern:,
         paths:,
+        ignore_error:,
+        ignore_file:,
         hidden:,
         no_ignore:,
         case_sensitive:,
@@ -49,8 +52,7 @@ module Fdr
         min_size:,
         max_size:,
         changed_within:,
-        changed_before:,
-        ignore_error:
+        changed_before:
       )
     end
 
@@ -73,12 +75,15 @@ module Fdr
       max_size: nil,
       changed_within: nil,
       changed_before: nil,
-      ignore_error: true
+      ignore_error: true,
+      ignore_file: []
     )
       native_grep(
         pattern:,
         name:,
         paths:,
+        ignore_error:,
+        ignore_file:,
         hidden:,
         no_ignore:,
         case_sensitive:,
@@ -93,8 +98,7 @@ module Fdr
         min_size:,
         max_size:,
         changed_within:,
-        changed_before:,
-        ignore_error:
+        changed_before:
       )
     end
 

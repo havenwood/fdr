@@ -40,6 +40,7 @@ static CHANGED_WITHIN: LazyId = LazyId::new("changed_within");
 static CHANGED_BEFORE: LazyId = LazyId::new("changed_before");
 static NAME: LazyId = LazyId::new("name");
 static IGNORE_ERROR: LazyId = LazyId::new("ignore_error");
+static IGNORE_FILE: LazyId = LazyId::new("ignore_file");
 
 /// Rejects before coercion so caller `to_str` and `to_ary` errors remain intact.
 fn reject_type(ruby: &Ruby, value: Value, target: &str) -> Error {
@@ -350,8 +351,8 @@ fn extract_string_or_strings(ruby: &Ruby, hash: RHash, key: &LazyId) -> Result<V
     strings_from_array(ruby, RArray::try_convert(value)?, key)
 }
 
-fn extract_paths(ruby: &Ruby, hash: RHash) -> Result<Vec<std::path::PathBuf>, Error> {
-    let Some(value) = hash.get(*PATHS) else {
+fn extract_paths(ruby: &Ruby, hash: RHash, key: &LazyId) -> Result<Vec<std::path::PathBuf>, Error> {
+    let Some(value) = hash.get(**key) else {
         return Ok(Vec::new());
     };
 
@@ -479,8 +480,9 @@ fn build_search_config(
 ) -> Result<SearchConfig, Error> {
     Ok(SearchConfig {
         pattern: extract_string(ruby, kwargs, pattern_key)?,
-        paths: extract_paths(ruby, kwargs)?,
+        paths: extract_paths(ruby, kwargs, &PATHS)?,
         raise_on_error: !extract_boolish(kwargs, &IGNORE_ERROR, true)?,
+        ignore_file: extract_paths(ruby, kwargs, &IGNORE_FILE)?,
         hidden: extract_optional_arg(kwargs, &HIDDEN)?.unwrap_or_default(),
         no_ignore: extract_optional_arg(kwargs, &NO_IGNORE)?.unwrap_or_default(),
         case_sensitive: extract_optional_arg(kwargs, &CASE_SENSITIVE)?.unwrap_or_default(),

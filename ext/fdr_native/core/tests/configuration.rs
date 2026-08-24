@@ -288,6 +288,7 @@ fn search_allows_all_options_combined() {
         pattern: Some("lib".to_string()),
         paths: vec![PathBuf::from(".")],
         raise_on_error: false,
+        ignore_file: Vec::new(),
         hidden: true,
         no_ignore: false,
         case_sensitive: false,

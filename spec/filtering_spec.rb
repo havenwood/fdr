@@ -2,9 +2,71 @@
 
 require_relative "spec_helper"
 require "fileutils"
+require "open3"
 require "tmpdir"
 
 describe "Fdr filtering" do
+  describe "ignore_file" do
+    def with_ignore_file
+      Dir.mktmpdir("fdr-ignore-file") do |dir|
+        File.write(File.join(dir, "custom.ignore"), "skipme.txt\n")
+        File.write(File.join(dir, "skipme.txt"), "needle\n")
+        File.write(File.join(dir, "keep.txt"), "needle\n")
+        yield dir, File.join(dir, "custom.ignore")
+      end
+    end
+
+    it "applies an extra gitignore-format file" do
+      with_ignore_file do |dir, ignore|
+        assert_includes Fdr.search(paths: [dir], type: "f"), File.join(dir, "skipme.txt")
+        refute_includes Fdr.search(paths: [dir], type: "f", ignore_file: [ignore]),
+          File.join(dir, "skipme.txt")
+      end
+    end
+
+    it "outranks no_ignore, as fd and rg do" do
+      with_ignore_file do |dir, ignore|
+        results = Fdr.search(paths: [dir], type: "f", ignore_file: [ignore], no_ignore: true)
+
+        refute_includes results, File.join(dir, "skipme.txt")
+        assert_includes results, File.join(dir, "keep.txt")
+      end
+    end
+
+    it "applies to grep too" do
+      with_ignore_file do |dir, ignore|
+        results = Fdr.grep(pattern: "needle", paths: [dir], ignore_file: [ignore])
+
+        assert_equal [File.join(dir, "keep.txt")], results.keys
+      end
+    end
+
+    it "skips a missing ignore file unless ignore_error is false" do
+      with_ignore_file do |dir, _ignore|
+        missing = File.join(dir, "nope.ignore")
+
+        refute_empty Fdr.search(paths: [dir], type: "f", ignore_file: [missing])
+        assert_raises(Fdr::IOError) do
+          Fdr.search(paths: [dir], ignore_file: [missing], ignore_error: false).to_a
+        end
+      end
+    end
+
+    it "classifies a malformed ignore-file glob as an invalid option" do
+      with_ignore_file do |dir, ignore|
+        File.write(ignore, "skipme.txt\n[z-a]\n")
+
+        refute_includes Fdr.search(paths: [dir], type: "f", ignore_file: [ignore]),
+          File.join(dir, "skipme.txt")
+        error = assert_raises(Fdr::InvalidOption) do
+          Fdr.search(paths: [dir], ignore_file: [ignore], ignore_error: false).to_a
+        end
+
+        assert_match(/invalid range/, error.message)
+      end
+    end
+  end
+
   describe "extension filtering" do
     it "filters by single extension" do
       results = Fdr.search(extension: "toml", paths: ["ext"], max_depth: 3)
@@ -114,6 +176,24 @@ describe "Fdr filtering" do
 
     def basenames(paths) = paths.map { File.basename(_1) }.sort
 
+    def global_ignore_output(tree, environment, chdir: Dir.pwd)
+      script = <<~RUBY
+        require "fdr"
+        tree = ARGV[0]
+        names = ->(paths) { paths.map { File.basename(_1) }.sort }
+        print [names[Fdr.search(paths: [tree], type: "f")],
+               names[Fdr.grep(pattern: "needle", paths: [tree]).keys]].inspect
+      RUBY
+      output, status = Open3.capture2(
+        environment,
+        Gem.ruby, "-I#{File.expand_path("../lib", __dir__)}", "-e", script, tree,
+        chdir:
+      )
+
+      assert_predicate status, :success?
+      output
+    end
+
     it "honors .fdignore for search and .rgignore for grep" do
       ignore_tree do |dir|
         assert_equal %w[keep.txt rg.txt], basenames(Fdr.search(paths: [dir], type: "f"))
@@ -128,6 +208,68 @@ describe "Fdr filtering" do
 
         refute_includes found, "git.txt"
         refute_includes found, "plain.txt"
+      end
+    end
+
+    # Out of process because XDG_CONFIG_HOME is global and the suite is parallel.
+    it "honors fd's global ignore file for search only" do
+      Dir.mktmpdir("fdr-global-ignore") do |dir|
+        tree = File.join(dir, "tree")
+        config = File.join(dir, "config")
+        FileUtils.mkdir_p(File.join(config, "fd"))
+        Dir.mkdir(tree)
+        File.write(File.join(config, "fd", "ignore"), "global.txt\n")
+        %w[global.txt keep.txt].each { File.write(File.join(tree, _1), "needle\n") }
+
+        output = global_ignore_output(tree, {"XDG_CONFIG_HOME" => config})
+
+        assert_equal [%w[keep.txt], %w[global.txt keep.txt]].inspect, output
+      end
+    end
+
+    it "falls back to HOME when XDG_CONFIG_HOME is empty or relative" do
+      Dir.mktmpdir("fdr-global-ignore") do |dir|
+        tree = File.join(dir, "tree")
+        home = File.join(dir, "home")
+        FileUtils.mkdir_p([tree, File.join(home, ".config", "fd")])
+        File.write(File.join(home, ".config", "fd", "ignore"), "global.txt\n")
+        %w[global.txt keep.txt local.txt].each { File.write(File.join(tree, _1), "needle\n") }
+
+        ["", "relative"].each do |xdg|
+          config = xdg.empty? ? dir : File.join(dir, xdg)
+          FileUtils.mkdir_p(File.join(config, "fd"))
+          File.write(File.join(config, "fd", "ignore"), "local.txt\n")
+
+          output = global_ignore_output(
+            tree,
+            {"XDG_CONFIG_HOME" => xdg, "HOME" => home},
+            chdir: dir
+          )
+
+          assert_equal [%w[keep.txt local.txt], %w[global.txt keep.txt local.txt]].inspect, output
+        end
+      end
+    end
+
+    it "ignores empty or relative HOME when XDG_CONFIG_HOME is unset" do
+      Dir.mktmpdir("fdr-global-ignore") do |dir|
+        tree = File.join(dir, "tree")
+        Dir.mkdir(tree)
+        %w[keep.txt local.txt].each { File.write(File.join(tree, _1), "needle\n") }
+
+        ["", "relative"].each do |home|
+          config = home.empty? ? dir : File.join(dir, home)
+          FileUtils.mkdir_p(File.join(config, ".config", "fd"))
+          File.write(File.join(config, ".config", "fd", "ignore"), "local.txt\n")
+
+          output = global_ignore_output(
+            tree,
+            {"XDG_CONFIG_HOME" => nil, "HOME" => home},
+            chdir: dir
+          )
+
+          assert_equal [%w[keep.txt local.txt], %w[keep.txt local.txt]].inspect, output
+        end
       end
     end
 
