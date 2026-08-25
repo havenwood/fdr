@@ -47,8 +47,7 @@ pub struct GrepConfig {
     pub content_case_sensitive: bool,
     /// Searches binary content past the first NUL, like `rg -a`.
     pub text: bool,
-    /// Reports each occurrence with a one-based byte column, like `rg --column`.
-    pub column: bool,
+    pub format: GrepFormat,
     /// File filters, with `SearchConfig::pattern` matching names.
     pub search: SearchConfig,
 }
@@ -59,7 +58,7 @@ impl Default for GrepConfig {
             pattern: String::new(),
             content_case_sensitive: true,
             text: false,
-            column: false,
+            format: GrepFormat::Line,
             search: SearchConfig::default(),
         }
     }
@@ -67,17 +66,48 @@ impl Default for GrepConfig {
 
 impl GrepConfig {
     fn occurrence_mode(&self) -> bool {
-        self.column
+        self.format != GrepFormat::Line
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GrepFormat {
+    #[default]
+    Line,
+    Column,
+    ByteRange,
+}
+
+impl GrepFormat {
+    pub fn from_options(column: bool, byte_range: bool) -> Result<Self, SearchError> {
+        if column && byte_range {
+            return Err(SearchError::InvalidInput(
+                "column and byte_range cannot both be true".to_owned(),
+            ));
+        }
+
+        Ok(if column {
+            Self::Column
+        } else if byte_range {
+            Self::ByteRange
+        } else {
+            Self::Line
+        })
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum GrepPosition {
+    Column(u64),
+    ByteRange { offset: u64, length: u64 },
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct GrepMatch {
     pub path: Arc<[u8]>,
     pub line_number: u64,
-    /// 1-based byte offset of this occurrence, when `GrepConfig::column` is set.
-    pub column: Option<u64>,
-    pub text: Vec<u8>,
+    pub position: Option<GrepPosition>,
+    pub text: Arc<[u8]>,
 }
 
 #[derive(Debug)]
@@ -613,6 +643,9 @@ fn build_walker(
 
 const STREAM_CHUNK: usize = 256;
 
+/// Keeps queued grep text near the same bound even when lines are huge.
+const GREP_STREAM_CHUNK_BYTES: usize = 1024 * 1024;
+
 /// `ignore` parallelizes over directories, so entry count is not a useful cue.
 const DIRECTORY_THRESHOLD: usize = 64;
 
@@ -626,11 +659,16 @@ const SERIAL_PRESCAN_ENTRIES: usize = 512;
 /// Limits discarded work during serial grep pre-scan.
 const GREP_SERIAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Bounds what the pre-scan buffers, since one line holds as many occurrences
+/// as bytes and `GREP_SERIAL_MAX_BYTES` alone would allow millions.
+const GREP_SERIAL_MAX_MATCHES: usize = 4096;
+
 /// Grows batches to `STREAM_CHUNK` but sends the first result immediately.
 /// `visited` flushes partial batches stranded by selective filters.
 struct EmitBatch<'a, T, F: Fn(Vec<T>) -> bool> {
     items: Vec<T>,
     limit: usize,
+    weight: usize,
     since_flush: usize,
     emit: &'a F,
     stopped: &'a AtomicBool,
@@ -641,6 +679,7 @@ impl<'a, T, F: Fn(Vec<T>) -> bool> EmitBatch<'a, T, F> {
         Self {
             items: Vec::new(),
             limit: 1,
+            weight: 0,
             since_flush: 0,
             emit,
             stopped,
@@ -648,8 +687,13 @@ impl<'a, T, F: Fn(Vec<T>) -> bool> EmitBatch<'a, T, F> {
     }
 
     fn push(&mut self, item: T) -> bool {
+        self.push_weighted(item, 0)
+    }
+
+    fn push_weighted(&mut self, item: T, weight: usize) -> bool {
         self.items.push(item);
-        self.items.len() < self.limit || self.flush()
+        self.weight = self.weight.saturating_add(weight);
+        (self.items.len() < self.limit && self.weight < GREP_STREAM_CHUNK_BYTES) || self.flush()
     }
 
     fn visited(&mut self) -> bool {
@@ -664,6 +708,7 @@ impl<'a, T, F: Fn(Vec<T>) -> bool> EmitBatch<'a, T, F> {
         }
 
         let batch = std::mem::take(&mut self.items);
+        self.weight = 0;
         self.limit = self.limit.saturating_mul(2).min(STREAM_CHUNK);
         self.items.reserve(self.limit);
         if (self.emit)(batch) {
@@ -835,29 +880,46 @@ impl<R: Read> Read for CancellableReader<'_, R> {
     }
 }
 
-/// Strips CR only before LF. A final CR without LF is content.
+/// Drops LF but keeps CR searchable.
+fn matching_line(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\n").unwrap_or(bytes)
+}
+
+/// Drops CR from CRLF but keeps a lone trailing CR.
 fn line_text(bytes: &[u8]) -> &[u8] {
-    bytes
-        .strip_suffix(b"\n")
-        .map_or(bytes, |line| line.strip_suffix(b"\r").unwrap_or(line))
+    let line = matching_line(bytes);
+    if bytes.ends_with(b"\n") {
+        line.strip_suffix(b"\r").unwrap_or(line)
+    } else {
+        line
+    }
 }
 
 struct LineEmitter<'a, 'b, F: Fn(Vec<GrepMatch>) -> bool> {
     path: Arc<[u8]>,
     cancel: &'a AtomicBool,
-    /// Reuses the line matcher for exact column offsets.
     matcher: Option<&'a RegexMatcher>,
+    byte_range: bool,
     batch: &'a mut EmitBatch<'b, GrepMatch, F>,
 }
 
 impl<F: Fn(Vec<GrepMatch>) -> bool> LineEmitter<'_, '_, F> {
-    fn emit(&mut self, line_number: u64, column: Option<u64>, text: &[u8]) -> bool {
-        self.batch.push(GrepMatch {
-            path: Arc::clone(&self.path),
-            line_number,
-            column,
-            text: text.to_vec(),
-        })
+    fn emit(
+        &mut self,
+        line_number: u64,
+        position: Option<GrepPosition>,
+        text: Arc<[u8]>,
+        weight: usize,
+    ) -> bool {
+        self.batch.push_weighted(
+            GrepMatch {
+                path: Arc::clone(&self.path),
+                line_number,
+                position,
+                text,
+            },
+            weight,
+        )
     }
 }
 
@@ -876,31 +938,39 @@ impl<F: Fn(Vec<GrepMatch>) -> bool> grep_searcher::Sink for LineEmitter<'_, '_, 
         let Some(line_number) = matched.line_number() else {
             return Ok(true);
         };
-        let text = line_text(matched.bytes());
+        let occurrence = self.matcher.is_some();
+        let text: Arc<[u8]> = Arc::from(if occurrence {
+            matching_line(matched.bytes())
+        } else {
+            line_text(matched.bytes())
+        });
+        let text_bytes = text.len();
         let Some(finder) = self.matcher else {
-            return Ok(self.emit(line_number, None, text));
+            return Ok(self.emit(line_number, None, text, text_bytes));
         };
 
-        let mut columns = Vec::new();
+        let mut found_any = false;
+        let mut live = true;
         finder
-            .find_iter(text, |found| {
-                columns.push(found.start() as u64 + 1);
-                true
+            .find_iter(matching_line(matched.bytes()), |found| {
+                let weight = if found_any { 0 } else { text_bytes };
+                found_any = true;
+                let start = found.start() as u64;
+                let position = if self.byte_range {
+                    GrepPosition::ByteRange {
+                        offset: start,
+                        length: (found.end() - found.start()) as u64,
+                    }
+                } else {
+                    GrepPosition::Column(start + 1)
+                };
+                live = self.emit(line_number, Some(position), Arc::clone(&text), weight);
+                live
             })
             .map_err(std::io::Error::other)?;
 
-        // `$` may match the stripped terminator without an occurrence in `text`.
-        if columns.is_empty() {
-            return Ok(self.emit(line_number, Some(1), text));
-        }
-
-        for column in columns {
-            if !self.emit(line_number, Some(column), text) {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
+        debug_assert!(found_any, "a matching line should contain an occurrence");
+        Ok(live)
     }
 }
 
@@ -946,11 +1016,14 @@ fn skip_utf8_bom(file: &mut std::fs::File) -> io::Result<()> {
     const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
     let mut head = [0_u8; 3];
-    if file.read_exact(&mut head).is_ok() && head == BOM {
-        return Ok(());
+    match file.read_exact(&mut head) {
+        Ok(()) if head == BOM => Ok(()),
+        Ok(()) => file.seek(io::SeekFrom::Start(0)).map(drop),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            file.seek(io::SeekFrom::Start(0)).map(drop)
+        }
+        Err(error) => Err(error),
     }
-
-    file.seek(io::SeekFrom::Start(0)).map(drop)
 }
 
 fn grep_candidate(
@@ -963,10 +1036,10 @@ fn grep_candidate(
         .is_some_and(|file_type| file_type.is_file())
     {
         if raise_on_error && entry.depth() == Some(0) && !entry.path().is_dir() {
-            return Err(SearchError::Io(io::Error::other(format!(
-                "{}: not a regular file",
-                entry.path().display()
-            ))));
+            return Err(file_io_error(
+                entry.path(),
+                &io::Error::other("not a regular file"),
+            ));
         }
         return Ok(false);
     }
@@ -987,14 +1060,22 @@ fn grep_file<F: Fn(Vec<GrepMatch>) -> bool>(
     path: &Path,
     cancel: &AtomicBool,
     filters: &EntryFilters,
-    column: bool,
+    config: &GrepConfig,
     batch: &mut EmitBatch<'_, GrepMatch, F>,
-) {
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return;
+) -> Result<(), SearchError> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if config.search.raise_on_error => {
+            return Err(file_io_error(path, &error));
+        }
+        Err(_) => return Ok(()),
     };
-    if skip_utf8_bom(&mut file).is_err() {
-        return;
+    if let Err(error) = skip_utf8_bom(&mut file) {
+        return if config.search.raise_on_error {
+            Err(file_io_error(path, &error))
+        } else {
+            Ok(())
+        };
     }
 
     let reader = CancellableReader {
@@ -1004,11 +1085,23 @@ fn grep_file<F: Fn(Vec<GrepMatch>) -> bool>(
     let mut sink = LineEmitter {
         path: Arc::from(emitted_path(path, filters.strip_cwd_prefix).as_slice()),
         cancel,
-        matcher: column.then_some(matcher),
+        matcher: config.occurrence_mode().then_some(matcher),
+        byte_range: config.format == GrepFormat::ByteRange,
         batch,
     };
 
-    drop(searcher.search_reader(matcher, reader, &mut sink));
+    match searcher.search_reader(matcher, reader, &mut sink) {
+        Err(_) if cancel.load(Ordering::Relaxed) => Err(SearchError::Cancelled),
+        Err(error) if config.search.raise_on_error => Err(file_io_error(path, &error)),
+        Ok(()) | Err(_) => Ok(()),
+    }
+}
+
+fn file_io_error(path: &Path, error: &io::Error) -> SearchError {
+    SearchError::Io(io::Error::new(
+        error.kind(),
+        format!("{}: {error}", path.display()),
+    ))
 }
 
 /// Returns `None` when the tree is wide enough for `ignore`'s thread pool.
@@ -1023,9 +1116,17 @@ fn serial_grep(
     let mut searcher = build_searcher(config.text);
     let mut scanned_bytes = 0_u64;
     let collected = Mutex::new(Vec::new());
+    let overflowed = AtomicBool::new(false);
     let collect = |batch: Vec<GrepMatch>| {
-        lock(&collected).extend(batch);
-        true
+        let mut buffered = lock(&collected);
+        buffered.extend(batch);
+        let capped = buffered.len() > GREP_SERIAL_MAX_MATCHES;
+        drop(buffered);
+
+        if capped {
+            overflowed.store(true, Ordering::Relaxed);
+        }
+        !capped
     };
     let mut batch = EmitBatch::new(&collect, stopped);
 
@@ -1056,9 +1157,13 @@ fn serial_grep(
             &entry.into_path(),
             cancel,
             filters,
-            config.column,
+            config,
             &mut batch,
-        );
+        )?;
+
+        if overflowed.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
     }
 
     if cancel.load(Ordering::Relaxed) {
@@ -1074,7 +1179,7 @@ fn serial_grep(
     ))
 }
 
-/// Emits line batches: once per line, or per occurrence in column mode.
+/// Emits one result per line or occurrence.
 pub fn grep_stream<F>(config: &GrepConfig, cancel: &AtomicBool, emit: F) -> Result<(), SearchError>
 where
     F: Fn(Vec<GrepMatch>) -> bool + Sync,
@@ -1089,11 +1194,19 @@ where
     }
 
     let stopped = AtomicBool::new(false);
-    if let Some(matches) = serial_grep(&builder, &matcher, &filters, config, cancel, &stopped)? {
-        if !matches.is_empty() {
-            emit(matches);
+    // Occurrence mode skips the buffering pre-scan: one file can hold a match
+    // per byte, which would both defeat an early stop and outweigh the spawn it
+    // saves.
+    if !config.occurrence_mode() {
+        match serial_grep(&builder, &matcher, &filters, config, cancel, &stopped)? {
+            Some(buffered) => {
+                if !buffered.is_empty() {
+                    emit(buffered);
+                }
+                return Ok(());
+            }
+            None => stopped.store(false, Ordering::Relaxed),
         }
-        return Ok(());
     }
 
     let failure = Mutex::new(None);
@@ -1127,16 +1240,20 @@ where
                     return WalkState::Quit;
                 }
             };
-            if candidate {
-                grep_file(
+            if candidate
+                && let Err(error) = grep_file(
                     &mut searcher,
                     matcher,
                     &entry.into_path(),
                     cancel,
                     filters,
-                    config.column,
+                    config,
                     &mut batch,
-                );
+                )
+            {
+                record(failure, error);
+                stopped.store(true, Ordering::Relaxed);
+                return WalkState::Quit;
             }
 
             if cancel.load(Ordering::Relaxed) || stopped.load(Ordering::Relaxed) || !batch.visited()
@@ -1294,6 +1411,7 @@ mod tests {
             path: Arc::from(&b"needle.txt"[..]),
             cancel: &cancel,
             matcher: None,
+            byte_range: false,
             batch: &mut batch,
         };
 
@@ -1325,6 +1443,22 @@ mod tests {
         }
 
         assert_eq!(*lock(&flushed), vec![1, 2, 4, 8]);
+    }
+
+    #[test]
+    fn emit_batch_flushes_before_huge_lines_fill_a_count_sized_chunk() {
+        let stopped = AtomicBool::new(false);
+        let flushed = Mutex::new(Vec::new());
+        let record = |batch: Vec<u8>| {
+            lock(&flushed).push(batch.len());
+            true
+        };
+        let mut batch = EmitBatch::new(&record, &stopped);
+
+        assert!(batch.push(1));
+        assert!(batch.push_weighted(2, GREP_STREAM_CHUNK_BYTES));
+
+        assert_eq!(*lock(&flushed), vec![1, 1]);
     }
 
     #[test]

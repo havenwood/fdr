@@ -82,6 +82,7 @@ describe "Fdr error handling" do
     it "does not raise on a readable tree when ignore_error is false" do
       refute_empty Fdr.search(paths: ["lib"], ignore_error: false).to_a
     end
+
     it "raises for an explicit non-file when ignore_error is false" do
       Dir.mktmpdir("fdr-non-file") do |dir|
         fifo = File.join(dir, "fifo")
@@ -89,10 +90,30 @@ describe "Fdr error handling" do
 
         assert_empty Fdr.grep(pattern: "needle", paths: [fifo]).to_a
         assert_empty Fdr.grep(pattern: "needle", paths: [dir], ignore_error: false).to_a
-        error = assert_raises(Fdr::IOError) do
-          Fdr.grep(pattern: "needle", paths: [fifo], ignore_error: false).to_a
+        [{}, {column: true}, {byte_range: true}].each do |position|
+          error = assert_raises(Fdr::IOError) do
+            Fdr.grep(pattern: "needle", paths: [fifo], ignore_error: false, **position).to_a
+          end
+          assert_match(/fifo: not a regular file/, error.message)
         end
-        assert_match(/fifo: not a regular file/, error.message)
+      end
+    end
+
+    it "raises when grep cannot open a file and ignore_error is false" do
+      Dir.mktmpdir("fdr-unreadable-file") do |dir|
+        path = File.join(dir, "secret.txt")
+        File.write(path, "needle\n")
+        File.chmod(0, path)
+
+        assert_empty Fdr.grep(pattern: "needle", paths: [path]).to_a
+        [{}, {column: true}, {byte_range: true}].each do |position|
+          error = assert_raises(Fdr::IOError) do
+            Fdr.grep(pattern: "needle", paths: [path], ignore_error: false, **position).to_a
+          end
+          assert_match(/secret\.txt/, error.message)
+        end
+      ensure
+        File.chmod(0o600, path) if path && File.exist?(path)
       end
     end
   end

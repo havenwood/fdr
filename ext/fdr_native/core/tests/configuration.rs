@@ -5,7 +5,7 @@ pub mod grep_support;
 #[path = "support/search.rs"]
 pub mod search_support;
 
-use fdr_core::{GrepConfig, SearchConfig, SearchError};
+use fdr_core::{GrepConfig, GrepFormat, SearchConfig, SearchError};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -67,6 +67,15 @@ fn grep_with_empty_paths_returns_empty() {
     .expect("grep should succeed");
 
     assert!(results.is_empty(), "no paths should mean no grep roots");
+}
+
+#[test]
+fn grep_rejects_multiple_occurrence_formats() {
+    let error =
+        GrepFormat::from_options(true, true).expect_err("column and byte_range should conflict");
+
+    assert!(matches!(error, SearchError::InvalidInput(message)
+            if message.contains("column and byte_range")));
 }
 
 #[test]

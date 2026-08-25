@@ -3,7 +3,7 @@
 #[path = "support/grep.rs"]
 pub mod grep_support;
 
-use fdr_core::{GrepConfig, SearchConfig, SearchError};
+use fdr_core::{GrepConfig, GrepFormat, SearchConfig, SearchError};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -53,6 +53,8 @@ fn grep_defaults_to_case_sensitive_content_and_case_insensitive_names() {
     let config = GrepConfig::default();
 
     assert!(config.content_case_sensitive);
+    assert!(!config.text);
+    assert_eq!(config.format, GrepFormat::Line);
     assert!(!config.search.case_sensitive);
 }
 

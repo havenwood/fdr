@@ -65,6 +65,18 @@ describe "Fdr.grep" do
         [@path, 4, 14, "needle twice needle"]], results
     end
 
+    it "reports a byte Range for String#byteslice" do
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], byte_range: true)
+        .sort_by { |path, line_number, range, _text| [path, line_number, range.begin] }
+
+      assert_equal [[@path, 3, 0...6, "needle"],
+        [@path, 4, 0...6, "needle twice needle"],
+        [@path, 4, 13...19, "needle twice needle"]], results
+      results.each do |_path, _line_number, range, text|
+        assert_equal "needle", text.byteslice(range)
+      end
+    end
+
     it "counts the column in bytes, as rg does" do
       path = File.join(@tmpdir, "multibyte.txt")
       File.write(path, "caf\u00e9 needle here\n")
@@ -73,6 +85,48 @@ describe "Fdr.grep" do
 
       assert_equal 7, column
       assert_equal "needle", text.byteslice(column - 1, 6)
+    end
+
+    it "indexes the original CRLF line in occurrence modes" do
+      path = File.join(@tmpdir, "crlf.txt")
+      File.binwrite(path, "foo\r\n")
+
+      assert_equal [[path, 1, 4, "foo\r"]],
+        Fdr.grep(pattern: '\\r', paths: [path], column: true).to_a
+
+      _, _, range, text = Fdr.grep(pattern: '\\r', paths: [path], byte_range: true).first
+      assert_equal [3...4, "\r"], [range, text.byteslice(range)]
+
+      _, _, range, text = Fdr.grep(pattern: "$", paths: [path], byte_range: true).first
+      assert_equal [4...4, ""], [range, text.byteslice(range)]
+    end
+
+    it "freezes the line in every result shape" do
+      path = File.join(@tmpdir, "shared.txt")
+      File.write(path, "needle needle needle needle needle\n")
+
+      [{}, {column: true}, {byte_range: true}].each do |shape|
+        texts = Fdr.grep(pattern: "needle", paths: [path], **shape).map { |*match| match.last }
+
+        assert_equal(shape.empty? ? 1 : 5, texts.size)
+        assert(texts.all?(&:frozen?), "result text must not be mutable")
+        next if shape.empty?
+
+        assert_equal 1, texts.map(&:object_id).uniq.size,
+          "every occurrence on a line should share its text"
+      end
+    end
+
+    it "keeps shared occurrence text across GC compaction" do
+      path = File.join(@tmpdir, "shared.txt")
+      File.write(path, "needle needle\n")
+      matches = Fdr.grep(pattern: "needle", paths: [path], column: true)
+
+      first = matches.next.last
+      GC.compact
+      second = matches.next.last
+
+      assert_same first, second
     end
 
     it "yields nothing when nothing matches" do
@@ -131,6 +185,12 @@ describe "Fdr.grep" do
       assert_equal [2, 3, 4], results[@path].keys
     end
 
+    it "treats a non-false byte_range value as truthy" do
+      result = Fdr.grep(pattern: "needle", paths: [@path], byte_range: "yes").first
+
+      assert_equal [@path, 3, 0...6, "needle"], result
+    end
+
     it "scans binary files when text is true, as rg -a does" do
       binary = File.join(@tmpdir, "binary.bin")
       File.binwrite(binary, "before\0needle here\n")
@@ -144,7 +204,7 @@ describe "Fdr.grep" do
       binary = File.join(@tmpdir, "binary.bin")
       File.binwrite(binary, "before\0needle here\n")
 
-      [{}, {column: true}].each do |shape|
+      [{}, {column: true}, {byte_range: true}].each do |shape|
         assert_empty Fdr.grep(pattern: "e\0n", paths: [binary], **shape).to_a
         refute_empty Fdr.grep(pattern: "e\0n", paths: [binary], text: true, **shape).to_a
       end
@@ -314,6 +374,14 @@ describe "Fdr.grep" do
       assert_raises(ArgumentError) do
         grep_results(pattern: "needle", paths: [@tmpdir], type: "f")
       end
+    end
+
+    it "rejects column and byte_range together" do
+      error = assert_raises(Fdr::InvalidOption) do
+        Fdr.grep(pattern: "needle", paths: [@tmpdir], column: true, byte_range: true)
+      end
+
+      assert_match(/column and byte_range cannot both be true/, error.message)
     end
 
     it "raises for an invalid regex pattern" do

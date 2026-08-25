@@ -1,4 +1,4 @@
-use fdr_core::{GrepConfig, SearchConfig, grep_stream, search_stream};
+use fdr_core::{GrepConfig, GrepFormat, GrepPosition, SearchConfig, grep_stream, search_stream};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -107,11 +107,16 @@ fn grep_stream_emits_each_matching_line() {
     let matches = Mutex::new(Vec::new());
 
     grep_stream(&config, &AtomicBool::new(false), |batch| {
-        matches.lock().expect("matches lock should work").extend(
-            batch
-                .into_iter()
-                .map(|matched| (matched.path.to_vec(), matched.line_number, matched.text)),
-        );
+        matches
+            .lock()
+            .expect("matches lock should work")
+            .extend(batch.into_iter().map(|matched| {
+                (
+                    matched.path.to_vec(),
+                    matched.line_number,
+                    matched.text.to_vec(),
+                )
+            }));
         true
     })
     .expect("streaming grep should succeed");
@@ -159,4 +164,166 @@ fn grep_stream_takes_the_serial_path_for_a_small_tree() {
     .expect("streaming grep should succeed");
 
     assert_eq!(*batches.lock().expect("batches lock should work"), vec![4]);
+}
+
+#[test]
+fn grep_stream_is_complete_when_the_pre_scan_overflows() {
+    let directory = TempDir::new().expect("should create temp directory");
+    let lines = 5_000;
+    std::fs::write(directory.path().join("dense.txt"), "needle\n".repeat(lines))
+        .expect("should write file");
+    let config = GrepConfig {
+        pattern: "needle".to_owned(),
+        search: SearchConfig {
+            paths: vec![directory.path().to_path_buf()],
+            ..SearchConfig::default()
+        },
+        ..GrepConfig::default()
+    };
+    let seen = Mutex::new(0_usize);
+
+    grep_stream(&config, &AtomicBool::new(false), |batch| {
+        *seen.lock().expect("seen lock should work") += batch.len();
+        true
+    })
+    .expect("streaming grep should succeed");
+
+    // More matches than the pre-scan buffers, so it is discarded and replaced
+    // by the parallel walk without losing or repeating a line.
+    assert_eq!(*seen.lock().expect("seen lock should work"), lines);
+}
+
+#[test]
+fn grep_stream_is_complete_when_the_entry_limit_flush_overflows() {
+    let directory = TempDir::new().expect("should create temp directory");
+    let matching = directory.path().join("matching.txt");
+    let other = directory.path().join("other");
+    let lines = 4_097;
+    std::fs::write(&matching, "needle\n".repeat(lines)).expect("should write matching file");
+    std::fs::create_dir(&other).expect("should create other directory");
+    for index in 0..511 {
+        std::fs::write(other.join(format!("f{index:04}.txt")), "other\n")
+            .expect("should write other file");
+    }
+    let config = GrepConfig {
+        pattern: "needle".to_owned(),
+        search: SearchConfig {
+            paths: vec![matching, other],
+            ..SearchConfig::default()
+        },
+        ..GrepConfig::default()
+    };
+    let seen = Mutex::new(0_usize);
+
+    grep_stream(&config, &AtomicBool::new(false), |batch| {
+        *seen.lock().expect("seen lock should work") += batch.len();
+        true
+    })
+    .expect("streaming grep should succeed");
+
+    // The final two pre-scan matches flush only when the entry limit bails.
+    assert_eq!(*seen.lock().expect("seen lock should work"), lines);
+}
+
+#[test]
+fn grep_stream_is_complete_when_the_byte_limit_flush_overflows() {
+    let directory = TempDir::new().expect("should create temp directory");
+    let matching = directory.path().join("matching.txt");
+    let oversized = directory.path().join("oversized.txt");
+    let lines = 4_097;
+    std::fs::write(&matching, "needle\n".repeat(lines)).expect("should write matching file");
+    std::fs::File::create(&oversized)
+        .expect("should create oversized file")
+        .set_len(8 * 1024 * 1024)
+        .expect("should size oversized file");
+    let config = GrepConfig {
+        pattern: "needle".to_owned(),
+        search: SearchConfig {
+            paths: vec![matching, oversized],
+            ..SearchConfig::default()
+        },
+        ..GrepConfig::default()
+    };
+    let seen = Mutex::new(0_usize);
+
+    grep_stream(&config, &AtomicBool::new(false), |batch| {
+        *seen.lock().expect("seen lock should work") += batch.len();
+        true
+    })
+    .expect("streaming grep should succeed");
+
+    // The final two pre-scan matches flush only when the byte limit bails.
+    assert_eq!(*seen.lock().expect("seen lock should work"), lines);
+}
+
+#[test]
+fn grep_occurrence_stream_stops_after_the_first_match() {
+    let directory = TempDir::new().expect("should create temp directory");
+    let path = directory.path().join("dense.txt");
+    std::fs::write(&path, "a".repeat(4_096)).expect("should write file");
+
+    for byte_range in [false, true] {
+        let config = GrepConfig {
+            pattern: "a".to_owned(),
+            format: if byte_range {
+                GrepFormat::ByteRange
+            } else {
+                GrepFormat::Column
+            },
+            search: SearchConfig {
+                paths: vec![path.clone()],
+                ..SearchConfig::default()
+            },
+            ..GrepConfig::default()
+        };
+        let batches = Mutex::new(Vec::new());
+
+        grep_stream(&config, &AtomicBool::new(false), |batch| {
+            batches
+                .lock()
+                .expect("batches lock should work")
+                .push(batch.len());
+            false
+        })
+        .expect("stopping occurrence grep should succeed");
+
+        assert_eq!(*batches.lock().expect("batches lock should work"), vec![1]);
+    }
+}
+
+#[test]
+fn grep_byte_range_indexes_returned_crlf_text() {
+    let directory = TempDir::new().expect("should create temp directory");
+    let path = directory.path().join("crlf.txt");
+    std::fs::write(&path, b"foo\r\n").expect("should write file");
+    let config = GrepConfig {
+        pattern: r"\r".to_owned(),
+        format: GrepFormat::ByteRange,
+        search: SearchConfig {
+            paths: vec![path],
+            ..SearchConfig::default()
+        },
+        ..GrepConfig::default()
+    };
+    let results = Mutex::new(Vec::new());
+
+    grep_stream(&config, &AtomicBool::new(false), |batch| {
+        results
+            .lock()
+            .expect("results lock should work")
+            .extend(batch);
+        true
+    })
+    .expect("byte range grep should succeed");
+
+    let results = results.into_inner().expect("results lock should work");
+    let matched = results.first().expect("should find carriage return");
+    assert_eq!(
+        matched.position,
+        Some(GrepPosition::ByteRange {
+            offset: 3,
+            length: 1,
+        })
+    );
+    assert_eq!(&*matched.text, b"foo\r");
 }

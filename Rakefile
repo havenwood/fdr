@@ -34,6 +34,16 @@ GEM_SMOKE_TEST = <<~'RUBY'
   raise 'Fdr.grep did not return an Enumerator' unless grep_results.is_a?(Enumerator)
   raise 'Fdr.grep returned no matches' if grep_results.to_a.empty?
   raise 'Fdr.grep searched an empty path set' unless Fdr.grep(pattern: '.', paths: []).to_a.empty?
+
+  binary = File.join(Dir.pwd, 'fdr-smoke.bin')
+  File.binwrite(binary, "a\0a\r\n")
+  occurrences = Fdr.grep(pattern: 'a', paths: [binary], text: true, column: true).to_a
+  expected = [[binary, 1, 1, "a\0a\r"], [binary, 1, 3, "a\0a\r"]]
+  raise 'Fdr.grep text or column smoke failed' unless occurrences == expected
+  match = Fdr.grep(pattern: '\\r', paths: [binary], text: true, byte_range: true).first
+  raise 'Fdr.grep byte range smoke failed' unless match == [binary, 1, 3...4, "a\0a\r"]
+  raise 'Fdr.grep byte range did not index text' unless match.last.byteslice(match[2]) == "\r"
+
   raise 'Fdr exposed removed search aliases' if Fdr.respond_to?(:entries) || Fdr.respond_to?(:scan)
 
   puts "Verified installed Fdr #{Fdr::VERSION}"

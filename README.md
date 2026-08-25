@@ -44,7 +44,7 @@ Fdr.search(
 
 ### Grep
 
-`Fdr.grep` returns an `Enumerator` of path, one-based line number and matching line, in no particular order. A line comes back once however many times it matches.
+`Fdr.grep` returns an `Enumerator` of path, one-based line number and matching line, in no particular order. A line comes back once however many times it matches. Returned text strings are frozen in every result shape.
 
 ```ruby
 require "fdr"
@@ -65,7 +65,9 @@ Fdr.grep(pattern: "module Fdr", paths: %w[lib]).group_by { |path,| path }
 
 Binary files are skipped at the first NUL. Pass `text: true` to scan them anyway, as `rg -a` does.
 
-`column: true` yields `path, line_number, column, text` instead, one entry per occurrence rather than per line, as `rg --vimgrep` does. The column is a 1-based byte offset, so slice with `text.byteslice(column - 1, length)`.
+`column: true` yields `path, line_number, column, text` instead, one entry per occurrence rather than per line, in the shape of `rg --vimgrep`. The column is a 1-based byte offset.
+
+`byte_range: true` yields `path, line_number, range, text` instead, where `range` is a zero-based byte `Range`, so `text.byteslice(range)` returns the match. It cannot be combined with `column: true`. Both occurrence modes keep a CR before LF in `text` so their offsets index it exactly.
 
 ### Ignore files
 
@@ -74,6 +76,8 @@ By default, both `search` and `grep` respect `.ignore` and, inside a git reposit
 `ignore_file:` adds your own gitignore-format files at the lowest precedence. They still apply under `no_ignore: true`, like `fd` and `rg`.
 
 ### Behavior
+
+- **Grep result shapes:** Occurrence modes include a zero-width match at the end of a final line without LF. This measured difference from `rg --vimgrep` is deliberate: omitting it would leave the matching line without an occurrence tuple, while keeping it matches Ruby's regex engine.
 
 Paths come back under the root you gave, so `paths: ["lib"]` gives `lib/fdr.rb` and `paths: ["./lib"]` gives `./lib/fdr.rb`. The default root adds no prefix.
 

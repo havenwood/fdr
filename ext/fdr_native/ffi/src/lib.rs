@@ -1,7 +1,8 @@
 //! Ruby FFI bindings for the fdr-core search library.
 
 use fdr_core::{
-    FILE_TYPES, GrepConfig, GrepMatch, SearchConfig, SearchError, grep_stream, search_stream,
+    FILE_TYPES, GrepConfig, GrepFormat, GrepMatch, GrepPosition, SearchConfig, SearchError,
+    grep_stream, search_stream,
 };
 use magnus::scan_args::scan_args;
 use magnus::typed_data::Obj;
@@ -45,6 +46,7 @@ static IGNORE_ERROR: LazyId = LazyId::new("ignore_error");
 static IGNORE_FILE: LazyId = LazyId::new("ignore_file");
 static TEXT: LazyId = LazyId::new("text");
 static COLUMN: LazyId = LazyId::new("column");
+static BYTE_RANGE: LazyId = LazyId::new("byte_range");
 
 /// Rejects before coercion so caller `to_str` and `to_ary` errors remain intact.
 fn reject_type(ruby: &Ruby, value: Value, target: &str) -> Error {
@@ -743,9 +745,12 @@ fn path_string(ruby: &Ruby, path: &[u8]) -> RString {
     ruby.enc_str_new(path, ruby.filesystem_encoding())
 }
 
-/// Raw line in the external encoding, as with `File.readlines`.
+/// Raw line in the external encoding, as with `File.readlines`. Frozen because
+/// occurrences on one line are handed the same `String`.
 fn line_string(ruby: &Ruby, line: &[u8]) -> RString {
-    ruby.enc_str_new(line, ruby.default_external_encoding())
+    let line = ruby.enc_str_new(line, ruby.default_external_encoding());
+    line.freeze();
+    line
 }
 
 fn core_error(ruby: &Ruby, operation: &str, error: &SearchError) -> Error {
@@ -780,6 +785,8 @@ fn stream_each(ruby: &Ruby, rb_self: Value) -> Result<Value, Error> {
     let operation = source.operation();
     let session = source.start(ruby)?;
     let _stop = StopStream(session.as_ref());
+    // Retaining the Arc makes identity safe across batch boundaries.
+    let mut line: Option<(Arc<[u8]>, RString)> = None;
 
     loop {
         let next = session.take_ready().map_or_else(
@@ -801,16 +808,30 @@ fn stream_each(ruby: &Ruby, rb_self: Value) -> Result<Value, Error> {
                 let GrepMatch {
                     path: path_bytes,
                     line_number,
-                    column,
+                    position,
                     text: line_bytes,
                 } = matched;
                 let path = path_string(ruby, &path_bytes);
-                let text = line_string(ruby, &line_bytes);
+                let text = match line.as_ref() {
+                    Some((cached, string)) if Arc::ptr_eq(cached, &line_bytes) => *string,
+                    _ => {
+                        let string = line_string(ruby, line_bytes.as_ref());
+                        line = Some((Arc::clone(&line_bytes), string));
+                        string
+                    }
+                };
                 drop(path_bytes);
                 drop(line_bytes);
-                let _: Value = match column {
-                    // Follow `rg --vimgrep` tuple order in column mode.
-                    Some(column) => ruby.yield_values((path, line_number, column, text))?,
+                let _: Value = match position {
+                    Some(GrepPosition::Column(column)) => {
+                        ruby.yield_values((path, line_number, column, text))?
+                    }
+                    // A `Range` so `text.byteslice(range)` returns the match,
+                    // with the exclusive end `rg --json` reports.
+                    Some(GrepPosition::ByteRange { offset, length }) => {
+                        let range = ruby.range_new(offset, offset.saturating_add(length), true)?;
+                        ruby.yield_values((path, line_number, range, text))?
+                    }
                     None => ruby.yield_values((path, line_number, text))?,
                 };
             }
@@ -853,11 +874,16 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<Enumerator, Error> {
     let search = build_search_config(ruby, kwargs, &NAME, Vec::new())?;
     let content_case_sensitive = extract_boolish(kwargs, &CONTENT_CASE_SENSITIVE, true)?;
 
+    let format = GrepFormat::from_options(
+        extract_optional_arg(kwargs, &COLUMN)?.unwrap_or_default(),
+        extract_optional_arg(kwargs, &BYTE_RANGE)?.unwrap_or_default(),
+    )
+    .map_err(|error| core_error(ruby, "Grep", &error))?;
     let config = GrepConfig {
         pattern,
         content_case_sensitive,
         text: extract_optional_arg(kwargs, &TEXT)?.unwrap_or_default(),
-        column: extract_optional_arg(kwargs, &COLUMN)?.unwrap_or_default(),
+        format,
         search,
     };
     let source: Obj<StreamSource> = ruby.obj_wrap(StreamSource::new(StreamConfig::Grep(config)));
