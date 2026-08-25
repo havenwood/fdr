@@ -1,6 +1,6 @@
 # Fdr
 
-`Fdr` is a gem for `fd`-style file search and `rg`-style content search.
+`Fdr` is a Ruby gem for `fd`-style file search and `rg`-style content search without shelling out. It cuts startup overhead and returns lazy structured results with no CLI output to parse.
 
 ## Installation
 
@@ -18,20 +18,20 @@ gem install fdr
 
 ### Search
 
-`Fdr.search` returns a path-sorted `Array` of matching files and directories. `pattern` is a case-insensitive [Rust regular expression](https://docs.rs/regex) unless `glob: true`.
+`Fdr.search` returns an `Enumerator` of matching paths, in no particular order. `pattern` is a [Rust regex](https://docs.rs/regex) matched case-insensitively against the file name. `glob: true` makes it a glob, `case_sensitive: true` matches case, `full_path: true` matches the whole path.
 
 ```ruby
 require "fdr"
 
 Fdr.search
-#=> ["./Gemfile", "./LICENSE", "./README.md", "./Rakefile", "./ext", ...]
+#=> #<Enumerator: ...>
 ```
 
 Keyword options are based on `fd` flags
 
 ```ruby
-Fdr.search(extension: %w[rb rake])
-Fdr.search(pattern: "*.{rb,rake}", glob: true)
+Fdr.search(extension: %w[rb rake]).to_a
+Fdr.search(pattern: "*.{rb,rake}", glob: true).to_a
 
 Fdr.search(
   pattern: '\.test\.js$',
@@ -44,13 +44,19 @@ Fdr.search(
 
 ### Grep
 
-`Fdr.grep` returns a path-sorted `Hash` whose values map one-based line numbers to matching text. A line appears once regardless of how many times it matches.
+`Fdr.grep` returns an `Enumerator` of path, one-based line number and matching line, in no particular order. A line comes back once however many times it matches.
 
 ```ruby
 require "fdr"
 
-Fdr.grep(pattern: "module Fdr", paths: %w[lib])
-#=> {"lib/fdr.rb" => {13 => "module Fdr"}, "lib/fdr/version.rb" => {3 => "module Fdr"}}
+Fdr.grep(pattern: "module Fdr", paths: %w[lib]) do |path, line_number, text|
+  puts "#{path}:#{line_number}:#{text}"
+end
+
+Fdr.grep(pattern: "module Fdr", paths: %w[lib]).to_a.sort
+#=> [["lib/fdr.rb", 13, "module Fdr"], ["lib/fdr/version.rb", 3, "module Fdr"]]
+
+Fdr.grep(pattern: "module Fdr", paths: %w[lib]).group_by { |path,| path }
 ```
 
 `pattern` searches file contents. Filter files with `name` and the file-selection options from `Fdr.search`. `Fdr.grep` scans only regular files and does not accept `type`.
@@ -65,11 +71,21 @@ By default, both `search` and `grep` respect `.ignore` and, inside a git reposit
 
 ### Behavior
 
+Paths come back under the root you gave, so `paths: ["lib"]` gives `lib/fdr.rb` and `paths: ["./lib"]` gives `./lib/fdr.rb`. The default root adds no prefix.
+
 Hidden files and directories are skipped unless `hidden: true` is passed.
 
 Missing or unreadable entries are skipped. Pass `ignore_error: false` to raise `Fdr::IOError` on the first one instead. A bare `"-"` names the file `./-` rather than standard input.
 
-`Fdr.search` and `Fdr.grep` release the GVL, support `Timeout` and `Ctrl-C`, and run independently in threads, Ractors and forks.
+`Fdr.search` and `Fdr.grep` release the GVL, support `Timeout` and `Ctrl-C`, and run independently in threads, Ractors and forks. Wrap Enumerator consumption when setting a timeout:
+
+```ruby
+require "timeout"
+
+Timeout.timeout(5) { Fdr.grep(pattern: "TODO", paths: %w[lib]).to_a }
+```
+
+Nothing is walked until the `Enumerator` is consumed, so a bad `pattern` or `exclude` raises then, not at the call. Take what you need with `first`, `take`, `filter` or `to_a`.
 
 `Fdr` leaves out `fd`'s owner and exotic type filters and smart case, and `rg`'s context lines, literal and multiline matching, inverted matches and replacements.
 

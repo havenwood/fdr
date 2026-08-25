@@ -46,7 +46,7 @@ class NativeLoaderSpec < Minitest::Test
   end
 
   def load_fdr(lib)
-    script = "require 'fdr'; abort unless Fdr.search(paths: [#{lib.inspect}]).is_a?(Array)"
+    script = "require 'fdr'; results = Fdr.search(paths: [#{lib.inspect}]); abort unless results.is_a?(Enumerator) && results.any?"
     _, stderr, status = Open3.capture3(
       {"RUBYOPT" => nil, "RUBYLIB" => nil}, Gem.ruby, "--disable-gems", "-I#{lib}", "-e", script
     )

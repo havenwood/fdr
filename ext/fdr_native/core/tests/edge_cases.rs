@@ -1,6 +1,9 @@
 //! Integration tests for edge cases and boundary conditions
 
-use fdr_core::{SearchConfig, SearchError, search as search_bytes};
+#[path = "support/search.rs"]
+pub mod search_support;
+
+use fdr_core::{SearchConfig, SearchError};
 use std::fs::{self, File};
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -10,7 +13,7 @@ fn lossy(path: &[u8]) -> String {
 }
 
 fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
-    Ok(search_bytes(config)?
+    Ok(search_support::collect(config, false)?
         .iter()
         .map(|path| lossy(path))
         .collect())
@@ -33,7 +36,7 @@ fn search_includes_non_utf8_filenames() {
         ..Default::default()
     };
 
-    let results = search_bytes(&config).expect("search should succeed");
+    let results = search_support::collect(&config, false).expect("search should succeed");
     assert_eq!(results.len(), 1, "non-UTF-8 filename should be emitted");
     let result = results.first().expect("should have one result");
     assert!(

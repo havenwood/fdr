@@ -16,49 +16,79 @@ describe "Fdr.grep" do
   end
 
   describe "results" do
-    it "returns a Hash of paths to one-based line numbers and their text" do
+    it "returns an Enumerator of path, one-based line number and text" do
       results = Fdr.grep(pattern: "needle", paths: [@tmpdir])
 
-      assert_equal({@path => {3 => "needle", 4 => "needle twice needle"}}, results)
+      assert_kind_of Enumerator, results
+      assert_equal [[@path, 3, "needle"], [@path, 4, "needle twice needle"]], results.to_a.sort
+    end
+
+    it "yields to a block and returns the Enumerator" do
+      yielded = []
+
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir]) { |*match| yielded << match }
+
+      assert_kind_of Enumerator, results
+      assert_equal results.to_a.sort, yielded.sort
+    end
+
+    it "groups matches by path" do
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir]).group_by { |path,| path }
+
+      assert_equal [[@path, 3, "needle"], [@path, 4, "needle twice needle"]], results[@path].sort
+    end
+
+    it "leaves a location-keyed Hash to the caller, which dedupes" do
+      results = Fdr.grep(pattern: "needle", paths: [@path, @path])
+        .to_h { |path, line_number, text| [[path, line_number], text] }
+
+      assert_equal({[@path, 3] => "needle", [@path, 4] => "needle twice needle"}, results)
     end
 
     it "reports a line with two matches once" do
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir])
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir]).to_a
 
-      assert_equal ["needle twice needle"], results[@path].values_at(4)
+      assert_equal [[@path, 4, "needle twice needle"]], results.filter { |_path, line_number, _text| line_number == 4 }
     end
 
-    it "returns an empty Hash when nothing matches" do
+    it "omits the ./ prefix when paths defaults, as rg does" do
+      path, = Fdr.grep(pattern: "module Fdr", name: '^version\.rb$').first
+
+      assert_equal "lib/fdr/version.rb", path
+    end
+
+    it "yields nothing when nothing matches" do
       results = Fdr.grep(pattern: "haystack", paths: [@tmpdir])
 
-      assert_empty results
+      assert_empty results.to_a
     end
 
-    it "orders paths deterministically" do
-      100.times do |index|
-        dir = File.join(@tmpdir, format("dir_%<index>03d", index:))
-        Dir.mkdir(dir)
-        File.write(File.join(dir, "file.txt"), "needle\n")
-      end
+    it "starts grepping when the Enumerator is consumed" do
+      results = Fdr.grep(pattern: "later", paths: [@tmpdir])
+      path = File.join(@tmpdir, "later.txt")
+      File.write(path, "later\n")
 
-      keys = Fdr.grep(pattern: "needle", paths: [@tmpdir]).keys
-
-      assert_equal keys.sort, keys, "paths should be sorted"
+      assert_includes results.to_a, [path, 1, "later"]
     end
 
-    it "orders paths deterministically from the parallel walker" do
-      600.times do |index|
-        File.write(File.join(@tmpdir, format("file_%<index>03d.txt", index:)), "needle\n")
-      end
+    it "can be enumerated again" do
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir])
+      first = results.to_a.sort
 
-      keys = Fdr.grep(pattern: "needle", paths: [@tmpdir]).keys
+      assert_equal first, results.to_a.sort
+    end
 
-      assert_equal 601, keys.size
-      assert_equal keys.sort, keys, "parallel grep paths should be sorted"
+    it "emits matches again for a repeated path" do
+      results = Fdr.grep(pattern: "needle", paths: [@path, @path]).to_a
+
+      assert_equal 2, results.count { |match| match == [@path, 3, "needle"] }
+      assert_equal 2, results.count { |match| match == [@path, 4, "needle twice needle"] }
     end
 
     it "tags matching lines with the external encoding" do
-      line = Fdr.grep(pattern: "needle", paths: [@tmpdir]).fetch(@path).fetch(3)
+      _, _, line = Fdr.grep(pattern: "needle", paths: [@tmpdir]).find do |_path, line_number, _text|
+        line_number == 3
+      end
 
       assert_equal Encoding.default_external, line.encoding
     end
@@ -66,19 +96,19 @@ describe "Fdr.grep" do
 
   describe "content matching" do
     it "is case sensitive by default" do
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir])
+      results = grep_results(pattern: "needle", paths: [@tmpdir])
 
       assert_equal [3, 4], results[@path].keys
     end
 
     it "can search case insensitively" do
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], content_case_sensitive: false)
+      results = grep_results(pattern: "needle", paths: [@tmpdir], content_case_sensitive: false)
 
       assert_equal [2, 3, 4], results[@path].keys
     end
 
     it "treats nil case sensitivity as falsey" do
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], content_case_sensitive: nil)
+      results = grep_results(pattern: "needle", paths: [@tmpdir], content_case_sensitive: nil)
 
       assert_equal [2, 3, 4], results[@path].keys
     end
@@ -86,7 +116,7 @@ describe "Fdr.grep" do
     it "skips binary files" do
       File.binwrite(File.join(@tmpdir, "binary.bin"), "needle\n\0needle\n")
 
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir])
+      results = grep_results(pattern: "needle", paths: [@tmpdir])
 
       assert_equal [@path], results.keys
     end
@@ -96,8 +126,8 @@ describe "Fdr.grep" do
     it "skips hidden files by default" do
       File.write(File.join(@tmpdir, ".hidden.rb"), "needle\n")
 
-      default_results = Fdr.grep(pattern: "needle", paths: [@tmpdir])
-      with_hidden = Fdr.grep(pattern: "needle", paths: [@tmpdir], hidden: true)
+      default_results = grep_results(pattern: "needle", paths: [@tmpdir])
+      with_hidden = grep_results(pattern: "needle", paths: [@tmpdir], hidden: true)
 
       assert_equal [@path], default_results.keys
       assert_equal 2, with_hidden.size
@@ -108,8 +138,8 @@ describe "Fdr.grep" do
       File.write(File.join(@tmpdir, ".gitignore"), "ignored.rb\n")
       File.write(File.join(@tmpdir, "ignored.rb"), "needle\n")
 
-      default_results = Fdr.grep(pattern: "needle", paths: [@tmpdir])
-      without_ignore = Fdr.grep(pattern: "needle", paths: [@tmpdir], no_ignore: true)
+      default_results = grep_results(pattern: "needle", paths: [@tmpdir])
+      without_ignore = grep_results(pattern: "needle", paths: [@tmpdir], no_ignore: true)
 
       assert_equal [@path], default_results.keys
       assert_equal 2, without_ignore.size
@@ -119,7 +149,7 @@ describe "Fdr.grep" do
       Dir.mkdir(File.join(@tmpdir, "vendor"))
       File.write(File.join(@tmpdir, "vendor", "skip.rb"), "needle\n")
 
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], exclude: %w[vendor])
+      results = grep_results(pattern: "needle", paths: [@tmpdir], exclude: %w[vendor])
 
       assert_equal [@path], results.keys
     end
@@ -129,7 +159,7 @@ describe "Fdr.grep" do
       other_path = File.join(other, "other.rb")
       File.write(other_path, "needle\n")
 
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir, other])
+      results = grep_results(pattern: "needle", paths: [@tmpdir, other])
 
       assert_equal [@path, other_path].sort, results.keys.sort
     ensure
@@ -137,18 +167,18 @@ describe "Fdr.grep" do
     end
 
     it "returns no results for an empty paths array" do
-      assert_empty Fdr.grep(pattern: "needle", paths: [])
+      assert_empty grep_results(pattern: "needle", paths: [])
     end
 
     it "rejects nil paths" do
-      assert_raises(TypeError) { Fdr.grep(pattern: "needle", paths: nil) }
+      assert_raises(TypeError) { grep_results(pattern: "needle", paths: nil) }
     end
 
     it "filters by size" do
       big = File.join(@tmpdir, "big.txt")
       File.write(big, "needle\n#{"padding\n" * 100}")
 
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], max_size: 100)
+      results = grep_results(pattern: "needle", paths: [@tmpdir], max_size: 100)
 
       assert_includes results.keys, @path
       refute_includes results.keys, big
@@ -159,7 +189,7 @@ describe "Fdr.grep" do
       File.write(old, "needle\n")
       File.utime(Time.now - 86_400, Time.now - 86_400, old)
 
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], changed_within: 3600)
+      results = grep_results(pattern: "needle", paths: [@tmpdir], changed_within: 3600)
 
       assert_includes results.keys, @path
       refute_includes results.keys, old
@@ -168,7 +198,7 @@ describe "Fdr.grep" do
     it "filters by extension" do
       File.write(File.join(@tmpdir, "notes.txt"), "needle\n")
 
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], extension: "rb")
+      results = grep_results(pattern: "needle", paths: [@tmpdir], extension: "rb")
 
       assert_equal [@path], results.keys
     end
@@ -177,7 +207,7 @@ describe "Fdr.grep" do
       notes = File.join(@tmpdir, "notes.txt")
       File.write(notes, "needle\n")
 
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], extension: %w[rb txt])
+      results = grep_results(pattern: "needle", paths: [@tmpdir], extension: %w[rb txt])
 
       assert_equal [@path, notes].sort, results.keys.sort
     end
@@ -185,7 +215,7 @@ describe "Fdr.grep" do
     it "filters by filename with name" do
       File.write(File.join(@tmpdir, "example_spec.rb"), "needle\n")
 
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], name: '_spec\.rb$')
+      results = grep_results(pattern: "needle", paths: [@tmpdir], name: '_spec\.rb$')
 
       assert_equal [File.join(@tmpdir, "example_spec.rb")], results.keys
     end
@@ -194,8 +224,8 @@ describe "Fdr.grep" do
       upper_path = File.join(@tmpdir, "UPPER.rb")
       File.write(upper_path, "needle\n")
 
-      default_results = Fdr.grep(pattern: "needle", paths: [@tmpdir], name: "upper")
-      sensitive = Fdr.grep(pattern: "needle", paths: [@tmpdir], name: "upper", case_sensitive: true)
+      default_results = grep_results(pattern: "needle", paths: [@tmpdir], name: "upper")
+      sensitive = grep_results(pattern: "needle", paths: [@tmpdir], name: "upper", case_sensitive: true)
 
       assert_equal [upper_path], default_results.keys
       assert_empty sensitive
@@ -204,7 +234,7 @@ describe "Fdr.grep" do
     it "filters names with a glob when glob is true" do
       File.write(File.join(@tmpdir, "notes.txt"), "needle\n")
 
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], name: "*.rb", glob: true)
+      results = grep_results(pattern: "needle", paths: [@tmpdir], name: "*.rb", glob: true)
 
       assert_equal [@path], results.keys
     end
@@ -214,7 +244,7 @@ describe "Fdr.grep" do
       Dir.mkdir(nested)
       File.write(File.join(nested, "deep.rb"), "needle\n")
 
-      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], max_depth: 1)
+      results = grep_results(pattern: "needle", paths: [@tmpdir], max_depth: 1)
 
       assert_equal [@path], results.keys
     end
@@ -227,7 +257,7 @@ describe "Fdr.grep" do
         File.write(File.join(@tmpdir, directory, "match.rb"), "needle\n")
       end
 
-      results = Fdr.grep(
+      results = grep_results(
         pattern: "needle",
         paths: [@tmpdir],
         min_depth: 2,
@@ -240,18 +270,18 @@ describe "Fdr.grep" do
 
   describe "errors" do
     it "requires a pattern" do
-      assert_raises(ArgumentError) { Fdr.grep(paths: [@tmpdir]) }
+      assert_raises(ArgumentError) { grep_results(paths: [@tmpdir]) }
     end
 
     it "rejects the search-only type filter" do
       assert_raises(ArgumentError) do
-        Fdr.grep(pattern: "needle", paths: [@tmpdir], type: "f")
+        grep_results(pattern: "needle", paths: [@tmpdir], type: "f")
       end
     end
 
     it "raises for an invalid regex pattern" do
       error = assert_raises(RegexpError) do
-        Fdr.grep(pattern: "[invalid", paths: [@tmpdir])
+        grep_results(pattern: "[invalid", paths: [@tmpdir])
       end
 
       assert_match(/Grep failed/, error.message)
@@ -259,7 +289,7 @@ describe "Fdr.grep" do
 
     it "raises for a pattern spanning lines" do
       error = assert_raises(RegexpError) do
-        Fdr.grep(pattern: "first\nNeedle", paths: [@tmpdir])
+        grep_results(pattern: "first\nNeedle", paths: [@tmpdir])
       end
 
       assert_match(/Grep failed/, error.message)
@@ -267,7 +297,7 @@ describe "Fdr.grep" do
 
     it "raises for a pattern requiring a NUL byte" do
       error = assert_raises(RegexpError) do
-        Fdr.grep(pattern: '\x00', paths: [@tmpdir])
+        grep_results(pattern: '\x00', paths: [@tmpdir])
       end
 
       assert_match(/Grep failed/, error.message)

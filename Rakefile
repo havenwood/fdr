@@ -14,8 +14,14 @@ GEM_SMOKE_TEST = <<~'RUBY'
   require 'fdr'
 
   raise "Expected Fdr #{expected_version}, got #{Fdr::VERSION}" unless Fdr::VERSION == expected_version
-  raise 'Fdr.search returned no Ruby files' if Fdr.search(paths: [gem_home], extension: 'rb', no_ignore: true).empty?
-  raise 'Fdr.search searched an empty path set' unless Fdr.search(paths: []).empty?
+  search_results = Fdr.search(paths: [gem_home], extension: 'rb', no_ignore: true)
+  raise 'Fdr.search did not return an Enumerator' unless search_results.is_a?(Enumerator)
+  raise 'Fdr.search returned no Ruby files' if search_results.to_a.empty?
+  raise 'Fdr.search searched an empty path set' unless Fdr.search(paths: []).to_a.empty?
+
+  yielded = []
+  Fdr.search(paths: [gem_home], extension: 'rb', no_ignore: true) { |path| yielded << path }
+  raise 'Fdr.search ignored its block' if yielded.empty?
 
   grep_results = Fdr.grep(
     pattern: 'MODULE FDR',
@@ -25,8 +31,9 @@ GEM_SMOKE_TEST = <<~'RUBY'
     no_ignore: true,
     content_case_sensitive: false
   )
-  raise 'Fdr.grep returned no matches' if grep_results.empty?
-  raise 'Fdr.grep searched an empty path set' unless Fdr.grep(pattern: '.', paths: []).empty?
+  raise 'Fdr.grep did not return an Enumerator' unless grep_results.is_a?(Enumerator)
+  raise 'Fdr.grep returned no matches' if grep_results.to_a.empty?
+  raise 'Fdr.grep searched an empty path set' unless Fdr.grep(pattern: '.', paths: []).to_a.empty?
   raise 'Fdr exposed removed search aliases' if Fdr.respond_to?(:entries) || Fdr.respond_to?(:scan)
 
   puts "Verified installed Fdr #{Fdr::VERSION}"

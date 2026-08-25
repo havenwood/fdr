@@ -1,10 +1,14 @@
 //! Integration tests for cancelling searches
 
-use fdr_core::{GrepConfig, SearchConfig, SearchError, grep_with_cancel, search_with_cancel};
+#[path = "support/grep.rs"]
+pub mod grep_support;
+#[path = "support/search.rs"]
+pub mod search_support;
+
+use fdr_core::{GrepConfig, SearchConfig, SearchError};
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use tempfile::TempDir;
 
 #[test]
@@ -19,8 +23,7 @@ fn search_with_cancel_refuses_to_start_when_already_cancelled() {
         ..Default::default()
     };
 
-    let cancel = AtomicBool::new(true);
-    let result = search_with_cancel(&config, &cancel);
+    let result = search_support::collect(&config, true);
     assert!(
         matches!(result, Err(SearchError::Cancelled)),
         "cancelled search should return SearchError::Cancelled, got {result:?}"
@@ -44,8 +47,7 @@ fn grep_with_cancel_refuses_to_start_when_already_cancelled() {
         ..Default::default()
     };
 
-    let cancel = AtomicBool::new(true);
-    let result = grep_with_cancel(&config, &cancel);
+    let result = grep_support::collect(&config, true);
     assert!(
         matches!(result, Err(SearchError::Cancelled)),
         "cancelled grep should return SearchError::Cancelled, got {result:?}"
@@ -63,7 +65,7 @@ fn search_with_cancel_completes_when_not_cancelled() {
         ..Default::default()
     };
 
-    let cancel = AtomicBool::new(false);
-    let results = search_with_cancel(&config, &cancel).expect("uncancelled search should succeed");
+    let results =
+        search_support::collect(&config, false).expect("uncancelled search should succeed");
     assert_eq!(results.len(), 1, "uncancelled search should find the file");
 }

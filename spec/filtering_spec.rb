@@ -18,15 +18,15 @@ describe "Fdr filtering" do
 
     it "applies an extra gitignore-format file" do
       with_ignore_file do |dir, ignore|
-        assert_includes Fdr.search(paths: [dir], type: "f"), File.join(dir, "skipme.txt")
-        refute_includes Fdr.search(paths: [dir], type: "f", ignore_file: [ignore]),
+        assert_includes search_results(paths: [dir], type: "f"), File.join(dir, "skipme.txt")
+        refute_includes search_results(paths: [dir], type: "f", ignore_file: [ignore]),
           File.join(dir, "skipme.txt")
       end
     end
 
     it "outranks no_ignore, as fd and rg do" do
       with_ignore_file do |dir, ignore|
-        results = Fdr.search(paths: [dir], type: "f", ignore_file: [ignore], no_ignore: true)
+        results = search_results(paths: [dir], type: "f", ignore_file: [ignore], no_ignore: true)
 
         refute_includes results, File.join(dir, "skipme.txt")
         assert_includes results, File.join(dir, "keep.txt")
@@ -35,7 +35,7 @@ describe "Fdr filtering" do
 
     it "applies to grep too" do
       with_ignore_file do |dir, ignore|
-        results = Fdr.grep(pattern: "needle", paths: [dir], ignore_file: [ignore])
+        results = grep_results(pattern: "needle", paths: [dir], ignore_file: [ignore])
 
         assert_equal [File.join(dir, "keep.txt")], results.keys
       end
@@ -45,7 +45,7 @@ describe "Fdr filtering" do
       with_ignore_file do |dir, _ignore|
         missing = File.join(dir, "nope.ignore")
 
-        refute_empty Fdr.search(paths: [dir], type: "f", ignore_file: [missing])
+        refute_empty search_results(paths: [dir], type: "f", ignore_file: [missing])
         assert_raises(Fdr::IOError) do
           Fdr.search(paths: [dir], ignore_file: [missing], ignore_error: false).to_a
         end
@@ -69,19 +69,19 @@ describe "Fdr filtering" do
 
   describe "extension filtering" do
     it "filters by single extension" do
-      results = Fdr.search(extension: "toml", paths: ["ext"], max_depth: 3)
+      results = search_results(extension: "toml", paths: ["ext"], max_depth: 3)
       refute_empty results
       assert(results.all? { |result| result.end_with?(".toml") })
     end
 
     it "finds rb files" do
-      results = Fdr.search(extension: "rb", paths: ["lib"])
+      results = search_results(extension: "rb", paths: ["lib"])
       assert(results.all? { |result| result.end_with?(".rb") })
       assert(results.any? { |result| result.include?("fdr.rb") })
     end
 
     it "works with extension without leading dot" do
-      results = Fdr.search(extension: "rb", paths: ["lib"], max_depth: 2)
+      results = search_results(extension: "rb", paths: ["lib"], max_depth: 2)
       refute_empty results
       assert(results.all? { |result| result.end_with?(".rb") })
     end
@@ -90,55 +90,55 @@ describe "Fdr filtering" do
       Dir.mktmpdir("fdr-extensions") do |dir|
         %w[one.rb two.rs three.txt].each { File.write(File.join(dir, _1), "") }
 
-        all = Fdr.search(paths: [dir], type: "f").sort
+        all = search_results(paths: [dir], type: "f").sort
         expected = %w[one.rb two.rs].map { File.join(dir, _1) }.sort
 
-        assert_equal expected, Fdr.search(paths: [dir], extension: [".rb", "rs"]).sort
-        assert_equal Fdr.search(paths: [dir], extension: "rb"),
-          Fdr.search(paths: [dir], extension: ["rb"])
-        assert_equal all, Fdr.search(paths: [dir], extension: []).sort
+        assert_equal expected, search_results(paths: [dir], extension: [".rb", "rs"]).sort
+        assert_equal search_results(paths: [dir], extension: "rb"),
+          search_results(paths: [dir], extension: ["rb"])
+        assert_equal all, search_results(paths: [dir], extension: []).sort
       end
     end
   end
 
   describe "file type filtering" do
     it "finds files only with type f" do
-      results = Fdr.search(type: "f", paths: ["lib"], max_depth: 2)
+      results = search_results(type: "f", paths: ["lib"], max_depth: 2)
       refute_empty results
     end
 
     it "finds directories only with type d" do
-      results = Fdr.search(type: "d", paths: ["."], max_depth: 2)
+      results = search_results(type: "d", paths: ["."], max_depth: 2)
       refute_empty results
       assert(results.all? { |path| File.directory?(path) })
     end
 
     it "excludes directories when type is f" do
-      results = Fdr.search(type: "f", paths: ["."], max_depth: 1)
+      results = search_results(type: "f", paths: ["."], max_depth: 1)
       assert(results.none? { |path| File.directory?(path) })
     end
 
     it "supports file type alias" do
-      results = Fdr.search(type: "file", paths: ["lib"], max_depth: 2)
+      results = search_results(type: "file", paths: ["lib"], max_depth: 2)
       refute_empty results
       assert(results.all? { |path| File.file?(path) })
     end
 
     it "accepts file types as symbols" do
-      results = Fdr.search(type: :file, paths: ["lib"], max_depth: 2)
+      results = search_results(type: :file, paths: ["lib"], max_depth: 2)
 
       refute_empty results
       assert(results.all? { |path| File.file?(path) })
     end
 
     it "supports dir type alias" do
-      results = Fdr.search(type: "dir", paths: ["."], max_depth: 2)
+      results = search_results(type: "dir", paths: ["."], max_depth: 2)
       refute_empty results
       assert(results.all? { |path| File.directory?(path) })
     end
 
     it "supports directory type alias" do
-      results = Fdr.search(type: "directory", paths: ["."], max_depth: 2)
+      results = search_results(type: "directory", paths: ["."], max_depth: 2)
       refute_empty results
       assert(results.all? { |path| File.directory?(path) })
     end
@@ -148,12 +148,12 @@ describe "Fdr filtering" do
         File.write(File.join(dir, "file"), "")
         Dir.mkdir(File.join(dir, "directory"))
 
-        all = Fdr.search(paths: [dir], max_depth: 1).sort
+        all = search_results(paths: [dir], max_depth: 1).sort
 
-        assert_equal all, Fdr.search(paths: [dir], type: [:f, "directory"], max_depth: 1).sort
-        assert_equal Fdr.search(paths: [dir], type: :f),
-          Fdr.search(paths: [dir], type: [:f])
-        assert_equal all, Fdr.search(paths: [dir], type: [], max_depth: 1).sort
+        assert_equal all, search_results(paths: [dir], type: [:f, "directory"], max_depth: 1).sort
+        assert_equal search_results(paths: [dir], type: :f),
+          search_results(paths: [dir], type: [:f])
+        assert_equal all, search_results(paths: [dir], type: [], max_depth: 1).sort
       end
     end
   end
@@ -181,8 +181,8 @@ describe "Fdr filtering" do
         require "fdr"
         tree = ARGV[0]
         names = ->(paths) { paths.map { File.basename(_1) }.sort }
-        print [names[Fdr.search(paths: [tree], type: "f")],
-               names[Fdr.grep(pattern: "needle", paths: [tree]).keys]].inspect
+        grep_paths = Fdr.grep(pattern: "needle", paths: [tree]).map { |path,| path }
+        print [names[Fdr.search(paths: [tree], type: "f")], names[grep_paths]].inspect
       RUBY
       output, status = Open3.capture2(
         environment,
@@ -196,15 +196,15 @@ describe "Fdr filtering" do
 
     it "honors .fdignore for search and .rgignore for grep" do
       ignore_tree do |dir|
-        assert_equal %w[keep.txt rg.txt], basenames(Fdr.search(paths: [dir], type: "f"))
-        assert_equal %w[fd.txt keep.txt], basenames(Fdr.grep(pattern: "needle", paths: [dir]).keys)
+        assert_equal %w[keep.txt rg.txt], basenames(search_results(paths: [dir], type: "f"))
+        assert_equal %w[fd.txt keep.txt], basenames(grep_results(pattern: "needle", paths: [dir]).keys)
       end
     end
 
     it "honors .gitignore and .ignore for both" do
       ignore_tree do |dir|
-        found = basenames(Fdr.search(paths: [dir], type: "f")) +
-          basenames(Fdr.grep(pattern: "needle", paths: [dir]).keys)
+        found = basenames(search_results(paths: [dir], type: "f")) +
+          basenames(grep_results(pattern: "needle", paths: [dir]).keys)
 
         refute_includes found, "git.txt"
         refute_includes found, "plain.txt"
@@ -275,7 +275,7 @@ describe "Fdr filtering" do
 
     it "disables every ignore file with no_ignore" do
       ignore_tree do |dir|
-        results = basenames(Fdr.search(paths: [dir], type: "f", no_ignore: true, hidden: true))
+        results = basenames(search_results(paths: [dir], type: "f", no_ignore: true, hidden: true))
 
         assert_equal %w[.fdignore .gitignore .ignore .rgignore fd.txt git.txt keep.txt
           plain.txt rg.txt], results
@@ -293,7 +293,7 @@ describe "Fdr filtering" do
           File.write(File.join(dir, root, "sub", "vendor", "x.rb"), "")
         end
 
-        results = Fdr.search(
+        results = search_results(
           paths: [File.join(dir, "a"), File.join(dir, "b")],
           exclude: ["sub/vendor"]
         )
@@ -308,7 +308,7 @@ describe "Fdr filtering" do
 
   describe "hidden files" do
     it "excludes hidden files by default" do
-      results = Fdr.search(paths: ["."], max_depth: 1)
+      results = search_results(paths: ["."], max_depth: 1)
       hidden_files = results.select do |result|
         basename = File.basename(result)
         basename.start_with?(".") && basename != "."
@@ -317,12 +317,12 @@ describe "Fdr filtering" do
     end
 
     it "includes hidden files when requested" do
-      results = Fdr.search(paths: ["."], max_depth: 1, hidden: true)
+      results = search_results(paths: ["."], max_depth: 1, hidden: true)
       assert(results.any? { |result| File.basename(result).start_with?(".") })
     end
 
     it "finds dotfiles with hidden option" do
-      results = Fdr.search(pattern: "gitignore", paths: ["."], hidden: true, max_depth: 1)
+      results = search_results(pattern: "gitignore", paths: ["."], hidden: true, max_depth: 1)
       assert(results.any? { |result| result.include?(".gitignore") })
     end
   end

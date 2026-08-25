@@ -1,6 +1,9 @@
 //! Integration tests for file content search
 
-use fdr_core::{GrepConfig, SearchConfig, SearchError, grep as grep_bytes};
+#[path = "support/grep.rs"]
+pub mod grep_support;
+
+use fdr_core::{GrepConfig, SearchConfig, SearchError};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -16,7 +19,7 @@ struct LossyGrep {
 }
 
 fn grep(config: &GrepConfig) -> Result<Vec<LossyGrep>, SearchError> {
-    Ok(grep_bytes(config)?
+    Ok(grep_support::collect(config, false)?
         .into_iter()
         .map(|result| LossyGrep {
             path: lossy(&result.path),
@@ -370,7 +373,7 @@ fn grep_returns_empty_when_nothing_matches() {
 }
 
 #[test]
-fn grep_returns_results_sorted_by_path() {
+fn grep_returns_every_matching_path_without_requiring_order() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     let temp_path = temp_dir.path();
     for index in 0..200 {
@@ -380,12 +383,19 @@ fn grep_returns_results_sorted_by_path() {
     }
 
     let results = grep(&needle_in(search_under(temp_path))).expect("grep should succeed");
-    let paths: Vec<&str> = results.iter().map(|result| result.path.as_str()).collect();
-    let mut sorted = paths.clone();
-    sorted.sort_unstable();
+    let mut paths: Vec<String> = results.into_iter().map(|result| result.path).collect();
+    paths.sort_unstable();
+    let expected: Vec<String> = (0..200)
+        .map(|index| {
+            temp_path
+                .join(format!("dir_{index:04}/file.txt"))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
 
     assert_eq!(paths.len(), 200);
-    assert_eq!(paths, sorted, "results should be ordered by path");
+    assert_eq!(paths, expected);
 }
 
 #[test]

@@ -1,6 +1,9 @@
 //! Integration tests for file filtering functionality
 
-use fdr_core::{SearchConfig, SearchError, search as search_bytes};
+#[path = "support/search.rs"]
+pub mod search_support;
+
+use fdr_core::{SearchConfig, SearchError};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -10,7 +13,7 @@ fn lossy(path: &[u8]) -> String {
 }
 
 fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
-    Ok(search_bytes(config)?
+    Ok(search_support::collect(config, false)?
         .iter()
         .map(|path| lossy(path))
         .collect())

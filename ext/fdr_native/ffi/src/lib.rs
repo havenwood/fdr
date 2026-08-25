@@ -1,21 +1,22 @@
 //! Ruby FFI bindings for the fdr-core search library.
-#![allow(unsafe_code, reason = "FFI requires unsafe for Ruby interop")]
 
 use fdr_core::{
-    FILE_TYPES, GrepConfig, SearchConfig, SearchError, grep_with_cancel, search_with_cancel,
+    FILE_TYPES, GrepConfig, GrepMatch, SearchConfig, SearchError, grep_stream, search_stream,
 };
 use magnus::scan_args::scan_args;
+use magnus::typed_data::Obj;
 use magnus::value::LazyId;
 use magnus::{
-    Error, ExceptionClass, RArray, RHash, RModule, RString, Ruby, Symbol, TryConvert, Value,
-    function, prelude::*,
+    DataTypeFunctions, Enumerator, Error, ExceptionClass, RArray, RHash, RModule, RString, Ruby,
+    Symbol, TryConvert, TypedData, Value, function, method, prelude::*,
 };
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, Weak};
 
 // rb-sys's tracking allocator calls Ruby's GC API. Search workers allocate on
 // native threads without the GVL, so the process allocator must remain in use.
@@ -39,6 +40,7 @@ static MAX_SIZE: LazyId = LazyId::new("max_size");
 static CHANGED_WITHIN: LazyId = LazyId::new("changed_within");
 static CHANGED_BEFORE: LazyId = LazyId::new("changed_before");
 static NAME: LazyId = LazyId::new("name");
+static STRIP_CWD_PREFIX: LazyId = LazyId::new("strip_cwd_prefix");
 static IGNORE_ERROR: LazyId = LazyId::new("ignore_error");
 static IGNORE_FILE: LazyId = LazyId::new("ignore_file");
 
@@ -64,6 +66,10 @@ fn coercible(value: Value, coercions: &[&str]) -> Result<bool, Error> {
 
 /// Accepts valid UTF-8 binary strings that magnus cannot transcode while
 /// preserving coercion errors.
+#[allow(
+    unsafe_code,
+    reason = "Magnus exposes Ruby string bytes through an unsafe borrowed slice"
+)]
 fn to_utf8(ruby: &Ruby, value: Value, name: &str) -> Result<String, Error> {
     let Some(string) = RString::from_value(value) else {
         return String::try_convert(value);
@@ -169,59 +175,225 @@ where
     }
 }
 
-enum Outcome<R> {
-    Done(Result<R, SearchError>),
+enum Outcome {
+    Done(Result<(), SearchError>),
     Panicked(Box<dyn std::any::Any + Send>),
 }
 
-/// A pthread condvar rather than a channel: Rust parks on a libdispatch
-/// semaphore, which traps if the process forks and the child calls back in.
-struct Handoff<R> {
-    state: Mutex<(Option<Outcome<R>>, bool)>,
-    ready: Condvar,
+enum StreamEvent {
+    Search(Vec<Vec<u8>>),
+    Grep(Vec<GrepMatch>),
 }
 
-impl<R> Handoff<R> {
+enum ActiveEvent {
+    Search(std::vec::IntoIter<Vec<u8>>),
+    Grep(std::vec::IntoIter<GrepMatch>),
+}
+
+impl From<StreamEvent> for ActiveEvent {
+    fn from(event: StreamEvent) -> Self {
+        match event {
+            StreamEvent::Search(paths) => Self::Search(paths.into_iter()),
+            StreamEvent::Grep(matches) => Self::Grep(matches.into_iter()),
+        }
+    }
+}
+
+enum StreamItem {
+    Search(Vec<u8>),
+    Grep(GrepMatch),
+}
+
+impl ActiveEvent {
+    fn next(&mut self) -> Option<StreamItem> {
+        match self {
+            Self::Search(paths) => paths.next().map(StreamItem::Search),
+            Self::Grep(matches) => matches.next().map(StreamItem::Grep),
+        }
+    }
+}
+
+struct StreamState {
+    events: VecDeque<StreamEvent>,
+    active: Option<ActiveEvent>,
+    outcome: Option<Outcome>,
+    interrupted: bool,
+}
+
+enum StreamNext {
+    Item(StreamItem),
+    Outcome(Outcome),
+    Interrupted,
+}
+
+impl StreamState {
+    fn take_next(&mut self) -> Option<(StreamNext, bool)> {
+        if std::mem::replace(&mut self.interrupted, false) {
+            return Some((StreamNext::Interrupted, false));
+        }
+
+        let mut released = false;
+        loop {
+            if let Some(active) = &mut self.active {
+                if let Some(item) = active.next() {
+                    return Some((StreamNext::Item(item), released));
+                }
+                self.active = None;
+            }
+            if let Some(event) = self.events.pop_front() {
+                self.active = Some(event.into());
+                released = true;
+                continue;
+            }
+            return self
+                .outcome
+                .take()
+                .map(|outcome| (StreamNext::Outcome(outcome), released));
+        }
+    }
+}
+
+struct StreamSession {
+    pid: u32,
+    state: Mutex<StreamState>,
+    ready: Condvar,
+    space: Condvar,
+    cancelled: AtomicBool,
+    capacity: usize,
+}
+
+impl StreamSession {
     fn new() -> Self {
+        let capacity = fdr_core::queue_capacity();
+
         Self {
-            state: Mutex::new((None, false)),
+            pid: std::process::id(),
+            state: Mutex::new(StreamState {
+                events: VecDeque::with_capacity(capacity),
+                active: None,
+                outcome: None,
+                interrupted: false,
+            }),
             ready: Condvar::new(),
+            space: Condvar::new(),
+            cancelled: AtomicBool::new(false),
+            capacity,
         }
     }
 
-    fn finish(&self, outcome: Outcome<R>) {
+    fn inherited(&self) -> bool {
+        self.pid != std::process::id()
+    }
+
+    fn cancelled() -> StreamNext {
+        StreamNext::Outcome(Outcome::Done(Err(SearchError::Cancelled)))
+    }
+
+    fn push(&self, event: StreamEvent) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.0 = Some(outcome);
+        while state.events.len() >= self.capacity && !self.cancelled.load(Ordering::Relaxed) {
+            state = self
+                .space
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if self.cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        state.events.push_back(event);
+        drop(state);
+        self.ready.notify_one();
+        true
+    }
+
+    fn finish(&self, outcome: Outcome) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        state.outcome = Some(outcome);
         drop(state);
         self.ready.notify_all();
     }
 
     fn interrupt(&self) {
+        if self.inherited() {
+            return;
+        }
+
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.1 = true;
+        state.interrupted = true;
         drop(state);
         self.ready.notify_all();
     }
 
-    /// Blocks until the walk finishes or Ruby interrupts, so it must run
-    /// without the GVL. `None` means an interrupt, not a result.
-    fn wait(&self) -> Option<Outcome<R>> {
+    /// Locks before notifying so cancellation cannot race a producer's wait.
+    fn cancel(&self) {
+        if self.inherited() {
+            return;
+        }
+
+        self.cancelled.store(true, Ordering::Relaxed);
+        let payload = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                std::mem::take(&mut state.events),
+                state.active.take(),
+                state.outcome.take(),
+            )
+        };
+        drop(payload);
+        self.ready.notify_all();
+        self.space.notify_all();
+    }
+
+    fn take_ready(&self) -> Option<StreamNext> {
+        if self.inherited() {
+            return Some(Self::cancelled());
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (next, released) = state.take_next()?;
+        drop(state);
+        if released {
+            self.space.notify_all();
+        }
+        Some(next)
+    }
+
+    /// Waits without the GVL for a result, completion, or interrupt.
+    fn wait(&self) -> StreamNext {
+        if self.inherited() {
+            return Self::cancelled();
+        }
+
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
-            if let Some(outcome) = state.0.take() {
-                return Some(outcome);
-            }
-            if std::mem::replace(&mut state.1, false) {
-                return None;
+            if let Some((next, released)) = state.take_next() {
+                drop(state);
+                if released {
+                    self.space.notify_all();
+                }
+                return next;
             }
             state = self
                 .ready
@@ -231,61 +403,108 @@ impl<R> Handoff<R> {
     }
 }
 
-unsafe extern "C" fn wake<R>(handoff: *mut c_void) {
-    // SAFETY: `handoff` points to the `Arc<Handoff>` contents in
-    // `interruptible`, which outlives every call Ruby can make here.
-    let handoff = unsafe { &*handoff.cast::<Handoff<R>>() };
-    handoff.interrupt();
+#[allow(
+    unsafe_code,
+    reason = "MRI invokes the unblock callback through a raw pointer"
+)]
+unsafe extern "C" fn wake_stream(session: *mut c_void) {
+    // SAFETY: `session` points into an `Arc<StreamSession>` that outlives the
+    // synchronous `without_gvl` call.
+    let session = unsafe { &*session.cast::<StreamSession>() };
+    session.interrupt();
 }
 
-/// Waits on a worker thread with the GVL released, so a real interrupt
-/// raises and a spurious one resumes the wait without discarding the walk.
-fn interruptible<R: Send + 'static>(
-    ruby: &Ruby,
-    cancel: &Arc<AtomicBool>,
-    run: impl FnOnce(&AtomicBool) -> Result<R, SearchError> + Send + 'static,
-) -> Result<Result<R, SearchError>, Error> {
-    struct StopWorker<'a>(&'a AtomicBool);
+enum StreamConfig {
+    Search(SearchConfig),
+    Grep(GrepConfig),
+}
 
-    impl Drop for StopWorker<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
+#[derive(TypedData)]
+#[magnus(class = "Fdr::Stream", free_immediately)]
+struct StreamSource {
+    config: Arc<StreamConfig>,
+    sessions: Mutex<Vec<Weak<StreamSession>>>,
+}
+
+impl DataTypeFunctions for StreamSource {}
+
+impl StreamSource {
+    fn new(config: StreamConfig) -> Self {
+        Self {
+            config: Arc::new(config),
+            sessions: Mutex::new(Vec::new()),
         }
     }
 
-    let stop = StopWorker(cancel);
-    let handoff = Arc::new(Handoff::<R>::new());
-    let worker_handoff = Arc::clone(&handoff);
-    let worker_cancel = Arc::clone(cancel);
-
-    std::thread::Builder::new()
-        .spawn(move || {
-            let outcome = catch_unwind(AssertUnwindSafe(|| run(&worker_cancel)));
-            worker_handoff.finish(match outcome {
-                Ok(result) => Outcome::Done(result),
-                Err(panic) => Outcome::Panicked(panic),
-            });
-        })
-        .map_err(|error| {
-            fdr_error(
-                ruby,
-                "IOError",
-                ruby.exception_io_error(),
-                format!("could not start the search thread: {error}"),
-            )
-        })?;
-
-    loop {
-        let outcome = without_gvl(|| handoff.wait(), wake::<R>, handoff.as_ref());
-        ruby.thread_check_ints()?;
-        match outcome {
-            Some(Some(Outcome::Done(result))) => {
-                drop(stop);
-                return Ok(result);
-            }
-            Some(Some(Outcome::Panicked(panic))) => resume_unwind(panic),
-            _ => {}
+    fn operation(&self) -> &'static str {
+        match self.config.as_ref() {
+            StreamConfig::Search(_) => "Search",
+            StreamConfig::Grep(_) => "Grep",
         }
+    }
+
+    fn start(&self, ruby: &Ruby) -> Result<Arc<StreamSession>, Error> {
+        let session = Arc::new(StreamSession::new());
+        let worker_session = Arc::clone(&session);
+        let config = Arc::clone(&self.config);
+
+        std::thread::Builder::new()
+            .name(format!("fdr-{}", self.operation().to_ascii_lowercase()))
+            .spawn(move || {
+                let outcome = catch_unwind(AssertUnwindSafe(|| match config.as_ref() {
+                    StreamConfig::Search(config) => {
+                        search_stream(config, &worker_session.cancelled, |paths| {
+                            worker_session.push(StreamEvent::Search(paths))
+                        })
+                    }
+                    StreamConfig::Grep(config) => {
+                        grep_stream(config, &worker_session.cancelled, |matches| {
+                            worker_session.push(StreamEvent::Grep(matches))
+                        })
+                    }
+                }));
+                worker_session.finish(match outcome {
+                    Ok(result) => Outcome::Done(result),
+                    Err(panic) => Outcome::Panicked(panic),
+                });
+            })
+            .map_err(|error| {
+                fdr_error(
+                    ruby,
+                    "IOError",
+                    ruby.exception_io_error(),
+                    format!("could not start the search thread: {error}"),
+                )
+            })?;
+
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions.retain(|session| session.strong_count() > 0);
+        sessions.push(Arc::downgrade(&session));
+        drop(sessions);
+        Ok(session)
+    }
+}
+
+impl Drop for StreamSource {
+    fn drop(&mut self) {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for session in sessions.iter().filter_map(Weak::upgrade) {
+            session.cancel();
+        }
+    }
+}
+
+struct StopStream<'a>(&'a StreamSession);
+
+impl Drop for StopStream<'_> {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -338,7 +557,6 @@ fn extract_string_or_strings(ruby: &Ruby, hash: RHash, key: &LazyId) -> Result<V
     let Some(value) = hash.get(**key).filter(|value| !value.is_nil()) else {
         return Ok(Vec::new());
     };
-
     let name = LazyId::get_inner_with(key, ruby).name()?;
 
     if value.is_kind_of(ruby.class_string()) || coercible(value, &["to_str"])? {
@@ -481,6 +699,7 @@ fn build_search_config(
     Ok(SearchConfig {
         pattern: extract_string(ruby, kwargs, pattern_key)?,
         paths: extract_paths(ruby, kwargs, &PATHS)?,
+        strip_cwd_prefix: extract_optional_arg(kwargs, &STRIP_CWD_PREFIX)?.unwrap_or_default(),
         raise_on_error: !extract_boolish(kwargs, &IGNORE_ERROR, true)?,
         ignore_file: extract_paths(ruby, kwargs, &IGNORE_FILE)?,
         hidden: extract_optional_arg(kwargs, &HIDDEN)?.unwrap_or_default(),
@@ -554,27 +773,61 @@ fn core_error(ruby: &Ruby, operation: &str, error: &SearchError) -> Error {
     }
 }
 
-fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
+fn stream_each(ruby: &Ruby, rb_self: Value) -> Result<Value, Error> {
+    let source: &StreamSource = TryConvert::try_convert(rb_self)?;
+    let operation = source.operation();
+    let session = source.start(ruby)?;
+    let _stop = StopStream(session.as_ref());
+
+    loop {
+        let next = session.take_ready().map_or_else(
+            || without_gvl(|| session.wait(), wake_stream, session.as_ref()),
+            Some,
+        );
+        ruby.thread_check_ints()?;
+        let Some(next) = next else {
+            continue;
+        };
+
+        match next {
+            StreamNext::Item(StreamItem::Search(bytes)) => {
+                let path = path_string(ruby, &bytes);
+                drop(bytes);
+                let _: Value = ruby.yield_value(path)?;
+            }
+            StreamNext::Item(StreamItem::Grep(matched)) => {
+                let GrepMatch {
+                    path: path_bytes,
+                    line_number,
+                    text: line_bytes,
+                } = matched;
+                let path = path_string(ruby, &path_bytes);
+                let text = line_string(ruby, &line_bytes);
+                drop(path_bytes);
+                drop(line_bytes);
+                let _: Value = ruby.yield_values((path, line_number, text))?;
+            }
+            StreamNext::Outcome(Outcome::Done(result)) => {
+                result.map_err(|error| core_error(ruby, operation, &error))?;
+                return Ok(ruby.qnil().as_value());
+            }
+            StreamNext::Outcome(Outcome::Panicked(panic)) => resume_unwind(panic),
+            StreamNext::Interrupted => {}
+        }
+    }
+}
+
+fn fdr_search(ruby: &Ruby, args: &[Value]) -> Result<Enumerator, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
     let kwargs = args_scan.keywords;
     let file_type = extract_file_types(ruby, kwargs)?;
     let config = build_search_config(ruby, kwargs, &PATTERN, file_type)?;
 
-    let cancel = Arc::new(AtomicBool::new(false));
-    let results = interruptible(ruby, &cancel, move |cancel| {
-        search_with_cancel(&config, cancel)
-    })?
-    .map_err(|err| core_error(ruby, "Search", &err))?;
-    let array = ruby.ary_new_capa(results.len());
-
-    for path in results {
-        array.push(path_string(ruby, &path))?;
-    }
-
-    Ok(array)
+    let source: Obj<StreamSource> = ruby.obj_wrap(StreamSource::new(StreamConfig::Search(config)));
+    Ok(source.enumeratorize("each", ()))
 }
 
-fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
+fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<Enumerator, Error> {
     let args_scan = scan_args::<(), (), (), (), RHash, ()>(args)?;
     let kwargs = args_scan.keywords;
     if let Some(value) = kwargs.get(*PATTERN)
@@ -590,14 +843,6 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
             "missing keyword: pattern".to_owned(),
         )
     })?;
-    if kwargs.get(*TYPE).is_some() {
-        return Err(fdr_error(
-            ruby,
-            "InvalidOption",
-            ruby.exception_arg_error(),
-            "unknown keyword: :type".to_owned(),
-        ));
-    }
     let search = build_search_config(ruby, kwargs, &NAME, Vec::new())?;
     let content_case_sensitive = extract_boolish(kwargs, &CONTENT_CASE_SENSITIVE, true)?;
 
@@ -606,34 +851,24 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
         content_case_sensitive,
         search,
     };
-    let cancel = Arc::new(AtomicBool::new(false));
-    let results = interruptible(ruby, &cancel, move |cancel| {
-        grep_with_cancel(&config, cancel)
-    })?
-    .map_err(|err| core_error(ruby, "Grep", &err))?;
-    let ruby_results = ruby.hash_new_capa(results.len());
-
-    for result in results {
-        let lines = ruby.hash_new_capa(result.lines.len());
-
-        for (number, text) in result.lines {
-            lines.aset(number, line_string(ruby, &text))?;
-        }
-
-        ruby_results.aset(path_string(ruby, &result.path), lines)?;
-    }
-
-    Ok(ruby_results)
+    let source: Obj<StreamSource> = ruby.obj_wrap(StreamSource::new(StreamConfig::Grep(config)));
+    Ok(source.enumeratorize("each", ()))
 }
 
 #[magnus::init]
+#[allow(
+    unsafe_code,
+    reason = "MRI exposes Ractor-safety registration as an unsafe C API"
+)]
 fn init(ruby: &Ruby) -> Result<(), Error> {
-    // SAFETY: no Ruby VALUE is cached or crosses threads; the walk runs on
-    // plain Rust data, which `Send + 'static` on `interruptible` enforces.
+    // SAFETY: workers share no Ruby values across threads or Ractors.
     unsafe { rb_sys::rb_ext_ractor_safe(true) };
 
     let fdr_module = ruby.define_module("Fdr")?;
     let error = fdr_module.define_module("Error")?;
+    let stream = fdr_module.define_class("Stream", ruby.class_object())?;
+    stream.define_method("each", method!(stream_each, 0))?;
+    let _: Value = fdr_module.funcall("private_constant", ("Stream",))?;
 
     for (name, superclass) in [
         ("InvalidPattern", ruby.exception_regexp_error()),
@@ -651,4 +886,97 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     fdr_module.define_singleton_method("native_grep", function!(fdr_grep, -1))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_a_source_cancels_its_active_session() {
+        let source = StreamSource::new(StreamConfig::Search(SearchConfig::default()));
+        let session = Arc::new(StreamSession::new());
+        source
+            .sessions
+            .lock()
+            .expect("sessions lock should work")
+            .push(Arc::downgrade(&session));
+
+        drop(source);
+
+        assert!(session.cancelled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancellation_releases_producers_racing_into_the_wait() {
+        const PRODUCERS: usize = 8;
+        const TRIALS: usize = 2_000;
+
+        for trial in 0..TRIALS {
+            let session = Arc::new(StreamSession::new());
+            for index in 0..session.capacity {
+                assert!(session.push(StreamEvent::Search(vec![index.to_string().into_bytes()])));
+            }
+
+            let producers: Vec<_> = (0..PRODUCERS)
+                .map(|_| {
+                    let session = Arc::clone(&session);
+                    std::thread::spawn(move || {
+                        session.push(StreamEvent::Search(vec![b"blocked".to_vec()]))
+                    })
+                })
+                .collect();
+            for _ in 0..trial % 64 {
+                std::hint::spin_loop();
+            }
+
+            session.cancel();
+
+            for producer in producers {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !producer.is_finished() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "trial {trial}: a producer never woke from `space`"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(!producer.join().expect("producer should not panic"));
+            }
+        }
+    }
+
+    #[test]
+    fn ready_items_keep_event_order() {
+        let session = StreamSession::new();
+        assert!(session.push(StreamEvent::Search(vec![b"first".to_vec()])));
+        assert!(session.push(StreamEvent::Search(vec![b"second".to_vec()])));
+
+        assert!(matches!(
+            session.wait(),
+            StreamNext::Item(StreamItem::Search(path)) if path == b"first"
+        ));
+        assert!(matches!(
+            session.take_ready(),
+            Some(StreamNext::Item(StreamItem::Search(path))) if path == b"second"
+        ));
+    }
+
+    #[test]
+    fn cancellation_drains_queued_and_active_events() {
+        let session = StreamSession::new();
+        assert!(session.push(StreamEvent::Search(vec![
+            b"first".to_vec(),
+            b"second".to_vec(),
+        ])));
+        assert!(session.push(StreamEvent::Search(vec![b"third".to_vec()])));
+
+        drop(session.take_ready());
+        session.cancel();
+
+        let state = session.state.lock().expect("state lock should work");
+        assert!(state.events.is_empty());
+        assert!(state.active.is_none());
+        drop(state);
+    }
 }

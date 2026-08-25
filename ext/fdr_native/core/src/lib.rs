@@ -6,9 +6,8 @@ use regex::bytes::{Regex, RegexBuilder};
 use std::io::{self, Read, Seek};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
 #[allow(
@@ -18,6 +17,8 @@ use std::sync::mpsc::{Sender, channel};
 pub struct SearchConfig {
     pub pattern: Option<String>,
     pub paths: Vec<PathBuf>,
+    /// Drops `./` from safe paths under the implicit cwd root.
+    pub strip_cwd_prefix: bool,
     /// Inverted so unreadable entries remain skipped by default.
     pub raise_on_error: bool,
     /// Extra gitignore-format files at lowest precedence, even with `no_ignore`.
@@ -57,11 +58,11 @@ impl Default for GrepConfig {
     }
 }
 
-#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct GrepResult {
-    pub path: Vec<u8>,
-    /// Matching lines as `(one-based number, text without its terminator)`.
-    pub lines: Vec<(u64, Vec<u8>)>,
+#[derive(Debug, Eq, PartialEq)]
+pub struct GrepMatch {
+    pub path: Arc<[u8]>,
+    pub line_number: u64,
+    pub text: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -156,6 +157,7 @@ struct EntryFilters {
     /// Applied after walking so shallow ignored or excluded directories can prune.
     min_depth: Option<usize>,
     full_path: bool,
+    strip_cwd_prefix: bool,
     full_path_base: Option<PathBuf>,
     follow: bool,
     min_size: Option<u64>,
@@ -192,6 +194,7 @@ impl EntryFilters {
                 .map_err(SearchError::InvalidInput)?,
             min_depth: config.min_depth,
             full_path,
+            strip_cwd_prefix: config.strip_cwd_prefix,
             full_path_base,
             follow: config.follow,
             min_size: config.min_size,
@@ -280,8 +283,15 @@ impl EntryFilters {
         };
 
         if sized {
-            // Follow symlinks to identify files, but measure each entry, as in fd.
-            if !entry.path().is_file() {
+            // Identify files through symlinks but measure each entry itself,
+            // so only a symlink needs that second stat.
+            let file_type = metadata.file_type();
+            let is_file = if file_type.is_symlink() {
+                entry.path().is_file()
+            } else {
+                file_type.is_file()
+            };
+            if !is_file {
                 return false;
             }
             if let Some(min) = self.min_size
@@ -423,6 +433,7 @@ fn walk_entry(
         Ok(entry) => return Ok(Some(WalkEntry::Normal(entry))),
         Err(error) => error,
     };
+    // Build only when the error will be raised, before consuming it.
     let raised = raise_on_error.then(|| walk_error(&error));
 
     broken_symlink_entry(error).map_or_else(
@@ -515,6 +526,11 @@ fn walk_threads() -> usize {
         .div_ceil(2)
 }
 
+#[must_use]
+pub fn queue_capacity() -> usize {
+    walk_threads() * 2
+}
+
 /// Rejects relative environment paths to avoid reading from cwd.
 fn absolute_env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
@@ -580,8 +596,7 @@ fn build_walker(
     Ok(Some(builder))
 }
 
-/// Batch size for result collection (same as fd's default).
-const BATCH_SIZE: usize = 256;
+const STREAM_CHUNK: usize = 256;
 
 /// `ignore` parallelizes over directories, so entry count is not a useful cue.
 const DIRECTORY_THRESHOLD: usize = 64;
@@ -590,51 +605,65 @@ fn parallel_search_required(directories: usize) -> bool {
     directories >= DIRECTORY_THRESHOLD
 }
 
-/// Grep scans contents per entry, so threads pay off sooner than for search.
-const GREP_PARALLEL_THRESHOLD: usize = 512;
+/// Limits discarded pre-scan work and first-result buffering.
+const SERIAL_PRESCAN_ENTRIES: usize = 512;
 
 /// Limits discarded work during serial grep pre-scan.
 const GREP_SERIAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Wrapper for batched result sending with automatic flush on drop.
-struct ResultBatch {
-    batch: Vec<Vec<u8>>,
-    sender: Sender<Vec<Vec<u8>>>,
+/// Grows batches to `STREAM_CHUNK` but sends the first result immediately.
+/// `visited` flushes partial batches stranded by selective filters.
+struct EmitBatch<'a, T, F: Fn(Vec<T>) -> bool> {
+    items: Vec<T>,
+    limit: usize,
+    since_flush: usize,
+    emit: &'a F,
+    stopped: &'a AtomicBool,
 }
 
-impl ResultBatch {
-    fn new(sender: Sender<Vec<Vec<u8>>>) -> Self {
+impl<'a, T, F: Fn(Vec<T>) -> bool> EmitBatch<'a, T, F> {
+    fn new(emit: &'a F, stopped: &'a AtomicBool) -> Self {
         Self {
-            batch: Vec::new(),
-            sender,
+            items: Vec::new(),
+            limit: 1,
+            since_flush: 0,
+            emit,
+            stopped,
         }
     }
 
-    fn push(&mut self, item: Vec<u8>) {
-        if self.batch.capacity() == 0 {
-            self.batch.reserve(BATCH_SIZE);
-        }
-        self.batch.push(item);
-        if self.batch.len() >= BATCH_SIZE {
-            self.flush();
-        }
+    fn push(&mut self, item: T) -> bool {
+        self.items.push(item);
+        self.items.len() < self.limit || self.flush()
     }
 
-    fn flush(&mut self) {
-        if !self.batch.is_empty() {
-            drop(self.sender.send(std::mem::take(&mut self.batch)));
+    fn visited(&mut self) -> bool {
+        self.since_flush += 1;
+        self.since_flush < self.limit || self.flush()
+    }
+
+    fn flush(&mut self) -> bool {
+        self.since_flush = 0;
+        if self.items.is_empty() {
+            return true;
         }
+
+        let batch = std::mem::take(&mut self.items);
+        self.limit = self.limit.saturating_mul(2).min(STREAM_CHUNK);
+        self.items.reserve(self.limit);
+        if (self.emit)(batch) {
+            return true;
+        }
+
+        self.stopped.store(true, Ordering::Relaxed);
+        false
     }
 }
 
-impl Drop for ResultBatch {
+impl<T, F: Fn(Vec<T>) -> bool> Drop for EmitBatch<'_, T, F> {
     fn drop(&mut self) {
         self.flush();
     }
-}
-
-pub fn search(config: &SearchConfig) -> Result<Vec<Vec<u8>>, SearchError> {
-    search_with_cancel(config, &AtomicBool::new(false))
 }
 
 fn search_entry(entry: WalkEntry, filters: &EntryFilters) -> Option<Vec<u8>> {
@@ -653,7 +682,7 @@ fn search_entry(entry: WalkEntry, filters: &EntryFilters) -> Option<Vec<u8>> {
         return None;
     }
 
-    Some(path_into_bytes(entry.into_path()))
+    Some(path_into_bytes(entry.into_path(), filters.strip_cwd_prefix))
 }
 
 fn serial_search(
@@ -665,8 +694,8 @@ fn serial_search(
     let mut results = Vec::new();
     let mut directories = 0;
 
-    for entry in builder.build() {
-        if parallel_search_required(directories) {
+    for (visited, entry) in builder.build().enumerate() {
+        if parallel_search_required(directories) || visited >= SERIAL_PRESCAN_ENTRIES {
             return Ok(None);
         }
         if cancel.load(Ordering::Relaxed) {
@@ -692,87 +721,7 @@ fn serial_search(
         return Err(SearchError::Cancelled);
     }
 
-    results.sort_unstable();
-
     Ok(Some(results))
-}
-
-pub fn search_with_cancel(
-    config: &SearchConfig,
-    cancel: &AtomicBool,
-) -> Result<Vec<Vec<u8>>, SearchError> {
-    let filters = EntryFilters::new(config)?;
-    let Some(builder) = build_walker(config, ".fdignore", fd_global_ignore().as_deref())? else {
-        return Ok(Vec::new());
-    };
-    if depth_range_is_empty(config) {
-        return Ok(Vec::new());
-    }
-
-    if let Some(results) = serial_search(&builder, &filters, cancel, config.raise_on_error)? {
-        return Ok(results);
-    }
-
-    let (tx, rx) = channel();
-    let failure = Mutex::new(None);
-
-    let walker = builder.build_parallel();
-
-    walker.run(|| {
-        let tx = tx.clone();
-        let filters = &filters;
-        let failure = &failure;
-
-        let mut batch = ResultBatch::new(tx);
-
-        Box::new(move |entry| {
-            if cancel.load(Ordering::Relaxed) {
-                return WalkState::Quit;
-            }
-
-            let entry = match walk_entry(entry, config.raise_on_error) {
-                Ok(Some(entry)) => entry,
-                Ok(None) => return WalkState::Continue,
-                Err(error) => {
-                    record(failure, error);
-                    return WalkState::Quit;
-                }
-            };
-
-            if let Some(path) = search_entry(entry, filters) {
-                batch.push(path);
-            }
-
-            WalkState::Continue
-        })
-    });
-
-    drop(tx);
-    if cancel.load(Ordering::Relaxed) {
-        return Err(SearchError::Cancelled);
-    }
-    if let Some(error) = lock(&failure).take() {
-        return Err(error);
-    }
-
-    let mut batches: Vec<Vec<Vec<u8>>> = rx.into_iter().collect();
-    let total_size: usize = batches.iter().map(Vec::len).sum();
-    let mut results = batches.pop().unwrap_or_default();
-    results.reserve_exact(total_size - results.len());
-
-    for batch in batches {
-        results.extend(batch);
-    }
-
-    results.sort_unstable();
-
-    Ok(results)
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Keeps the first walk error, since the parallel walkers race.
@@ -781,6 +730,79 @@ fn record(slot: &Mutex<Option<SearchError>>, error: SearchError) {
     if slot.is_none() {
         *slot = Some(error);
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Emits path batches. Returning `false` stops early without error.
+pub fn search_stream<F>(
+    config: &SearchConfig,
+    cancel: &AtomicBool,
+    emit: F,
+) -> Result<(), SearchError>
+where
+    F: Fn(Vec<Vec<u8>>) -> bool + Sync,
+{
+    let filters = EntryFilters::new(config)?;
+    let Some(builder) = build_walker(config, ".fdignore", fd_global_ignore().as_deref())? else {
+        return Ok(());
+    };
+    if depth_range_is_empty(config) {
+        return Ok(());
+    }
+
+    // Small trees avoid `ignore`'s thread pool.
+    if let Some(results) = serial_search(&builder, &filters, cancel, config.raise_on_error)? {
+        if !results.is_empty() {
+            emit(results);
+        }
+        return Ok(());
+    }
+
+    let stopped = AtomicBool::new(false);
+    let failure = Mutex::new(None);
+    builder.build_parallel().run(|| {
+        let filters = &filters;
+        let stopped = &stopped;
+        let failure = &failure;
+        let mut batch = EmitBatch::new(&emit, stopped);
+
+        Box::new(move |entry| {
+            if cancel.load(Ordering::Relaxed) || stopped.load(Ordering::Relaxed) {
+                return WalkState::Quit;
+            }
+
+            let entry = match walk_entry(entry, config.raise_on_error) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return WalkState::Continue,
+                Err(error) => {
+                    record(failure, error);
+                    stopped.store(true, Ordering::Relaxed);
+                    return WalkState::Quit;
+                }
+            };
+
+            let live = match search_entry(entry, filters) {
+                Some(path) => batch.push(path),
+                None => batch.visited(),
+            };
+
+            if live {
+                WalkState::Continue
+            } else {
+                WalkState::Quit
+            }
+        })
+    });
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err(SearchError::Cancelled);
+    }
+    lock(&failure).take().map_or(Ok(()), Err)
 }
 
 struct CancellableReader<'a, R> {
@@ -798,11 +820,20 @@ impl<R: Read> Read for CancellableReader<'_, R> {
     }
 }
 
-struct LineCollector {
-    lines: Vec<(u64, Vec<u8>)>,
+/// Strips CR only before LF. A final CR without LF is content.
+fn line_text(bytes: &[u8]) -> &[u8] {
+    bytes
+        .strip_suffix(b"\n")
+        .map_or(bytes, |line| line.strip_suffix(b"\r").unwrap_or(line))
 }
 
-impl grep_searcher::Sink for LineCollector {
+struct LineEmitter<'a, 'b, F: Fn(Vec<GrepMatch>) -> bool> {
+    path: Arc<[u8]>,
+    cancel: &'a AtomicBool,
+    batch: &'a mut EmitBatch<'b, GrepMatch, F>,
+}
+
+impl<F: Fn(Vec<GrepMatch>) -> bool> grep_searcher::Sink for LineEmitter<'_, '_, F> {
     type Error = std::io::Error;
 
     fn matched(
@@ -810,21 +841,20 @@ impl grep_searcher::Sink for LineCollector {
         _searcher: &Searcher,
         matched: &grep_searcher::SinkMatch<'_>,
     ) -> std::io::Result<bool> {
-        if let Some(line_number) = matched.line_number() {
-            let text = matched.bytes();
-            // Only a CR that precedes the LF is a terminator; a trailing CR on
-            // an unterminated final line is content.
-            let text = text
-                .strip_suffix(b"\n")
-                .map_or(text, |line| line.strip_suffix(b"\r").unwrap_or(line));
-            self.lines.push((line_number, text.to_vec()));
+        if self.cancel.load(Ordering::Relaxed) || self.batch.stopped.load(Ordering::Relaxed) {
+            return Ok(false);
         }
-        Ok(true)
-    }
-}
 
-pub fn grep(config: &GrepConfig) -> Result<Vec<GrepResult>, SearchError> {
-    grep_with_cancel(config, &AtomicBool::new(false))
+        let Some(line_number) = matched.line_number() else {
+            return Ok(true);
+        };
+
+        Ok(self.batch.push(GrepMatch {
+            path: Arc::clone(&self.path),
+            line_number,
+            text: line_text(matched.bytes()).to_vec(),
+        }))
+    }
 }
 
 fn build_searcher() -> Searcher {
@@ -834,6 +864,21 @@ fn build_searcher() -> Searcher {
         // Keep the file's own bytes: sniffing strips a BOM and transcodes UTF-16.
         .bom_sniffing(false)
         .build()
+}
+
+fn build_content_matcher(config: &GrepConfig) -> Result<RegexMatcher, SearchError> {
+    let mut builder = RegexMatcherBuilder::new();
+    builder
+        .case_insensitive(!config.content_case_sensitive)
+        .unicode(true)
+        .octal(false)
+        .dot_matches_new_line(false)
+        // Like `rg`, a lone CR is content and `$` anchors only before LF.
+        .line_terminator(Some(b'\n'))
+        .ban_byte(Some(b'\0'));
+    builder
+        .build(&config.pattern)
+        .map_err(|error| SearchError::InvalidRegex(error.to_string()))
 }
 
 /// Skips a UTF-8 BOM for `^` without transcoding UTF-16.
@@ -875,50 +920,55 @@ fn grep_candidate(
     Ok(filters.matches(entry))
 }
 
-/// Matching lines in `path`, or `None` when it is unreadable, cancelled, or has
-/// no match. Binary detection stops the scan at the first NUL, so matches found
-/// before it are kept, as in `rg`.
-fn grep_file(
+/// Scans until the first NUL, retaining earlier matches like `rg`.
+fn grep_file<F: Fn(Vec<GrepMatch>) -> bool>(
     searcher: &mut Searcher,
     matcher: &RegexMatcher,
-    path: PathBuf,
+    path: &Path,
     cancel: &AtomicBool,
-) -> Option<GrepResult> {
-    let mut collector = LineCollector { lines: Vec::new() };
-    let mut file = std::fs::File::open(&path).ok()?;
-    skip_utf8_bom(&mut file).ok()?;
+    filters: &EntryFilters,
+    batch: &mut EmitBatch<'_, GrepMatch, F>,
+) {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return;
+    };
+    if skip_utf8_bom(&mut file).is_err() {
+        return;
+    }
+
     let reader = CancellableReader {
         inner: file,
         cancel,
     };
+    let mut sink = LineEmitter {
+        path: Arc::from(emitted_path(path, filters.strip_cwd_prefix).as_slice()),
+        cancel,
+        batch,
+    };
 
-    if searcher
-        .search_reader(matcher, reader, &mut collector)
-        .is_ok()
-        && !collector.lines.is_empty()
-    {
-        Some(GrepResult {
-            path: path_into_bytes(path),
-            lines: collector.lines,
-        })
-    } else {
-        None
-    }
+    drop(searcher.search_reader(matcher, reader, &mut sink));
 }
 
+/// Returns `None` when the tree is wide enough for `ignore`'s thread pool.
 fn serial_grep(
     builder: &WalkBuilder,
     matcher: &RegexMatcher,
     filters: &EntryFilters,
     cancel: &AtomicBool,
+    stopped: &AtomicBool,
     raise_on_error: bool,
-) -> Result<Option<Vec<GrepResult>>, SearchError> {
+) -> Result<Option<Vec<GrepMatch>>, SearchError> {
     let mut searcher = build_searcher();
-    let mut results = Vec::new();
     let mut scanned_bytes = 0_u64;
+    let collected = Mutex::new(Vec::new());
+    let collect = |batch: Vec<GrepMatch>| {
+        lock(&collected).extend(batch);
+        true
+    };
+    let mut batch = EmitBatch::new(&collect, stopped);
 
     for (visited, entry) in builder.build().enumerate() {
-        if visited >= GREP_PARALLEL_THRESHOLD {
+        if visited >= SERIAL_PRESCAN_ENTRIES {
             return Ok(None);
         }
         if cancel.load(Ordering::Relaxed) {
@@ -938,69 +988,69 @@ fn serial_grep(
             return Ok(None);
         }
 
-        if let Some(result) = grep_file(&mut searcher, matcher, entry.into_path(), cancel) {
-            results.push(result);
-        }
+        grep_file(
+            &mut searcher,
+            matcher,
+            &entry.into_path(),
+            cancel,
+            filters,
+            &mut batch,
+        );
     }
 
     if cancel.load(Ordering::Relaxed) {
         return Err(SearchError::Cancelled);
     }
 
-    results.sort_unstable();
-    merge_colliding_paths(&mut results);
+    drop(batch);
 
-    Ok(Some(results))
+    Ok(Some(
+        collected
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    ))
 }
 
-pub fn grep_with_cancel(
-    config: &GrepConfig,
-    cancel: &AtomicBool,
-) -> Result<Vec<GrepResult>, SearchError> {
-    let mut matcher_builder = RegexMatcherBuilder::new();
-    matcher_builder
-        .case_insensitive(!config.content_case_sensitive)
-        .unicode(true)
-        .octal(false)
-        .dot_matches_new_line(false)
-        // `rg`'s default: a lone CR stays ordinary content, so `$` anchors
-        // before LF only.
-        .line_terminator(Some(b'\n'))
-        .ban_byte(Some(b'\0'));
-    let matcher = matcher_builder
-        .build(&config.pattern)
-        .map_err(|error| SearchError::InvalidRegex(error.to_string()))?;
+/// Emits line batches: once per line, or per occurrence in column mode.
+pub fn grep_stream<F>(config: &GrepConfig, cancel: &AtomicBool, emit: F) -> Result<(), SearchError>
+where
+    F: Fn(Vec<GrepMatch>) -> bool + Sync,
+{
+    let matcher = build_content_matcher(config)?;
     let filters = EntryFilters::new(&config.search)?;
     let Some(builder) = build_walker(&config.search, ".rgignore", None)? else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     if depth_range_is_empty(&config.search) {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
-    if let Some(results) = serial_grep(
+    let stopped = AtomicBool::new(false);
+    if let Some(matches) = serial_grep(
         &builder,
         &matcher,
         &filters,
         cancel,
+        &stopped,
         config.search.raise_on_error,
     )? {
-        return Ok(results);
+        if !matches.is_empty() {
+            emit(matches);
+        }
+        return Ok(());
     }
 
-    let (tx, rx) = channel();
     let failure = Mutex::new(None);
-    let walker = builder.build_parallel();
-
-    walker.run(|| {
+    builder.build_parallel().run(|| {
         let matcher = &matcher;
         let filters = &filters;
-        let tx = tx.clone();
+        let stopped = &stopped;
         let failure = &failure;
         let mut searcher = build_searcher();
+        let mut batch = EmitBatch::new(&emit, stopped);
 
         Box::new(move |entry| {
-            if cancel.load(Ordering::Relaxed) {
+            if cancel.load(Ordering::Relaxed) || stopped.load(Ordering::Relaxed) {
                 return WalkState::Quit;
             }
 
@@ -1009,6 +1059,7 @@ pub fn grep_with_cancel(
                 Ok(None) => return WalkState::Continue,
                 Err(error) => {
                     record(failure, error);
+                    stopped.store(true, Ordering::Relaxed);
                     return WalkState::Quit;
                 }
             };
@@ -1016,50 +1067,54 @@ pub fn grep_with_cancel(
                 Ok(candidate) => candidate,
                 Err(error) => {
                     record(failure, error);
+                    stopped.store(true, Ordering::Relaxed);
                     return WalkState::Quit;
                 }
             };
-            if !candidate {
-                return WalkState::Continue;
+            if candidate {
+                grep_file(
+                    &mut searcher,
+                    matcher,
+                    &entry.into_path(),
+                    cancel,
+                    filters,
+                    &mut batch,
+                );
             }
 
-            if let Some(result) = grep_file(&mut searcher, matcher, entry.into_path(), cancel) {
-                drop(tx.send(result));
+            if cancel.load(Ordering::Relaxed) || stopped.load(Ordering::Relaxed) || !batch.visited()
+            {
+                WalkState::Quit
+            } else {
+                WalkState::Continue
             }
-
-            WalkState::Continue
         })
     });
 
-    drop(tx);
     if cancel.load(Ordering::Relaxed) {
         return Err(SearchError::Cancelled);
     }
-    if let Some(error) = lock(&failure).take() {
-        return Err(error);
+    lock(&failure).take().map_or(Ok(()), Err)
+}
+
+/// Raw OS bytes without consuming the path.
+fn emitted_path(path: &Path, strip_cwd_prefix: bool) -> Vec<u8> {
+    let bytes = path.as_os_str().as_bytes();
+    if strip_cwd_prefix
+        && let Some(rest) = bytes.strip_prefix(b"./".as_slice())
+        && !rest.starts_with(b"-")
+    {
+        return rest.to_vec();
     }
-
-    let mut results: Vec<GrepResult> = rx.into_iter().collect();
-    results.sort_unstable();
-    merge_colliding_paths(&mut results);
-
-    Ok(results)
+    bytes.to_vec()
 }
 
-/// Raw OS bytes, so the path still opens the file.
-fn path_into_bytes(path: PathBuf) -> Vec<u8> {
-    path.into_os_string().into_vec()
-}
-
-fn merge_colliding_paths(results: &mut Vec<GrepResult>) {
-    results.dedup_by(|next, kept| {
-        next.path == kept.path && {
-            kept.lines.append(&mut next.lines);
-            kept.lines.sort_unstable();
-            kept.lines.dedup_by(|next, kept| next.0 == kept.0);
-            true
-        }
-    });
+fn path_into_bytes(path: PathBuf, strip_cwd_prefix: bool) -> Vec<u8> {
+    let mut bytes = path.into_os_string().into_vec();
+    if strip_cwd_prefix && bytes.starts_with(b"./") && bytes.get(2) != Some(&b'-') {
+        drop(bytes.drain(..2));
+    }
+    bytes
 }
 
 fn build_glob(glob: &str) -> Result<globset::Glob, globset::Error> {
@@ -1104,12 +1159,33 @@ mod tests {
             "the directory threshold should select the parallel walker"
         );
 
-        let results = search(&config).expect("parallel search should succeed");
+        let results = Mutex::new(Vec::new());
+        search_stream(&config, &AtomicBool::new(false), |batch| {
+            lock(&results).extend(batch);
+            true
+        })
+        .expect("parallel search should succeed");
+        let results = lock(&results);
         assert_eq!(results.len(), DIRECTORY_THRESHOLD * 2 + 1);
         assert!(
             results
                 .iter()
                 .any(|path| AsRef::<[u8]>::as_ref(path) == dangling.as_os_str().as_bytes())
+        );
+        drop(results);
+    }
+
+    #[test]
+    fn cwd_prefix_stripping_preserves_option_shaped_paths() {
+        for path in ["./-", "./-rf", "./-dir/file"] {
+            assert_eq!(emitted_path(Path::new(path), true), path.as_bytes());
+            assert_eq!(path_into_bytes(PathBuf::from(path), true), path.as_bytes());
+        }
+
+        assert_eq!(emitted_path(Path::new("./sub/-rf"), true), b"sub/-rf");
+        assert_eq!(
+            path_into_bytes(PathBuf::from("./sub/-rf"), true),
+            b"sub/-rf"
         );
     }
 
@@ -1119,45 +1195,7 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let path = PathBuf::from(std::ffi::OsString::from_vec(b"bad\xffname.txt".to_vec()));
-        assert_eq!(path_into_bytes(path), b"bad\xffname.txt");
-    }
-
-    #[test]
-    fn merge_colliding_paths_merges_line_numbers_of_equal_paths() {
-        let mut results = vec![
-            GrepResult {
-                path: b"a.txt".to_vec(),
-                lines: vec![(2, b"two".to_vec()), (3, b"three".to_vec())],
-            },
-            GrepResult {
-                path: b"a.txt".to_vec(),
-                lines: vec![(3, b"three".to_vec()), (7, b"seven".to_vec())],
-            },
-            GrepResult {
-                path: b"b.txt".to_vec(),
-                lines: vec![(1, b"one".to_vec())],
-            },
-        ];
-
-        merge_colliding_paths(&mut results);
-
-        assert_eq!(
-            results,
-            vec![
-                GrepResult {
-                    path: b"a.txt".to_vec(),
-                    lines: vec![
-                        (2, b"two".to_vec()),
-                        (3, b"three".to_vec()),
-                        (7, b"seven".to_vec())
-                    ],
-                },
-                GrepResult {
-                    path: b"b.txt".to_vec(),
-                    lines: vec![(1, b"one".to_vec())],
-                },
-            ]
-        );
+        assert_eq!(path_into_bytes(path, false), b"bad\xffname.txt");
     }
 
     #[test]
@@ -1192,13 +1230,67 @@ mod tests {
             .build("needle")
             .expect("should compile regex");
         let mut searcher = build_searcher();
-        let mut collector = LineCollector { lines: Vec::new() };
+        let stopped = AtomicBool::new(false);
+        let drop_batch = |_: Vec<GrepMatch>| true;
+        let mut batch = EmitBatch::new(&drop_batch, &stopped);
+        let mut sink = LineEmitter {
+            path: Arc::from(&b"needle.txt"[..]),
+            cancel: &cancel,
+            batch: &mut batch,
+        };
 
         let error = searcher
-            .search_reader(&matcher, reader, &mut collector)
+            .search_reader(&matcher, reader, &mut sink)
             .expect_err("cancelled reader should stop the search");
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(error.to_string(), "search cancelled");
+    }
+
+    #[test]
+    fn emit_batch_flushes_the_first_result_immediately_then_grows() {
+        let stopped = AtomicBool::new(false);
+        let flushed = Mutex::new(Vec::new());
+        let record = |batch: Vec<u8>| {
+            lock(&flushed).push(batch.len());
+            true
+        };
+        let mut batch = EmitBatch::new(&record, &stopped);
+
+        assert!(batch.push(1));
+        assert_eq!(*lock(&flushed), vec![1], "the first result cannot wait");
+
+        for size in [2, 4, 8] {
+            for item in 0..size {
+                assert!(batch.push(item));
+            }
+        }
+
+        assert_eq!(*lock(&flushed), vec![1, 2, 4, 8]);
+    }
+
+    #[test]
+    fn emit_batch_flushes_a_partial_batch_a_filter_would_strand() {
+        let stopped = AtomicBool::new(false);
+        let flushed = Mutex::new(Vec::new());
+        let record = |batch: Vec<u8>| {
+            lock(&flushed).push(batch.len());
+            true
+        };
+        let mut batch = EmitBatch::new(&record, &stopped);
+
+        assert!(batch.push(1));
+        assert!(batch.push(2));
+        lock(&flushed).clear();
+        assert!(
+            lock(&flushed).is_empty(),
+            "a partial batch should wait for the rest of its chunk"
+        );
+
+        for _ in 0..batch.limit {
+            assert!(batch.visited());
+        }
+
+        assert_eq!(*lock(&flushed), vec![1]);
     }
 }

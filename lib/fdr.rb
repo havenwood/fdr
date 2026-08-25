@@ -11,10 +11,14 @@ end
 
 # File and content search for Ruby
 module Fdr
+  # Tracks the implicit root separately from an explicit ".", like `fd` and `rg`.
+  CWD = ["."].freeze
+  private_constant :CWD
+
   class << self
     def search(
       pattern: nil,
-      paths: ["."],
+      paths: CWD,
       hidden: false,
       no_ignore: false,
       case_sensitive: false,
@@ -31,11 +35,13 @@ module Fdr
       changed_within: nil,
       changed_before: nil,
       ignore_error: true,
-      ignore_file: []
+      ignore_file: [],
+      &
     )
-      native_search(
+      results = native_search(
         pattern:,
         paths:,
+        strip_cwd_prefix: paths.equal?(CWD),
         ignore_error:,
         ignore_file:,
         hidden:,
@@ -54,12 +60,14 @@ module Fdr
         changed_within:,
         changed_before:
       )
+      results.each(&)
+      results
     end
 
     def grep(
       pattern:,
       name: nil,
-      paths: ["."],
+      paths: CWD,
       hidden: false,
       no_ignore: false,
       case_sensitive: false,
@@ -76,12 +84,14 @@ module Fdr
       changed_within: nil,
       changed_before: nil,
       ignore_error: true,
-      ignore_file: []
+      ignore_file: [],
+      &
     )
-      native_grep(
+      results = native_grep(
         pattern:,
         name:,
         paths:,
+        strip_cwd_prefix: paths.equal?(CWD),
         ignore_error:,
         ignore_file:,
         hidden:,
@@ -100,6 +110,8 @@ module Fdr
         changed_within:,
         changed_before:
       )
+      results.each(&)
+      results
     end
 
     private :native_search, :native_grep

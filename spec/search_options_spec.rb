@@ -9,22 +9,22 @@ require "pathname"
 describe "Fdr search options" do
   describe "depth control" do
     it "respects max_depth option" do
-      shallow = Fdr.search(paths: ["."], max_depth: 1)
-      deep = Fdr.search(paths: ["."], max_depth: 3)
+      shallow = search_results(paths: ["."], max_depth: 1)
+      deep = search_results(paths: ["."], max_depth: 3)
 
       assert deep.size > shallow.size,
         "deeper search should find more files"
     end
 
     it "respects min_depth option" do
-      results = Fdr.search(paths: ["ext"], min_depth: 2, max_depth: 3)
+      results = search_results(paths: ["ext"], min_depth: 2, max_depth: 3)
 
       refute_empty results, "should find files at min_depth 2"
     end
 
     it "combines min_depth and max_depth correctly" do
-      depth_2_only = Fdr.search(paths: ["ext"], min_depth: 2, max_depth: 2)
-      less_restricted = Fdr.search(paths: ["ext"], min_depth: 2, max_depth: 3)
+      depth_2_only = search_results(paths: ["ext"], min_depth: 2, max_depth: 2)
+      less_restricted = search_results(paths: ["ext"], min_depth: 2, max_depth: 3)
 
       assert_operator depth_2_only.size, "<=", less_restricted.size,
         "broader depth range should find at least as many files"
@@ -39,7 +39,7 @@ describe "Fdr search options" do
           File.write(File.join(dir, directory, "file.txt"), "")
         end
 
-        results = Fdr.search(
+        results = search_results(
           paths: [dir],
           min_depth: 2,
           type: "f",
@@ -51,14 +51,12 @@ describe "Fdr search options" do
     end
 
     it "returns empty when min_depth exceeds directory depth" do
-      results = Fdr.search(paths: ["lib"], min_depth: 100, max_depth: 100)
-
-      assert_kind_of Array, results
+      results = search_results(paths: ["lib"], min_depth: 100, max_depth: 100)
       assert_empty results, "should return empty when min_depth exceeds actual depth"
     end
 
     it "max_depth with 1 finds top level items" do
-      results = Fdr.search(paths: ["lib"], max_depth: 1)
+      results = search_results(paths: ["lib"], max_depth: 1)
 
       refute_empty results
       assert(results.all? { |p| !p.include?("lib/fdr/") },
@@ -68,7 +66,7 @@ describe "Fdr search options" do
 
   describe "path handling" do
     it "searches multiple paths" do
-      results = Fdr.search(extension: "rb", paths: %w[lib spec], max_depth: 2)
+      results = search_results(extension: "rb", paths: %w[lib spec], max_depth: 2)
 
       assert(results.any? { |result| result.start_with?("lib") },
         "should find files in lib directory")
@@ -77,14 +75,14 @@ describe "Fdr search options" do
     end
 
     it "defaults to current directory when paths not specified" do
-      results = Fdr.search(extension: "md", max_depth: 1)
+      results = search_results(extension: "md", max_depth: 1)
 
       assert(results.any? { |result| result.include?("README") },
         "should find README.md in current directory")
     end
 
     it "handles single path as array" do
-      results = Fdr.search(paths: ["lib"], max_depth: 1)
+      results = search_results(paths: ["lib"], max_depth: 1)
 
       refute_empty results, "should find files in lib"
       assert(results.all? { |result| result.start_with?("lib") },
@@ -92,7 +90,7 @@ describe "Fdr search options" do
     end
 
     it "returns relative paths" do
-      results = Fdr.search(paths: ["lib"], max_depth: 1)
+      results = search_results(paths: ["lib"], max_depth: 1)
 
       refute_empty results
       assert(results.none? { |result| result.start_with?("/") },
@@ -100,7 +98,7 @@ describe "Fdr search options" do
     end
 
     it "accepts binary-encoded paths" do
-      results = Fdr.search(paths: ["lib".b], max_depth: 1)
+      results = search_results(paths: ["lib".b], max_depth: 1)
 
       refute_empty results
       assert(results.all? { |result| result.start_with?("lib") },
@@ -110,25 +108,25 @@ describe "Fdr search options" do
     it "accepts binary-encoded strings for every string option" do
       binary = "fdr".b
 
-      assert_equal Fdr.search(pattern: "fdr", paths: ["lib"]),
-        Fdr.search(pattern: binary, paths: ["lib"])
-      assert_equal Fdr.search(extension: "rb", paths: ["lib"]),
-        Fdr.search(extension: "rb".b, paths: ["lib"])
-      assert_equal Fdr.search(extension: "rb", paths: ["lib"]),
-        Fdr.search(extension: ["rb".b], paths: ["lib"])
-      assert_equal Fdr.search(exclude: %w[version.rb], paths: ["lib"]),
-        Fdr.search(exclude: ["version.rb".b], paths: ["lib"])
-      assert_equal Fdr.search(type: "f", paths: ["lib"]),
-        Fdr.search(type: "f".b, paths: ["lib"])
-      assert_equal Fdr.search(type: "f", paths: ["lib"]),
-        Fdr.search(type: ["f".b], paths: ["lib"])
+      assert_equal search_results(pattern: "fdr", paths: ["lib"]),
+        search_results(pattern: binary, paths: ["lib"])
+      assert_equal search_results(extension: "rb", paths: ["lib"]),
+        search_results(extension: "rb".b, paths: ["lib"])
+      assert_equal search_results(extension: "rb", paths: ["lib"]),
+        search_results(extension: ["rb".b], paths: ["lib"])
+      assert_equal search_results(exclude: %w[version.rb], paths: ["lib"]),
+        search_results(exclude: ["version.rb".b], paths: ["lib"])
+      assert_equal search_results(type: "f", paths: ["lib"]),
+        search_results(type: "f".b, paths: ["lib"])
+      assert_equal search_results(type: "f", paths: ["lib"]),
+        search_results(type: ["f".b], paths: ["lib"])
     end
 
     it "raises Fdr::InvalidOption for a string option that is not valid UTF-8" do
       invalid = "caf\xE9".b
 
       {pattern: invalid, extension: invalid, exclude: [invalid], type: invalid}.each do |key, value|
-        error = assert_raises(Fdr::InvalidOption) { Fdr.search(paths: ["lib"], **{key => value}) }
+        error = assert_raises(Fdr::InvalidOption) { search_results(paths: ["lib"], **{key => value}) }
 
         assert_kind_of Fdr::Error, error
         assert_includes error.message, key.to_s
@@ -136,7 +134,7 @@ describe "Fdr search options" do
     end
 
     it "accepts Pathname paths" do
-      results = Fdr.search(paths: [Pathname.new("lib")], max_depth: 1)
+      results = search_results(paths: [Pathname.new("lib")], max_depth: 1)
 
       assert_includes results, "lib/fdr.rb"
     end
@@ -145,19 +143,19 @@ describe "Fdr search options" do
       path = Object.new
       def path.to_path = "lib"
 
-      assert_includes Fdr.search(paths: [path], max_depth: 1), "lib/fdr.rb"
+      assert_includes search_results(paths: [path], max_depth: 1), "lib/fdr.rb"
     end
 
     it "accepts a paths value responding to to_ary" do
       paths = Object.new
       def paths.to_ary = ["lib"]
 
-      assert_includes Fdr.search(paths:, max_depth: 1), "lib/fdr.rb"
+      assert_includes search_results(paths:, max_depth: 1), "lib/fdr.rb"
     end
 
     it "limits results to specified paths only" do
-      lib_only = Fdr.search(extension: "rb", paths: ["lib"], max_depth: 1)
-      spec_only = Fdr.search(extension: "rb", paths: ["spec"], max_depth: 1)
+      lib_only = search_results(extension: "rb", paths: ["lib"], max_depth: 1)
+      spec_only = search_results(extension: "rb", paths: ["spec"], max_depth: 1)
 
       assert(lib_only.all? { |p| p.start_with?("lib") },
         "lib search should only return lib files")
@@ -177,7 +175,7 @@ describe "Fdr search options" do
             cwd, target = ARGV
             Dir.chdir(cwd)
             Dir.rmdir(cwd)
-            puts Fdr.search(paths: [target], type: "f", full_path: true, max_depth: 1)
+            Fdr.search(paths: [target], type: "f", full_path: true, max_depth: 1).each { puts _1 }
           RUBY
           stdout, stderr, status = Open3.capture3(
             {"RUBYOPT" => nil, "RUBYLIB" => nil},
@@ -201,8 +199,8 @@ describe "Fdr search options" do
 
   describe "exclude patterns" do
     it "filters out excluded paths" do
-      all_results = Fdr.search(extension: "toml", paths: ["ext"])
-      filtered_results = Fdr.search(
+      all_results = search_results(extension: "toml", paths: ["ext"])
+      filtered_results = search_results(
         extension: "toml",
         paths: ["ext"],
         exclude: ["ffi"]
@@ -215,28 +213,26 @@ describe "Fdr search options" do
     end
 
     it "accepts multiple exclusion patterns" do
-      results = Fdr.search(
+      results = search_results(
         extension: "rs",
         paths: ["ext"],
         exclude: %w[ffi build]
       )
-
-      assert_kind_of Array, results
       refute(results.any? { |p| p.include?("/ffi/") },
         "should exclude ffi directory")
     end
 
     it "works with empty exclude array" do
-      results_no_exclude = Fdr.search(paths: ["lib"])
-      results_empty_exclude = Fdr.search(paths: ["lib"], exclude: [])
+      results_no_exclude = search_results(paths: ["lib"])
+      results_empty_exclude = search_results(paths: ["lib"], exclude: [])
 
       assert_equal results_no_exclude.size, results_empty_exclude.size,
         "empty exclude array should not affect results"
     end
 
     it "actually excludes paths from results" do
-      all_ext = Fdr.search(paths: ["ext"], type: "f", extension: "toml")
-      without_core = Fdr.search(paths: ["ext"], type: "f", extension: "toml", exclude: ["core"])
+      all_ext = search_results(paths: ["ext"], type: "f", extension: "toml")
+      without_core = search_results(paths: ["ext"], type: "f", extension: "toml", exclude: ["core"])
 
       assert_operator without_core.size, "<=", all_ext.size,
         "excluding core should find fewer or equal files"
@@ -269,7 +265,7 @@ describe "Fdr search options" do
     end
 
     it "respects .gitignore by default" do
-      with_ignore = Fdr.search(paths: [@tmpdir], type: "f")
+      with_ignore = search_results(paths: [@tmpdir], type: "f")
 
       assert(with_ignore.any? { |result| result.include?("normal.txt") },
         "should find non-ignored file")
@@ -278,7 +274,7 @@ describe "Fdr search options" do
     end
 
     it "ignores .gitignore when no_ignore is true" do
-      without_ignore = Fdr.search(paths: [@tmpdir], type: "f", no_ignore: true)
+      without_ignore = search_results(paths: [@tmpdir], type: "f", no_ignore: true)
 
       assert(without_ignore.any? { |result| result.include?("ignored.txt") },
         "should find ignored file when no_ignore: true")
@@ -287,8 +283,8 @@ describe "Fdr search options" do
     end
 
     it "finds more files with no_ignore than with default ignore" do
-      with_ignore = Fdr.search(paths: [@tmpdir], type: "f")
-      without_ignore = Fdr.search(paths: [@tmpdir], type: "f", no_ignore: true)
+      with_ignore = search_results(paths: [@tmpdir], type: "f")
+      without_ignore = search_results(paths: [@tmpdir], type: "f", no_ignore: true)
 
       assert without_ignore.size > with_ignore.size,
         "no_ignore should find more files than respecting .gitignore"
@@ -300,7 +296,7 @@ describe "Fdr search options" do
     it "searches the file, not stdin" do
       Dir.mktmpdir("fdr-dash") do |dir|
         File.write(File.join(dir, "-"), "content")
-        script = "require 'fdr'; print Fdr.search(paths: ['-']).inspect"
+        script = "require 'fdr'; print Fdr.search(paths: ['-']).to_a.sort.inspect"
         lib = File.expand_path("../lib", __dir__)
         output, status = Open3.capture2(Gem.ruby, "-I#{lib}", "-e", script, chdir: dir)
 

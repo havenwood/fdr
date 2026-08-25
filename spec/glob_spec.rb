@@ -6,13 +6,12 @@ require "tmpdir"
 describe "Fdr glob patterns" do
   describe "glob option" do
     it "supports glob patterns when glob option is enabled" do
-      results = Fdr.search(
+      results = search_results(
         pattern: "*.rb",
         paths: ["lib"],
         glob: true,
         max_depth: 1
       )
-      assert_kind_of Array, results
       refute_empty results, "should find .rb files with glob pattern"
       assert(results.all? { |result| result.end_with?(".rb") },
         "all results should match *.rb pattern")
@@ -22,8 +21,8 @@ describe "Fdr glob patterns" do
       Dir.mktmpdir("fdr-glob-case") do |dir|
         File.write(File.join(dir, "README.MD"), "")
 
-        insensitive = Fdr.search(pattern: "readme.*", paths: [dir], glob: true)
-        sensitive = Fdr.search(pattern: "readme.*", paths: [dir], glob: true, case_sensitive: true)
+        insensitive = search_results(pattern: "readme.*", paths: [dir], glob: true)
+        sensitive = search_results(pattern: "readme.*", paths: [dir], glob: true, case_sensitive: true)
 
         refute_empty insensitive, "glob should ignore case by default"
         assert_empty sensitive, "case_sensitive should apply to glob patterns"
@@ -31,7 +30,7 @@ describe "Fdr glob patterns" do
     end
 
     it "supports wildcard matching with *" do
-      results = Fdr.search(
+      results = search_results(
         pattern: "Cargo.*",
         paths: ["ext"],
         glob: true,
@@ -44,7 +43,7 @@ describe "Fdr glob patterns" do
     end
 
     it "supports question mark wildcards for single characters" do
-      results = Fdr.search(
+      results = search_results(
         pattern: "fd?.rb",
         paths: ["lib"],
         glob: true,
@@ -55,7 +54,7 @@ describe "Fdr glob patterns" do
     end
 
     it "supports bracket expressions for character classes" do
-      results = Fdr.search(
+      results = search_results(
         pattern: "*.[rt][bs]",
         paths: ["ext"],
         glob: true,
@@ -68,7 +67,7 @@ describe "Fdr glob patterns" do
 
   describe "glob vs regex" do
     it "treats pattern as regex by default (not glob)" do
-      regex_results = Fdr.search(
+      regex_results = search_results(
         pattern: '.*\.rb$',
         paths: ["lib"],
         glob: false,
@@ -79,7 +78,7 @@ describe "Fdr glob patterns" do
     end
 
     it "treats pattern as glob when glob option is true" do
-      glob_results = Fdr.search(
+      glob_results = search_results(
         pattern: "*.toml",
         paths: ["ext"],
         glob: true,
@@ -92,8 +91,8 @@ describe "Fdr glob patterns" do
 
     it "glob and regex produce different results for special chars" do
       # Glob `*` is a wildcard, while regex `*` repeats the preceding token.
-      glob_results = Fdr.search(pattern: "dr*", paths: ["lib"], glob: true, max_depth: 1)
-      regex_results = Fdr.search(pattern: "dr*", paths: ["lib"], glob: false, max_depth: 1)
+      glob_results = search_results(pattern: "dr*", paths: ["lib"], glob: true, max_depth: 1)
+      regex_results = search_results(pattern: "dr*", paths: ["lib"], glob: false, max_depth: 1)
 
       assert_empty glob_results, "glob must match the whole name, so dr* matches nothing in lib"
       refute_empty regex_results, "regex matches a substring, so dr* matches fdr files"
@@ -102,7 +101,7 @@ describe "Fdr glob patterns" do
 
   describe "complex glob patterns" do
     it "supports nested wildcards with **" do
-      results = Fdr.search(
+      results = search_results(
         pattern: "**/Cargo.toml",
         paths: ["ext"],
         glob: true,
@@ -115,7 +114,7 @@ describe "Fdr glob patterns" do
     end
 
     it "supports multiple extensions with braces" do
-      results = Fdr.search(
+      results = search_results(
         pattern: "*.{toml,lock}",
         paths: ["ext"],
         glob: true,
@@ -129,7 +128,7 @@ describe "Fdr glob patterns" do
 
   describe "glob with full_path" do
     it "applies glob pattern to full path when full_path is true" do
-      results = Fdr.search(
+      results = search_results(
         pattern: "**/fdr_native*",
         paths: ["."],
         glob: true,
@@ -146,14 +145,14 @@ describe "Fdr glob patterns" do
         File.write(File.join(src, "main.rb"), "x")
         File.write(File.join(tmpdir, "other.rb"), "x")
 
-        results = Fdr.search(pattern: "**/src/*.rb", paths: [tmpdir], glob: true, full_path: true)
+        results = search_results(pattern: "**/src/*.rb", paths: [tmpdir], glob: true, full_path: true)
 
         assert_equal [File.join(src, "main.rb")], results
       end
     end
 
     it "matches directory structure with glob and full_path" do
-      results = Fdr.search(
+      results = search_results(
         pattern: "**/Cargo.toml",
         paths: ["."],
         glob: true,

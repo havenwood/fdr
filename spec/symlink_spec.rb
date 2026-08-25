@@ -50,7 +50,7 @@ describe "Symlink behavior" do
 
   describe "follow: false (default)" do
     it "does not traverse into symlinked directories" do
-      results = Fdr.search(paths: [@tmpdir], follow: false)
+      results = search_results(paths: [@tmpdir], follow: false)
 
       assert(results.any? { |path| path.include?("real_dir") })
 
@@ -59,13 +59,13 @@ describe "Symlink behavior" do
     end
 
     it "finds symlinks themselves when type is not specified" do
-      results = Fdr.search(paths: [@tmpdir], follow: false, max_depth: 1)
+      results = search_results(paths: [@tmpdir], follow: false, max_depth: 1)
 
       assert_includes results, @link_to_dir
     end
 
     it "does not follow symlinked files" do
-      results = Fdr.search(paths: [@tmpdir], pattern: "link_to_file", follow: false)
+      results = search_results(paths: [@tmpdir], pattern: "link_to_file", follow: false)
 
       refute_empty results
       assert(results.all? { |path| File.symlink?(path) })
@@ -74,7 +74,7 @@ describe "Symlink behavior" do
 
   describe "follow: true" do
     it "traverses into symlinked directories" do
-      results = Fdr.search(paths: [@tmpdir], follow: true)
+      results = search_results(paths: [@tmpdir], follow: true)
 
       assert(results.any? { |path| path.include?("real_dir") && path.include?("file1.txt") })
 
@@ -83,13 +83,13 @@ describe "Symlink behavior" do
     end
 
     it "follows symlinks to files" do
-      results = Fdr.search(paths: [@tmpdir], pattern: "real_file", follow: true)
+      results = search_results(paths: [@tmpdir], pattern: "real_file", follow: true)
 
       refute_empty results
     end
 
     it "lists broken symlinks, like fd" do
-      results = Fdr.search(paths: [@tmpdir], follow: true)
+      results = search_results(paths: [@tmpdir], follow: true)
 
       assert_includes results, @broken_link
     end
@@ -97,14 +97,14 @@ describe "Symlink behavior" do
 
   describe 'type: "l" (symlink)' do
     it "finds only symlinks" do
-      results = Fdr.search(paths: [@tmpdir], type: "l", max_depth: 1)
+      results = search_results(paths: [@tmpdir], type: "l", max_depth: 1)
 
       refute_empty results
       assert results.all? { |path| File.symlink?(path) }, "all results should be symlinks"
     end
 
     it "finds directory symlinks" do
-      results = Fdr.search(paths: [@tmpdir], type: "l", pattern: "link_to_dir", max_depth: 1)
+      results = search_results(paths: [@tmpdir], type: "l", pattern: "link_to_dir", max_depth: 1)
 
       refute_empty results
       assert(results.any? do |path|
@@ -115,21 +115,21 @@ describe "Symlink behavior" do
     end
 
     it "finds file symlinks" do
-      results = Fdr.search(paths: [@tmpdir], type: "l", pattern: "link_to_file", max_depth: 1)
+      results = search_results(paths: [@tmpdir], type: "l", pattern: "link_to_file", max_depth: 1)
 
       refute_empty results
       assert(results.all? { |path| File.symlink?(path) })
     end
 
     it "finds broken symlinks" do
-      results = Fdr.search(paths: [@tmpdir], type: "l", max_depth: 1)
+      results = search_results(paths: [@tmpdir], type: "l", max_depth: 1)
 
       assert results.size >= 3, "should find at least 3 symlinks, found #{results.size}"
       assert results.any? { |path| File.symlink?(path) && !File.exist?(path) }, "should include broken symlink"
     end
 
     it "works with symlink type alias" do
-      results = Fdr.search(paths: [@tmpdir], type: "symlink", max_depth: 1)
+      results = search_results(paths: [@tmpdir], type: "symlink", max_depth: 1)
 
       refute_empty results
       assert(results.all? { |path| File.symlink?(path) })
@@ -138,7 +138,7 @@ describe "Symlink behavior" do
 
   describe "symlink as the search root" do
     it "omits the root link and returns its children" do
-      results = Fdr.search(paths: [@link_to_dir])
+      results = search_results(paths: [@link_to_dir])
 
       refute_includes results, @link_to_dir
       assert(results.any? { |path| path.include?("file1.txt") })
@@ -146,14 +146,14 @@ describe "Symlink behavior" do
     end
 
     it "omits the root link and returns its children with follow: true" do
-      results = Fdr.search(paths: [@link_to_dir], follow: true)
+      results = search_results(paths: [@link_to_dir], follow: true)
 
       refute_includes results, @link_to_dir
       assert(results.any? { |path| path.include?("file1.txt") })
     end
 
     it 'finds a file symlink root with type: "l"' do
-      results = Fdr.search(paths: [@link_to_file], type: "l")
+      results = search_results(paths: [@link_to_file], type: "l")
 
       assert_equal [@link_to_file], results
     end
@@ -164,8 +164,8 @@ describe "Symlink behavior" do
       File.write(big, "x" * 21_000)
       File.symlink(big, link)
 
-      assert_empty Fdr.search(paths: [link], min_size: 20_000)
-      assert_equal [link], Fdr.search(paths: [link], min_size: 20_000, follow: true)
+      assert_empty search_results(paths: [link], min_size: 20_000)
+      assert_equal [link], search_results(paths: [link], min_size: 20_000, follow: true)
     end
 
     it "answers the same for a symlink root on both sides of the parallel threshold" do
@@ -176,9 +176,9 @@ describe "Symlink behavior" do
       File.symlink(big, link)
       Dir.mkdir(pad)
 
-      serial = Fdr.search(paths: [pad, link], min_size: 20_000, follow: true)
+      serial = search_results(paths: [pad, link], min_size: 20_000, follow: true)
       70.times { |i| Dir.mkdir(File.join(pad, "d#{i}")) }
-      parallel = Fdr.search(paths: [pad, link], min_size: 20_000, follow: true)
+      parallel = search_results(paths: [pad, link], min_size: 20_000, follow: true)
 
       assert_equal [link], serial
       assert_equal [link], parallel
@@ -192,9 +192,9 @@ describe "Symlink behavior" do
       File.write(File.join(cycle, "file.txt"), "content")
       File.symlink(cycle, File.join(cycle, "loop"))
 
-      serial = Timeout.timeout(15) { Fdr.search(paths: [cycle], follow: true) }
+      serial = Timeout.timeout(15) { search_results(paths: [cycle], follow: true) }
       70.times { |i| Dir.mkdir(File.join(cycle, "d#{i}")) }
-      parallel = Timeout.timeout(15) { Fdr.search(paths: [cycle], follow: true) }
+      parallel = Timeout.timeout(15) { search_results(paths: [cycle], follow: true) }
 
       assert(serial.any? { |path| path.end_with?("file.txt") })
       assert(parallel.any? { |path| path.end_with?("file.txt") })
@@ -208,32 +208,30 @@ describe "Symlink behavior" do
       File.symlink(second, File.join(first, "to_second"))
       File.symlink(first, File.join(second, "to_first"))
 
-      serial = Timeout.timeout(15) { Fdr.search(paths: [first], follow: true) }
+      serial = Timeout.timeout(15) { search_results(paths: [first], follow: true) }
       70.times { |i| Dir.mkdir(File.join(second, "d#{i}")) }
-      parallel = Timeout.timeout(15) { Fdr.search(paths: [first], follow: true) }
-
-      assert_kind_of Array, serial
+      parallel = Timeout.timeout(15) { search_results(paths: [first], follow: true) }
       assert_operator parallel.size, :>=, serial.size
     end
   end
 
   describe "combination of follow and type" do
     it 'type: "l" with follow: true matches only broken symlinks' do
-      results = Fdr.search(paths: [@tmpdir], type: "l", follow: true, max_depth: 1)
+      results = search_results(paths: [@tmpdir], type: "l", follow: true, max_depth: 1)
 
       assert_equal [@broken_link], results,
         "followed symlinks take their target type, so only broken links remain"
     end
 
     it 'type: "l" with follow: false finds symlinks' do
-      results = Fdr.search(paths: [@tmpdir], type: "l", follow: false, max_depth: 1)
+      results = search_results(paths: [@tmpdir], type: "l", follow: false, max_depth: 1)
 
       refute_empty results
       assert(results.all? { |path| File.symlink?(path) })
     end
 
     it 'type: "f" excludes symlinks with follow: false' do
-      results = Fdr.search(paths: [@tmpdir], type: "f", follow: false)
+      results = search_results(paths: [@tmpdir], type: "f", follow: false)
 
       assert(results.all? { |path| File.file?(path) && !File.symlink?(path) })
     end
@@ -241,7 +239,7 @@ describe "Symlink behavior" do
 
   describe "pattern matching on symlinks" do
     it "matches pattern on symlink names" do
-      results = Fdr.search(paths: [@tmpdir], pattern: "link_to", max_depth: 1)
+      results = search_results(paths: [@tmpdir], pattern: "link_to", max_depth: 1)
 
       assert results.size >= 2, "should find at least 2 symlinks matching 'link_to'"
       assert(results.any? { |path| path.include?("link_to_dir") })
@@ -252,7 +250,7 @@ describe "Symlink behavior" do
       rb_link = File.join(@tmpdir, "link.rb")
       File.symlink(@real_file, rb_link)
 
-      results = Fdr.search(paths: [@tmpdir], type: "l", extension: "rb", max_depth: 1)
+      results = search_results(paths: [@tmpdir], type: "l", extension: "rb", max_depth: 1)
 
       assert(results.any? { |path| path == rb_link })
     end
@@ -269,7 +267,7 @@ describe "Symlink behavior" do
     end
 
     it "finds files in ignored directories when both no_ignore and follow are true" do
-      results = Fdr.search(
+      results = search_results(
         paths: [@tmpdir],
         follow: true,
         no_ignore: true,
@@ -281,7 +279,7 @@ describe "Symlink behavior" do
     end
 
     it "follows symlinks to ignored directories with no_ignore" do
-      results = Fdr.search(
+      results = search_results(
         paths: [@tmpdir],
         follow: true,
         no_ignore: true,

@@ -48,7 +48,7 @@ module Fdr
     ?changed_before: Integer?,
     ?ignore_error: ::boolish,
     ?ignore_file: ::array[::path]
-  ) -> Array[String]
+  ) ?{ (String) -> void } -> Enumerator[String]
 
   def self.grep: (
     pattern: ::string,
@@ -71,5 +71,5 @@ module Fdr
     ?changed_before: Integer?,
     ?ignore_error: ::boolish,
     ?ignore_file: ::array[::path]
-  ) -> Hash[String, Hash[Integer, String]]
+  ) ?{ (String, Integer, String) -> void } -> Enumerator[[String, Integer, String]]
 end

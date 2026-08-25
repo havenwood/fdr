@@ -1,6 +1,11 @@
 //! Integration tests for search configuration
 
-use fdr_core::{GrepConfig, SearchConfig, SearchError, grep, search as search_bytes};
+#[path = "support/grep.rs"]
+pub mod grep_support;
+#[path = "support/search.rs"]
+pub mod search_support;
+
+use fdr_core::{GrepConfig, SearchConfig, SearchError};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -10,10 +15,14 @@ fn lossy(path: &[u8]) -> String {
 }
 
 fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
-    Ok(search_bytes(config)?
+    Ok(search_support::collect(config, false)?
         .iter()
         .map(|path| lossy(path))
         .collect())
+}
+
+fn grep(config: &GrepConfig) -> Result<Vec<grep_support::GrepResult>, SearchError> {
+    grep_support::collect(config, false)
 }
 
 #[test]
@@ -87,7 +96,7 @@ fn search_and_grep_use_their_own_ignore_files() {
         ..Default::default()
     })
     .expect("search should succeed");
-    let grepped = grep(&GrepConfig {
+    let mut grepped = grep(&GrepConfig {
         pattern: "needle".to_string(),
         search: SearchConfig {
             paths: vec![inner.clone()],
@@ -99,6 +108,7 @@ fn search_and_grep_use_their_own_ignore_files() {
     .iter()
     .map(|result| lossy(&result.path))
     .collect::<Vec<_>>();
+    grepped.sort_unstable();
 
     assert_eq!(searched, expected_search);
     assert_eq!(grepped, expected_grep);
@@ -109,7 +119,7 @@ fn search_and_grep_use_their_own_ignore_files() {
         ..Default::default()
     })
     .expect("unrestricted search should succeed");
-    let grepped = grep(&GrepConfig {
+    let mut grepped = grep(&GrepConfig {
         pattern: "needle".to_string(),
         search: SearchConfig {
             paths: vec![inner],
@@ -122,6 +132,7 @@ fn search_and_grep_use_their_own_ignore_files() {
     .iter()
     .map(|result| lossy(&result.path))
     .collect::<Vec<_>>();
+    grepped.sort_unstable();
 
     assert_eq!(searched, expected_all);
     assert_eq!(grepped, expected_all);
@@ -287,6 +298,7 @@ fn search_allows_all_options_combined() {
     let config = SearchConfig {
         pattern: Some("lib".to_string()),
         paths: vec![PathBuf::from(".")],
+        strip_cwd_prefix: false,
         raise_on_error: false,
         ignore_file: Vec::new(),
         hidden: true,
