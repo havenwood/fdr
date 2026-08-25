@@ -57,6 +57,24 @@ describe "Fdr.grep" do
       assert_equal "lib/fdr/version.rb", path
     end
 
+    it "reports one match per occurrence with column, as rg --vimgrep does" do
+      results = Fdr.grep(pattern: "needle", paths: [@tmpdir], column: true).to_a.sort
+
+      assert_equal [[@path, 3, 1, "needle"],
+        [@path, 4, 1, "needle twice needle"],
+        [@path, 4, 14, "needle twice needle"]], results
+    end
+
+    it "counts the column in bytes, as rg does" do
+      path = File.join(@tmpdir, "multibyte.txt")
+      File.write(path, "caf\u00e9 needle here\n")
+
+      _, _, column, text = Fdr.grep(pattern: "needle", paths: [path], column: true).first
+
+      assert_equal 7, column
+      assert_equal "needle", text.byteslice(column - 1, 6)
+    end
+
     it "yields nothing when nothing matches" do
       results = Fdr.grep(pattern: "haystack", paths: [@tmpdir])
 
@@ -111,6 +129,25 @@ describe "Fdr.grep" do
       results = grep_results(pattern: "needle", paths: [@tmpdir], content_case_sensitive: nil)
 
       assert_equal [2, 3, 4], results[@path].keys
+    end
+
+    it "scans binary files when text is true, as rg -a does" do
+      binary = File.join(@tmpdir, "binary.bin")
+      File.binwrite(binary, "before\0needle here\n")
+
+      assert_empty grep_results(pattern: "needle here", paths: [binary])
+      assert_equal({binary => {1 => "before\0needle here"}},
+        grep_results(pattern: "needle here", paths: [binary], text: true))
+    end
+
+    it "allows a NUL in the pattern only when text is true" do
+      binary = File.join(@tmpdir, "binary.bin")
+      File.binwrite(binary, "before\0needle here\n")
+
+      [{}, {column: true}].each do |shape|
+        assert_empty Fdr.grep(pattern: "e\0n", paths: [binary], **shape).to_a
+        refute_empty Fdr.grep(pattern: "e\0n", paths: [binary], text: true, **shape).to_a
+      end
     end
 
     it "skips binary files" do
@@ -300,7 +337,7 @@ describe "Fdr.grep" do
         grep_results(pattern: '\x00', paths: [@tmpdir])
       end
 
-      assert_match(/Grep failed/, error.message)
+      assert_match(/Grep failed: .*; pass `text: true` to search binary content/, error.message)
     end
   end
 end

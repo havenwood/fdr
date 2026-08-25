@@ -1,4 +1,5 @@
 use globset::GlobBuilder;
+use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
@@ -44,6 +45,10 @@ pub struct SearchConfig {
 pub struct GrepConfig {
     pub pattern: String,
     pub content_case_sensitive: bool,
+    /// Searches binary content past the first NUL, like `rg -a`.
+    pub text: bool,
+    /// Reports each occurrence with a one-based byte column, like `rg --column`.
+    pub column: bool,
     /// File filters, with `SearchConfig::pattern` matching names.
     pub search: SearchConfig,
 }
@@ -53,8 +58,16 @@ impl Default for GrepConfig {
         Self {
             pattern: String::new(),
             content_case_sensitive: true,
+            text: false,
+            column: false,
             search: SearchConfig::default(),
         }
+    }
+}
+
+impl GrepConfig {
+    fn occurrence_mode(&self) -> bool {
+        self.column
     }
 }
 
@@ -62,6 +75,8 @@ impl Default for GrepConfig {
 pub struct GrepMatch {
     pub path: Arc<[u8]>,
     pub line_number: u64,
+    /// 1-based byte offset of this occurrence, when `GrepConfig::column` is set.
+    pub column: Option<u64>,
     pub text: Vec<u8>,
 }
 
@@ -830,7 +845,20 @@ fn line_text(bytes: &[u8]) -> &[u8] {
 struct LineEmitter<'a, 'b, F: Fn(Vec<GrepMatch>) -> bool> {
     path: Arc<[u8]>,
     cancel: &'a AtomicBool,
+    /// Reuses the line matcher for exact column offsets.
+    matcher: Option<&'a RegexMatcher>,
     batch: &'a mut EmitBatch<'b, GrepMatch, F>,
+}
+
+impl<F: Fn(Vec<GrepMatch>) -> bool> LineEmitter<'_, '_, F> {
+    fn emit(&mut self, line_number: u64, column: Option<u64>, text: &[u8]) -> bool {
+        self.batch.push(GrepMatch {
+            path: Arc::clone(&self.path),
+            line_number,
+            column,
+            text: text.to_vec(),
+        })
+    }
 }
 
 impl<F: Fn(Vec<GrepMatch>) -> bool> grep_searcher::Sink for LineEmitter<'_, '_, F> {
@@ -848,19 +876,43 @@ impl<F: Fn(Vec<GrepMatch>) -> bool> grep_searcher::Sink for LineEmitter<'_, '_, 
         let Some(line_number) = matched.line_number() else {
             return Ok(true);
         };
+        let text = line_text(matched.bytes());
+        let Some(finder) = self.matcher else {
+            return Ok(self.emit(line_number, None, text));
+        };
 
-        Ok(self.batch.push(GrepMatch {
-            path: Arc::clone(&self.path),
-            line_number,
-            text: line_text(matched.bytes()).to_vec(),
-        }))
+        let mut columns = Vec::new();
+        finder
+            .find_iter(text, |found| {
+                columns.push(found.start() as u64 + 1);
+                true
+            })
+            .map_err(std::io::Error::other)?;
+
+        // `$` may match the stripped terminator without an occurrence in `text`.
+        if columns.is_empty() {
+            return Ok(self.emit(line_number, Some(1), text));
+        }
+
+        for column in columns {
+            if !self.emit(line_number, Some(column), text) {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 }
 
-fn build_searcher() -> Searcher {
+fn build_searcher(text: bool) -> Searcher {
+    let binary = if text {
+        BinaryDetection::none()
+    } else {
+        BinaryDetection::quit(b'\0')
+    };
     SearcherBuilder::new()
         .line_number(true)
-        .binary_detection(BinaryDetection::quit(b'\0'))
+        .binary_detection(binary)
         // Keep the file's own bytes: sniffing strips a BOM and transcodes UTF-16.
         .bom_sniffing(false)
         .build()
@@ -872,13 +924,21 @@ fn build_content_matcher(config: &GrepConfig) -> Result<RegexMatcher, SearchErro
         .case_insensitive(!config.content_case_sensitive)
         .unicode(true)
         .octal(false)
+        // `^`/`$` anchor per line. Without this grep-regex reads them as
+        // haystack anchors and loses the fast path.
+        .multi_line(true)
         .dot_matches_new_line(false)
         // Like `rg`, a lone CR is content and `$` anchors only before LF.
         .line_terminator(Some(b'\n'))
-        .ban_byte(Some(b'\0'));
-    builder
-        .build(&config.pattern)
-        .map_err(|error| SearchError::InvalidRegex(error.to_string()))
+        // Ban NUL only while binary detection stops there.
+        .ban_byte((!config.text).then_some(b'\0'));
+    builder.build(&config.pattern).map_err(|error| {
+        let mut message = error.to_string();
+        if message.contains("pattern contains \"\\0\"") {
+            message.push_str("; pass `text: true` to search binary content");
+        }
+        SearchError::InvalidRegex(message)
+    })
 }
 
 /// Skips a UTF-8 BOM for `^` without transcoding UTF-16.
@@ -927,6 +987,7 @@ fn grep_file<F: Fn(Vec<GrepMatch>) -> bool>(
     path: &Path,
     cancel: &AtomicBool,
     filters: &EntryFilters,
+    column: bool,
     batch: &mut EmitBatch<'_, GrepMatch, F>,
 ) {
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -943,6 +1004,7 @@ fn grep_file<F: Fn(Vec<GrepMatch>) -> bool>(
     let mut sink = LineEmitter {
         path: Arc::from(emitted_path(path, filters.strip_cwd_prefix).as_slice()),
         cancel,
+        matcher: column.then_some(matcher),
         batch,
     };
 
@@ -954,11 +1016,11 @@ fn serial_grep(
     builder: &WalkBuilder,
     matcher: &RegexMatcher,
     filters: &EntryFilters,
+    config: &GrepConfig,
     cancel: &AtomicBool,
     stopped: &AtomicBool,
-    raise_on_error: bool,
 ) -> Result<Option<Vec<GrepMatch>>, SearchError> {
-    let mut searcher = build_searcher();
+    let mut searcher = build_searcher(config.text);
     let mut scanned_bytes = 0_u64;
     let collected = Mutex::new(Vec::new());
     let collect = |batch: Vec<GrepMatch>| {
@@ -975,11 +1037,11 @@ fn serial_grep(
             return Err(SearchError::Cancelled);
         }
 
-        let Some(entry) = walk_entry(entry, raise_on_error)? else {
+        let Some(entry) = walk_entry(entry, config.search.raise_on_error)? else {
             continue;
         };
 
-        if !grep_candidate(&entry, filters, raise_on_error)? {
+        if !grep_candidate(&entry, filters, config.search.raise_on_error)? {
             continue;
         }
 
@@ -994,6 +1056,7 @@ fn serial_grep(
             &entry.into_path(),
             cancel,
             filters,
+            config.column,
             &mut batch,
         );
     }
@@ -1026,14 +1089,7 @@ where
     }
 
     let stopped = AtomicBool::new(false);
-    if let Some(matches) = serial_grep(
-        &builder,
-        &matcher,
-        &filters,
-        cancel,
-        &stopped,
-        config.search.raise_on_error,
-    )? {
+    if let Some(matches) = serial_grep(&builder, &matcher, &filters, config, cancel, &stopped)? {
         if !matches.is_empty() {
             emit(matches);
         }
@@ -1046,7 +1102,7 @@ where
         let filters = &filters;
         let stopped = &stopped;
         let failure = &failure;
-        let mut searcher = build_searcher();
+        let mut searcher = build_searcher(config.text);
         let mut batch = EmitBatch::new(&emit, stopped);
 
         Box::new(move |entry| {
@@ -1063,7 +1119,7 @@ where
                     return WalkState::Quit;
                 }
             };
-            let candidate = match grep_candidate(&entry, &filters, config.search.raise_on_error) {
+            let candidate = match grep_candidate(&entry, filters, config.search.raise_on_error) {
                 Ok(candidate) => candidate,
                 Err(error) => {
                     record(failure, error);
@@ -1078,6 +1134,7 @@ where
                     &entry.into_path(),
                     cancel,
                     filters,
+                    config.column,
                     &mut batch,
                 );
             }
@@ -1229,13 +1286,14 @@ mod tests {
         let matcher = RegexMatcherBuilder::new()
             .build("needle")
             .expect("should compile regex");
-        let mut searcher = build_searcher();
+        let mut searcher = build_searcher(false);
         let stopped = AtomicBool::new(false);
         let drop_batch = |_: Vec<GrepMatch>| true;
         let mut batch = EmitBatch::new(&drop_batch, &stopped);
         let mut sink = LineEmitter {
             path: Arc::from(&b"needle.txt"[..]),
             cancel: &cancel,
+            matcher: None,
             batch: &mut batch,
         };
 

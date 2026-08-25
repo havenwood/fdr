@@ -63,6 +63,10 @@ Fdr.grep(pattern: "module Fdr", paths: %w[lib]).group_by { |path,| path }
 
 `pattern` is case-sensitive by default, unlike `name`, which follows `Fdr.search`. Pass `content_case_sensitive: false` for case-insensitive matching.
 
+Binary files are skipped at the first NUL. Pass `text: true` to scan them anyway, as `rg -a` does.
+
+`column: true` yields `path, line_number, column, text` instead, one entry per occurrence rather than per line, as `rg --vimgrep` does. The column is a 1-based byte offset, so slice with `text.byteslice(column - 1, length)`.
+
 ### Ignore files
 
 By default, both `search` and `grep` respect `.ignore` and, inside a git repository, `.gitignore`, along with higher-precedence `.fdignore` for `Fdr.search` and `.rgignore` for `Fdr.grep`. `Fdr.search` also reads fd's global ignore file from `$XDG_CONFIG_HOME/fd/ignore` or `~/.config/fd/ignore`.

@@ -24,6 +24,9 @@ module Fdr
     include Error
   end
 
+  # `column: true` adds the 1-based byte column, as `rg --vimgrep`.
+  type grep_match = [String, Integer, String] | [String, Integer, Integer, String]
+
   type file_type = "f" | "file" | :f | :file
                  | "d" | "dir" | "directory" | :d | :dir | :directory
                  | "l" | "symlink" | :l | :symlink
@@ -58,6 +61,8 @@ module Fdr
     ?no_ignore: ::boolish,
     ?case_sensitive: ::boolish,
     ?content_case_sensitive: ::boolish,
+    ?text: ::boolish,
+    ?column: ::boolish,
     ?glob: ::boolish,
     ?full_path: ::boolish,
     ?follow: ::boolish,
@@ -71,5 +76,5 @@ module Fdr
     ?changed_before: Integer?,
     ?ignore_error: ::boolish,
     ?ignore_file: ::array[::path]
-  ) ?{ (String, Integer, String) -> void } -> Enumerator[[String, Integer, String]]
+  ) ?{ (*untyped) -> void } -> Enumerator[grep_match]
 end

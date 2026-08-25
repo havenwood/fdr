@@ -43,6 +43,8 @@ static NAME: LazyId = LazyId::new("name");
 static STRIP_CWD_PREFIX: LazyId = LazyId::new("strip_cwd_prefix");
 static IGNORE_ERROR: LazyId = LazyId::new("ignore_error");
 static IGNORE_FILE: LazyId = LazyId::new("ignore_file");
+static TEXT: LazyId = LazyId::new("text");
+static COLUMN: LazyId = LazyId::new("column");
 
 /// Rejects before coercion so caller `to_str` and `to_ary` errors remain intact.
 fn reject_type(ruby: &Ruby, value: Value, target: &str) -> Error {
@@ -799,13 +801,18 @@ fn stream_each(ruby: &Ruby, rb_self: Value) -> Result<Value, Error> {
                 let GrepMatch {
                     path: path_bytes,
                     line_number,
+                    column,
                     text: line_bytes,
                 } = matched;
                 let path = path_string(ruby, &path_bytes);
                 let text = line_string(ruby, &line_bytes);
                 drop(path_bytes);
                 drop(line_bytes);
-                let _: Value = ruby.yield_values((path, line_number, text))?;
+                let _: Value = match column {
+                    // Follow `rg --vimgrep` tuple order in column mode.
+                    Some(column) => ruby.yield_values((path, line_number, column, text))?,
+                    None => ruby.yield_values((path, line_number, text))?,
+                };
             }
             StreamNext::Outcome(Outcome::Done(result)) => {
                 result.map_err(|error| core_error(ruby, operation, &error))?;
@@ -849,6 +856,8 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<Enumerator, Error> {
     let config = GrepConfig {
         pattern,
         content_case_sensitive,
+        text: extract_optional_arg(kwargs, &TEXT)?.unwrap_or_default(),
+        column: extract_optional_arg(kwargs, &COLUMN)?.unwrap_or_default(),
         search,
     };
     let source: Obj<StreamSource> = ruby.obj_wrap(StreamSource::new(StreamConfig::Grep(config)));
