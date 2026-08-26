@@ -65,6 +65,8 @@ Fdr.grep(pattern: "module Fdr", paths: %w[lib]).group_by { |path,| path }
 
 Binary files are skipped at the first NUL. Pass `text: true` to scan them anyway, as `rg -a` does.
 
+`max_count:` caps matching lines per file, as `rg -m` does. `heap_limit:` caps memory used to read a line; oversized lines follow `ignore_error:`. Like `rg`, grep detects UTF-8 and UTF-16 byte order marks by default. `encoding:` accepts `"auto"`, `"none"` or a named encoding such as `"utf-16le"`, as `rg -E` does.
+
 `column: true` yields `path, line_number, column, text` instead, one entry per occurrence rather than per line, in the shape of `rg --vimgrep`. The column is a 1-based byte offset.
 
 `byte_range: true` yields `path, line_number, range, text` instead, where `range` is a zero-based byte `Range`, so `text.byteslice(range)` returns the match. It cannot be combined with `column: true`. Both occurrence modes keep a CR before LF in `text` so their offsets index it exactly.

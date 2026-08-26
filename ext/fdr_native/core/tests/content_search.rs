@@ -351,6 +351,20 @@ fn grep_follows_symlinks_when_enabled() {
 }
 
 #[test]
+#[cfg(unix)]
+fn grep_follows_an_explicit_file_symlink_without_follow() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let target = temp_dir.path().join("target.txt");
+    let link = temp_dir.path().join("link.txt");
+    fs::write(&target, "needle\n").expect("should write fixture");
+    std::os::unix::fs::symlink(&target, &link).expect("should create symlink");
+
+    let results = grep(&needle_in(search_under(&link))).expect("grep should succeed");
+
+    assert_eq!(results.len(), 1, "an explicit file root should be searched");
+}
+
+#[test]
 fn grep_skips_binary_files() {
     let temp_dir = TempDir::new().expect("should create temp dir");
     fs::write(temp_dir.path().join("binary.bin"), b"needle\n\0needle\n")
@@ -626,6 +640,59 @@ fn grep_skips_a_byte_order_mark_in_the_line_text() {
 
     let result = results.first().expect("should match one file");
     assert_eq!(result.lines, vec![(1, "needle here".to_string())]);
+}
+
+#[test]
+fn grep_detects_utf16_byte_order_marks_by_default_and_with_auto() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let path = temp_dir.path().join("utf16.txt");
+    let mut contents = vec![0xFF, 0xFE];
+    for unit in "needle café\n".encode_utf16() {
+        contents.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(&path, contents).expect("should write fixture");
+
+    for encoding in [None, Some("auto".to_owned())] {
+        let results = grep(&GrepConfig {
+            pattern: "^needle".to_owned(),
+            encoding,
+            search: search_under(&path),
+            ..Default::default()
+        })
+        .expect("grep should detect UTF-16");
+
+        assert_eq!(
+            results.first().expect("should find one file").lines,
+            vec![(1, "needle café".to_owned())]
+        );
+    }
+}
+
+#[test]
+fn grep_encoding_none_keeps_a_byte_order_mark_in_raw_input() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let path = temp_dir.path().join("utf8.txt");
+    fs::write(&path, "\u{feff}needle\n").expect("should write fixture");
+    let config = |pattern: &str| GrepConfig {
+        pattern: pattern.to_owned(),
+        encoding: Some("none".to_owned()),
+        search: search_under(&path),
+        ..Default::default()
+    };
+
+    assert!(
+        grep(&config("^needle"))
+            .expect("grep should succeed")
+            .is_empty()
+    );
+    assert_eq!(
+        grep(&config("needle"))
+            .expect("grep should succeed")
+            .first()
+            .expect("should find one file")
+            .lines,
+        vec![(1, "\u{feff}needle".to_owned())]
+    );
 }
 
 #[test]

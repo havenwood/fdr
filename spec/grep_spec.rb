@@ -129,6 +129,138 @@ describe "Fdr.grep" do
       assert_same first, second
     end
 
+    it "caps matching lines per file with max_count, as rg -m does" do
+      other = File.join(@tmpdir, "other.rb")
+      File.write(other, "needle\nneedle\nneedle\n")
+
+      capped = grep_results(pattern: "needle", paths: [@tmpdir], max_count: 1)
+
+      assert_equal [1], capped[other].keys
+      assert_equal 1, capped[@path].size, "the cap is per file, not per search"
+    end
+
+    it "bounds the per-worker search buffer with heap_limit" do
+      path = File.join(@tmpdir, "long-line.txt")
+      File.write(path, "needle #{"x" * 256}\n")
+
+      assert_empty Seen.each_line(pattern: "needle", paths: [path], heap_limit: 64).to_a
+      error = assert_raises(Seen::IOError) do
+        Seen.each_line(
+          pattern: "needle",
+          paths: [path],
+          heap_limit: 64,
+          ignore_error: false
+        ).to_a
+      end
+      assert_match(/configured allocation limit/, error.message)
+    end
+
+    it "does not walk or open files when max_count is zero" do
+      missing = File.join(@tmpdir, "missing")
+
+      assert_empty Fdr.grep(
+        pattern: "needle",
+        paths: [missing],
+        max_count: 0,
+        ignore_error: false
+      ).to_a
+    end
+
+    it "detects UTF-16 byte order marks by default, as rg does" do
+      path = File.join(@tmpdir, "utf16.txt")
+      File.binwrite(path, "\xFF\xFE".b + "needle wide\n".encode("UTF-16LE").b)
+
+      assert_equal [[path, 1, "needle wide"]],
+        Fdr.grep(pattern: "needle", paths: [path]).to_a
+      assert_equal [[path, 1, "needle wide"]],
+        Fdr.grep(pattern: "needle", paths: [path], encoding: "auto").to_a
+    end
+
+    it "reads a named encoding with encoding, as rg -E does" do
+      path = File.join(@tmpdir, "utf16.txt")
+      File.binwrite(path, "needle wide\n".encode("UTF-16LE").b)
+
+      assert_empty Fdr.grep(pattern: "needle", paths: [path]).to_a
+      assert_equal [[path, 1, "needle wide"]],
+        Fdr.grep(pattern: "needle", paths: [path], encoding: "utf-16le").to_a
+    end
+
+    it "lets a BOM override encoding, as rg -E does" do
+      path = File.join(@tmpdir, "utf16be.txt")
+      File.binwrite(path, "\xFE\xFF".b + "needle wide\n".encode("UTF-16BE").b)
+
+      assert_equal [[path, 1, "needle wide"]],
+        Fdr.grep(pattern: "needle", paths: [path], encoding: "utf-16le").to_a
+    end
+
+    it "tags explicitly decoded lines as UTF-8" do
+      path = File.join(@tmpdir, "utf16.txt")
+      File.binwrite(path, "\xFF\xFE".b + "needle café\n".encode("UTF-16LE").b)
+      original_external = Encoding.default_external
+      original_verbose = $VERBOSE
+      $VERBOSE = nil
+      Encoding.default_external = Encoding::ISO_8859_1
+      $VERBOSE = original_verbose
+
+      line = Fdr.grep(pattern: "needle", paths: [path], encoding: "utf-16le").first.last
+
+      assert_equal Encoding::UTF_8, line.encoding
+      assert_equal "needle café", line
+      assert line.frozen?
+    ensure
+      $VERBOSE = nil
+      Encoding.default_external = original_external if original_external
+      $VERBOSE = original_verbose
+    end
+
+    it "tags automatically decoded lines as UTF-8" do
+      path = File.join(@tmpdir, "utf16.txt")
+      File.binwrite(path, "\xFF\xFE".b + "needle café\n".encode("UTF-16LE").b)
+      original_external = Encoding.default_external
+      original_verbose = $VERBOSE
+      $VERBOSE = nil
+      Encoding.default_external = Encoding::ISO_8859_1
+      $VERBOSE = original_verbose
+
+      line = Fdr.grep(pattern: "needle", paths: [path]).first.last
+
+      assert_equal Encoding::UTF_8, line.encoding
+      assert_equal "needle café", line
+      assert line.frozen?
+    ensure
+      $VERBOSE = nil
+      Encoding.default_external = original_external if original_external
+      $VERBOSE = original_verbose
+    end
+
+    it "searches raw bytes with encoding none" do
+      path = File.join(@tmpdir, "utf8.txt")
+      File.binwrite(path, "\xEF\xBB\xBFneedle\n".b)
+
+      assert_empty Fdr.grep(pattern: "^needle", paths: [path], encoding: "none").to_a
+      _, _, line = Fdr.grep(pattern: "needle", paths: [path], encoding: "none").first
+      assert_equal "\xEF\xBB\xBFneedle".b, line.b
+      assert_equal Encoding.default_external, line.encoding
+    end
+
+    it "rejects an unknown encoding" do
+      error = assert_raises(Fdr::InvalidOption) do
+        Fdr.grep(pattern: "needle", paths: [@tmpdir], encoding: "nope-9").first
+      end
+
+      assert_match(/unknown encoding/, error.message)
+    end
+
+    it "rejects an unknown encoding before empty result shortcuts" do
+      [{paths: []}, {paths: [@tmpdir], min_depth: 2, max_depth: 1}, {max_count: 0}].each do |options|
+        error = assert_raises(Fdr::InvalidOption) do
+          Fdr.grep(pattern: "needle", encoding: "nope-9", **options).first
+        end
+
+        assert_match(/unknown encoding/, error.message)
+      end
+    end
+
     it "yields nothing when nothing matches" do
       results = Fdr.grep(pattern: "haystack", paths: [@tmpdir])
 

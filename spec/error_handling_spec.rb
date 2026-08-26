@@ -284,6 +284,13 @@ describe "Fdr error handling" do
       assert_match(/max_size must be a non-negative integer/, error.message)
     end
 
+    it "raises error for negative heap_limit" do
+      error = assert_raises(ArgumentError) do
+        Seen.each_line(pattern: "needle", paths: ["."], heap_limit: -1).first
+      end
+      assert_match(/heap_limit must be a non-negative integer/, error.message)
+    end
+
     it "raises error for negative changed_within" do
       error = assert_raises(ArgumentError) { search_results(paths: ["."], changed_within: -1) }
       assert_match(/changed_within must be a non-negative integer/, error.message)

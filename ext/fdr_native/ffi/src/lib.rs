@@ -47,6 +47,9 @@ static IGNORE_FILE: LazyId = LazyId::new("ignore_file");
 static TEXT: LazyId = LazyId::new("text");
 static COLUMN: LazyId = LazyId::new("column");
 static BYTE_RANGE: LazyId = LazyId::new("byte_range");
+static MAX_COUNT: LazyId = LazyId::new("max_count");
+static HEAP_LIMIT: LazyId = LazyId::new("heap_limit");
+static ENCODING: LazyId = LazyId::new("encoding");
 
 /// Rejects before coercion so caller `to_str` and `to_ary` errors remain intact.
 fn reject_type(ruby: &Ruby, value: Value, target: &str) -> Error {
@@ -745,10 +748,15 @@ fn path_string(ruby: &Ruby, path: &[u8]) -> RString {
     ruby.enc_str_new(path, ruby.filesystem_encoding())
 }
 
-/// Raw line in the external encoding, as with `File.readlines`. Frozen because
-/// occurrences on one line are handed the same `String`.
-fn line_string(ruby: &Ruby, line: &[u8]) -> RString {
-    let line = ruby.enc_str_new(line, ruby.default_external_encoding());
+/// Decoded lines are UTF-8. Raw lines use the external encoding.
+/// Every result is frozen so occurrences can safely share the same `String`.
+fn line_string(ruby: &Ruby, line: &[u8], utf8: bool) -> RString {
+    let encoding = if utf8 {
+        ruby.utf8_encoding()
+    } else {
+        ruby.default_external_encoding()
+    };
+    let line = ruby.enc_str_new(line, encoding);
     line.freeze();
     line
 }
@@ -810,12 +818,13 @@ fn stream_each(ruby: &Ruby, rb_self: Value) -> Result<Value, Error> {
                     line_number,
                     position,
                     text: line_bytes,
+                    utf8,
                 } = matched;
                 let path = path_string(ruby, &path_bytes);
                 let text = match line.as_ref() {
                     Some((cached, string)) if Arc::ptr_eq(cached, &line_bytes) => *string,
                     _ => {
-                        let string = line_string(ruby, line_bytes.as_ref());
+                        let string = line_string(ruby, line_bytes.as_ref(), utf8);
                         line = Some((Arc::clone(&line_bytes), string));
                         string
                     }
@@ -883,6 +892,9 @@ fn fdr_grep(ruby: &Ruby, args: &[Value]) -> Result<Enumerator, Error> {
         pattern,
         content_case_sensitive,
         text: extract_optional_arg(kwargs, &TEXT)?.unwrap_or_default(),
+        max_count: non_negative(ruby, kwargs, &MAX_COUNT, "max_count")?,
+        heap_limit: non_negative(ruby, kwargs, &HEAP_LIMIT, "heap_limit")?,
+        encoding: extract_string(ruby, kwargs, &ENCODING)?,
         format,
         search,
     };

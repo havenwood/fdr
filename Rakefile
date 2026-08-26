@@ -44,6 +44,11 @@ GEM_SMOKE_TEST = <<~'RUBY'
   raise 'Fdr.grep byte range smoke failed' unless match == [binary, 1, 3...4, "a\0a\r"]
   raise 'Fdr.grep byte range did not index text' unless match.last.byteslice(match[2]) == "\r"
 
+  utf16 = File.join(Dir.pwd, 'fdr-smoke-utf16.txt')
+  File.binwrite(utf16, "\xFF\xFE".b + "needle wide\n".encode('UTF-16LE').b)
+  expected = [[utf16, 1, 'needle wide']]
+  raise 'Fdr.grep BOM detection smoke failed' unless Fdr.grep(pattern: 'needle', paths: [utf16]).to_a == expected
+
   raise 'Fdr exposed removed search aliases' if Fdr.respond_to?(:entries) || Fdr.respond_to?(:scan)
 
   puts "Verified installed Fdr #{Fdr::VERSION}"

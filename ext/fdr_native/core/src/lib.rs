@@ -1,11 +1,14 @@
 use globset::GlobBuilder;
-use grep_matcher::Matcher;
+use grep_matcher::{LineTerminator, Matcher};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder};
+use grep_searcher::{BinaryDetection, Encoding, Searcher, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use regex::bytes::{Regex, RegexBuilder};
-use std::io::{self, Read, Seek};
+use std::cell::Cell;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,6 +50,11 @@ pub struct GrepConfig {
     pub content_case_sensitive: bool,
     /// Searches binary content past the first NUL, like `rg -a`.
     pub text: bool,
+    /// Caps matching lines per file, like `rg -m`.
+    pub max_count: Option<u64>,
+    /// Approximate per-worker search buffer limit in bytes.
+    pub heap_limit: Option<usize>,
+    pub encoding: Option<String>,
     pub format: GrepFormat,
     /// File filters, with `SearchConfig::pattern` matching names.
     pub search: SearchConfig,
@@ -57,6 +65,9 @@ impl Default for GrepConfig {
         Self {
             pattern: String::new(),
             content_case_sensitive: true,
+            max_count: None,
+            heap_limit: None,
+            encoding: None,
             text: false,
             format: GrepFormat::Line,
             search: SearchConfig::default(),
@@ -108,6 +119,8 @@ pub struct GrepMatch {
     pub line_number: u64,
     pub position: Option<GrepPosition>,
     pub text: Arc<[u8]>,
+    /// The searcher decoded this line to UTF-8.
+    pub utf8: bool,
 }
 
 #[derive(Debug)]
@@ -444,10 +457,24 @@ impl WalkEntry {
         }
     }
 
+    fn path_is_symlink(&self) -> bool {
+        match self {
+            Self::Normal(entry) => entry.path_is_symlink(),
+            Self::BrokenSymlink { .. } => true,
+        }
+    }
+
     fn metadata(&self) -> Option<std::fs::Metadata> {
         match self {
             Self::Normal(entry) => entry.metadata().ok(),
             Self::BrokenSymlink { metadata, .. } => Some(metadata.clone()),
+        }
+    }
+
+    fn inode(&self) -> Option<u64> {
+        match self {
+            Self::Normal(entry) => entry.ino(),
+            Self::BrokenSymlink { metadata, .. } => Some(metadata.ino()),
         }
     }
 }
@@ -868,6 +895,10 @@ where
 struct CancellableReader<'a, R> {
     inner: R,
     cancel: &'a AtomicBool,
+    sniff_bom: bool,
+    prefix: [u8; 3],
+    prefix_len: usize,
+    utf8: &'a Cell<bool>,
 }
 
 impl<R: Read> Read for CancellableReader<'_, R> {
@@ -876,7 +907,29 @@ impl<R: Read> Read for CancellableReader<'_, R> {
             return Err(io::Error::other("search cancelled"));
         }
 
-        self.inner.read(buffer)
+        let read = self.inner.read(buffer)?;
+        if !self.sniff_bom {
+            return Ok(read);
+        }
+
+        for byte in buffer.iter().copied().take(read) {
+            let Some(slot) = self.prefix.get_mut(self.prefix_len) else {
+                break;
+            };
+            *slot = byte;
+            self.prefix_len += 1;
+        }
+        let prefix = self.prefix.get(..self.prefix_len).unwrap_or(&self.prefix);
+        if prefix.starts_with(&[0xFF, 0xFE])
+            || prefix.starts_with(&[0xFE, 0xFF])
+            || prefix.starts_with(&[0xEF, 0xBB, 0xBF])
+        {
+            self.utf8.set(true);
+            self.sniff_bom = false;
+        } else if read == 0 || self.prefix_len == self.prefix.len() {
+            self.sniff_bom = false;
+        }
+        Ok(read)
     }
 }
 
@@ -900,6 +953,7 @@ struct LineEmitter<'a, 'b, F: Fn(Vec<GrepMatch>) -> bool> {
     cancel: &'a AtomicBool,
     matcher: Option<&'a RegexMatcher>,
     byte_range: bool,
+    utf8: &'a Cell<bool>,
     batch: &'a mut EmitBatch<'b, GrepMatch, F>,
 }
 
@@ -917,6 +971,7 @@ impl<F: Fn(Vec<GrepMatch>) -> bool> LineEmitter<'_, '_, F> {
                 line_number,
                 position,
                 text,
+                utf8: self.utf8.get(),
             },
             weight,
         )
@@ -974,18 +1029,56 @@ impl<F: Fn(Vec<GrepMatch>) -> bool> grep_searcher::Sink for LineEmitter<'_, '_, 
     }
 }
 
-fn build_searcher(text: bool) -> Searcher {
-    let binary = if text {
+#[derive(Clone, Debug)]
+struct GrepEncoding {
+    explicit: Option<Encoding>,
+    sniff_bom: bool,
+}
+
+/// Resolves once, so a bad label fails before the walk starts.
+fn build_encoding(config: &GrepConfig) -> Result<GrepEncoding, SearchError> {
+    match config.encoding.as_deref() {
+        None | Some("auto") => Ok(GrepEncoding {
+            explicit: None,
+            sniff_bom: true,
+        }),
+        Some("none") => Ok(GrepEncoding {
+            explicit: None,
+            sniff_bom: false,
+        }),
+        Some(label) => Encoding::new(label)
+            .map(|encoding| GrepEncoding {
+                explicit: Some(encoding),
+                sniff_bom: true,
+            })
+            .map_err(|error| SearchError::InvalidInput(error.to_string())),
+    }
+}
+
+struct GrepSearcher {
+    inner: Searcher,
+    encoding: GrepEncoding,
+}
+
+fn build_searcher(config: &GrepConfig, encoding: &GrepEncoding) -> GrepSearcher {
+    let binary = if config.text {
         BinaryDetection::none()
     } else {
         BinaryDetection::quit(b'\0')
     };
-    SearcherBuilder::new()
+    let inner = SearcherBuilder::new()
         .line_number(true)
+        .line_terminator(LineTerminator::byte(b'\n'))
+        .max_matches(config.max_count)
+        .heap_limit(config.heap_limit)
         .binary_detection(binary)
-        // Keep the file's own bytes: sniffing strips a BOM and transcodes UTF-16.
-        .bom_sniffing(false)
-        .build()
+        .bom_sniffing(encoding.sniff_bom)
+        .encoding(encoding.explicit.clone())
+        .build();
+    GrepSearcher {
+        inner,
+        encoding: encoding.clone(),
+    }
 }
 
 fn build_content_matcher(config: &GrepConfig) -> Result<RegexMatcher, SearchError> {
@@ -1011,18 +1104,38 @@ fn build_content_matcher(config: &GrepConfig) -> Result<RegexMatcher, SearchErro
     })
 }
 
-/// Skips a UTF-8 BOM for `^` without transcoding UTF-16.
-fn skip_utf8_bom(file: &mut std::fs::File) -> io::Result<()> {
-    const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
 
-    let mut head = [0_u8; 3];
-    match file.read_exact(&mut head) {
-        Ok(()) if head == BOM => Ok(()),
-        Ok(()) => file.seek(io::SeekFrom::Start(0)).map(drop),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-            file.seek(io::SeekFrom::Start(0)).map(drop)
+impl FileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
         }
-        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GrepCandidate {
+    path: PathBuf,
+    identity: FileIdentity,
+    len: u64,
+    follow: bool,
+}
+
+fn candidate_error(
+    entry: &WalkEntry,
+    raise_on_error: bool,
+    error: &io::Error,
+) -> Result<Option<GrepCandidate>, SearchError> {
+    if raise_on_error {
+        Err(file_io_error(entry.path(), error))
+    } else {
+        Ok(None)
     }
 }
 
@@ -1030,7 +1143,7 @@ fn grep_candidate(
     entry: &WalkEntry,
     filters: &EntryFilters,
     raise_on_error: bool,
-) -> Result<bool, SearchError> {
+) -> Result<Option<GrepCandidate>, SearchError> {
     if !entry
         .file_type()
         .is_some_and(|file_type| file_type.is_file())
@@ -1041,56 +1154,119 @@ fn grep_candidate(
                 &io::Error::other("not a regular file"),
             ));
         }
-        return Ok(false);
+        return Ok(None);
     }
 
     if let Some(min_depth) = filters.min_depth
         && entry.depth().is_none_or(|depth| depth < min_depth)
     {
-        return Ok(false);
+        return Ok(None);
     }
 
-    Ok(filters.matches(entry))
+    if !filters.matches(entry) {
+        return Ok(None);
+    }
+
+    // `ignore` deliberately follows an explicit file root, like `rg`, even
+    // when recursive symlink following is disabled.
+    let follow = filters.follow || (entry.depth() == Some(0) && entry.path_is_symlink());
+    let metadata = if follow {
+        entry.path().metadata().ok()
+    } else {
+        filters.entry_metadata(entry)
+    };
+    let Some(metadata) = metadata else {
+        return candidate_error(
+            entry,
+            raise_on_error,
+            &io::Error::other("could not inspect regular file"),
+        );
+    };
+    if !metadata.file_type().is_file() {
+        return candidate_error(
+            entry,
+            raise_on_error,
+            &io::Error::other("not a regular file"),
+        );
+    }
+    if entry
+        .inode()
+        .filter(|inode| *inode != 0)
+        .is_some_and(|walked_inode| walked_inode != metadata.ino())
+    {
+        return candidate_error(
+            entry,
+            raise_on_error,
+            &io::Error::other("file changed during traversal"),
+        );
+    }
+
+    Ok(Some(GrepCandidate {
+        path: entry.path().to_owned(),
+        identity: FileIdentity::from_metadata(&metadata),
+        len: metadata.len(),
+        follow,
+    }))
 }
 
-/// Scans until the first NUL, retaining earlier matches like `rg`.
+/// Opens without blocking on a replaced FIFO, then validates the descriptor.
+fn open_regular_file(path: &Path, expected: FileIdentity, follow: bool) -> io::Result<File> {
+    let mut flags = libc::O_NONBLOCK;
+    if !follow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    if FileIdentity::from_metadata(&metadata) != expected {
+        return Err(io::Error::other("file changed while opening"));
+    }
+
+    Ok(file)
+}
+
 fn grep_file<F: Fn(Vec<GrepMatch>) -> bool>(
-    searcher: &mut Searcher,
+    searcher: &mut GrepSearcher,
     matcher: &RegexMatcher,
-    path: &Path,
+    candidate: &GrepCandidate,
     cancel: &AtomicBool,
     filters: &EntryFilters,
     config: &GrepConfig,
     batch: &mut EmitBatch<'_, GrepMatch, F>,
 ) -> Result<(), SearchError> {
-    let mut file = match std::fs::File::open(path) {
+    let path = &candidate.path;
+    let file = match open_regular_file(path, candidate.identity, candidate.follow) {
         Ok(file) => file,
         Err(error) if config.search.raise_on_error => {
             return Err(file_io_error(path, &error));
         }
         Err(_) => return Ok(()),
     };
-    if let Err(error) = skip_utf8_bom(&mut file) {
-        return if config.search.raise_on_error {
-            Err(file_io_error(path, &error))
-        } else {
-            Ok(())
-        };
-    }
 
+    let utf8 = Cell::new(searcher.encoding.explicit.is_some());
     let reader = CancellableReader {
         inner: file,
         cancel,
+        sniff_bom: searcher.encoding.sniff_bom && searcher.encoding.explicit.is_none(),
+        prefix: [0; 3],
+        prefix_len: 0,
+        utf8: &utf8,
     };
     let mut sink = LineEmitter {
         path: Arc::from(emitted_path(path, filters.strip_cwd_prefix).as_slice()),
         cancel,
         matcher: config.occurrence_mode().then_some(matcher),
         byte_range: config.format == GrepFormat::ByteRange,
+        utf8: &utf8,
         batch,
     };
 
-    match searcher.search_reader(matcher, reader, &mut sink) {
+    match searcher.inner.search_reader(matcher, reader, &mut sink) {
         Err(_) if cancel.load(Ordering::Relaxed) => Err(SearchError::Cancelled),
         Err(error) if config.search.raise_on_error => Err(file_io_error(path, &error)),
         Ok(()) | Err(_) => Ok(()),
@@ -1110,10 +1286,11 @@ fn serial_grep(
     matcher: &RegexMatcher,
     filters: &EntryFilters,
     config: &GrepConfig,
+    encoding: &GrepEncoding,
     cancel: &AtomicBool,
     stopped: &AtomicBool,
 ) -> Result<Option<Vec<GrepMatch>>, SearchError> {
-    let mut searcher = build_searcher(config.text);
+    let mut searcher = build_searcher(config, encoding);
     let mut scanned_bytes = 0_u64;
     let collected = Mutex::new(Vec::new());
     let overflowed = AtomicBool::new(false);
@@ -1142,11 +1319,11 @@ fn serial_grep(
             continue;
         };
 
-        if !grep_candidate(&entry, filters, config.search.raise_on_error)? {
+        let Some(candidate) = grep_candidate(&entry, filters, config.search.raise_on_error)? else {
             continue;
-        }
+        };
 
-        scanned_bytes = scanned_bytes.saturating_add(entry.metadata().map_or(0, |m| m.len()));
+        scanned_bytes = scanned_bytes.saturating_add(candidate.len);
         if scanned_bytes > GREP_SERIAL_MAX_BYTES {
             return Ok(None);
         }
@@ -1154,7 +1331,7 @@ fn serial_grep(
         grep_file(
             &mut searcher,
             matcher,
-            &entry.into_path(),
+            &candidate,
             cancel,
             filters,
             config,
@@ -1186,10 +1363,15 @@ where
 {
     let matcher = build_content_matcher(config)?;
     let filters = EntryFilters::new(&config.search)?;
-    let Some(builder) = build_walker(&config.search, ".rgignore", None)? else {
+    let builder = build_walker(&config.search, ".rgignore", None)?;
+    let encoding = build_encoding(config)?;
+    let Some(builder) = builder else {
         return Ok(());
     };
     if depth_range_is_empty(&config.search) {
+        return Ok(());
+    }
+    if config.max_count == Some(0) {
         return Ok(());
     }
 
@@ -1198,7 +1380,9 @@ where
     // per byte, which would both defeat an early stop and outweigh the spawn it
     // saves.
     if !config.occurrence_mode() {
-        match serial_grep(&builder, &matcher, &filters, config, cancel, &stopped)? {
+        match serial_grep(
+            &builder, &matcher, &filters, config, &encoding, cancel, &stopped,
+        )? {
             Some(buffered) => {
                 if !buffered.is_empty() {
                     emit(buffered);
@@ -1215,7 +1399,8 @@ where
         let filters = &filters;
         let stopped = &stopped;
         let failure = &failure;
-        let mut searcher = build_searcher(config.text);
+        let encoding = encoding.clone();
+        let mut searcher = build_searcher(config, &encoding);
         let mut batch = EmitBatch::new(&emit, stopped);
 
         Box::new(move |entry| {
@@ -1240,11 +1425,11 @@ where
                     return WalkState::Quit;
                 }
             };
-            if candidate
+            if let Some(candidate) = candidate
                 && let Err(error) = grep_file(
                     &mut searcher,
                     matcher,
-                    &entry.into_path(),
+                    &candidate,
                     cancel,
                     filters,
                     config,
@@ -1372,6 +1557,62 @@ mod tests {
         assert_eq!(path_into_bytes(path, false), b"bad\xffname.txt");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn grep_candidate_rejects_a_file_replaced_during_traversal() {
+        let temp_dir = TempDir::new().expect("should create temp dir");
+        let path = temp_dir.path().join("candidate.txt");
+        let redirect = temp_dir.path().join("redirect.txt");
+        std::fs::write(&path, b"original").expect("should write candidate");
+        std::fs::write(&redirect, b"redirect").expect("should write redirect");
+
+        let config = SearchConfig {
+            paths: vec![path.clone()],
+            follow: true,
+            ..Default::default()
+        };
+        let filters = EntryFilters::new(&config).expect("should build filters");
+        let builder = build_walker(&config, ".rgignore", None)
+            .expect("should build walker")
+            .expect("path should produce a walker");
+        let entry = walk_entry(
+            builder
+                .build()
+                .next()
+                .expect("walker should yield candidate"),
+            true,
+        )
+        .expect("walk should succeed")
+        .expect("candidate should exist");
+
+        std::fs::remove_file(&path).expect("should remove candidate");
+        std::os::unix::fs::symlink(&redirect, &path).expect("should replace with symlink");
+
+        let error =
+            grep_candidate(&entry, &filters, true).expect_err("replacement should not be searched");
+        assert!(error.to_string().contains("file changed during traversal"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_rejects_a_symlink_replacement() {
+        let temp_dir = TempDir::new().expect("should create temp dir");
+        let path = temp_dir.path().join("candidate.txt");
+        let redirect = temp_dir.path().join("redirect.txt");
+        std::fs::write(&path, b"original").expect("should write candidate");
+        std::fs::write(&redirect, b"redirect").expect("should write redirect");
+        let expected =
+            FileIdentity::from_metadata(&path.metadata().expect("candidate should have metadata"));
+
+        std::fs::remove_file(&path).expect("should remove candidate");
+        std::os::unix::fs::symlink(&redirect, &path).expect("should replace with symlink");
+
+        assert!(open_regular_file(&path, expected, false).is_err());
+        let error = open_regular_file(&path, expected, true)
+            .expect_err("followed replacement should have the wrong identity");
+        assert_eq!(error.to_string(), "file changed while opening");
+    }
+
     #[test]
     fn grep_reader_checks_cancellation_between_buffers() {
         struct CancelAfterFirstRead<'a> {
@@ -1393,17 +1634,23 @@ mod tests {
         }
 
         let cancel = AtomicBool::new(false);
+        let utf8 = Cell::new(false);
         let reader = CancellableReader {
             inner: CancelAfterFirstRead {
                 cancel: &cancel,
                 emitted: false,
             },
             cancel: &cancel,
+            sniff_bom: true,
+            prefix: [0; 3],
+            prefix_len: 0,
+            utf8: &utf8,
         };
         let matcher = RegexMatcherBuilder::new()
             .build("needle")
             .expect("should compile regex");
-        let mut searcher = build_searcher(false);
+        let encoding = build_encoding(&GrepConfig::default()).expect("encoding should resolve");
+        let mut searcher = build_searcher(&GrepConfig::default(), &encoding);
         let stopped = AtomicBool::new(false);
         let drop_batch = |_: Vec<GrepMatch>| true;
         let mut batch = EmitBatch::new(&drop_batch, &stopped);
@@ -1412,10 +1659,12 @@ mod tests {
             cancel: &cancel,
             matcher: None,
             byte_range: false,
+            utf8: &utf8,
             batch: &mut batch,
         };
 
         let error = searcher
+            .inner
             .search_reader(&matcher, reader, &mut sink)
             .expect_err("cancelled reader should stop the search");
 
