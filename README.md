@@ -95,6 +95,32 @@ require "timeout"
 Timeout.timeout(5) { Seen.each_line(pattern: "TODO", paths: %w[lib]).to_a }
 ```
 
+`Seen` also works with Async:
+
+```ruby
+require "async"
+require "seen"
+
+queries = [
+  {pattern: "TODO", paths: %w[lib]},
+  {pattern: "unsafe", paths: %w[ext]}
+]
+
+matches = Sync do |task|
+  queries.map do |options|
+    task.async do |job|
+      job.with_timeout(5) do
+        Seen.each_line(**options).first(20)
+      end
+    end
+  end.flat_map(&:wait)
+end
+
+matches.each do |path, line, text|
+  puts "#{path}:#{line}: #{text}"
+end
+```
+
 Nothing is walked until the `Enumerator` is consumed, so a bad `pattern` or `exclude` raises then, not at the call. Take what you need with `first`, `take`, `filter` or `to_a`.
 
 `Seen` leaves out `fd`'s owner and exotic type filters and smart case, and `rg`'s context lines, literal and multiline matching, inverted matches and replacements.
