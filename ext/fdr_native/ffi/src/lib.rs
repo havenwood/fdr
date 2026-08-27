@@ -9,12 +9,13 @@ use magnus::typed_data::Obj;
 use magnus::value::LazyId;
 use magnus::{
     DataTypeFunctions, Enumerator, Error, ExceptionClass, RArray, RHash, RModule, RString, Ruby,
-    Symbol, TryConvert, TypedData, Value, function, method, prelude::*,
+    Symbol, TryConvert, TypedData, Value, function, kwargs, method, prelude::*,
 };
 use std::collections::VecDeque;
-use std::ffi::c_void;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, Weak};
@@ -123,65 +124,6 @@ fn extract_boolish(hash: RHash, key: &LazyId, default: bool) -> Result<bool, Err
         .map(|value| value.unwrap_or(default))
 }
 
-/// Runs `func` without the GVL and must not call Ruby. Interrupts call
-/// `unblock(arg)`. `None` means `func` never started.
-#[allow(
-    unsafe_code,
-    reason = "MRI's no-GVL API uses raw pointers and C callbacks"
-)]
-fn without_gvl<F, R, A>(func: F, unblock: unsafe extern "C" fn(*mut c_void), arg: &A) -> Option<R>
-where
-    F: FnOnce() -> R + Send,
-    R: Send,
-    A: Sync,
-{
-    struct CallState<F, R> {
-        func: Option<F>,
-        result: Option<std::thread::Result<R>>,
-    }
-
-    unsafe extern "C" fn call<F: FnOnce() -> R, R>(state: *mut c_void) -> *mut c_void {
-        // SAFETY: `state` points to the `CallState` below, alive for this synchronous call.
-        let state = unsafe { &mut *state.cast::<CallState<F, R>>() };
-        if let Some(func) = state.func.take() {
-            state.result = Some(catch_unwind(AssertUnwindSafe(func)));
-        }
-        ptr::null_mut()
-    }
-
-    let mut state = CallState::<F, R> {
-        func: Some(func),
-        result: None,
-    };
-    // SAFETY: the callback runs synchronously while `state` is alive. `F`, `R`,
-    // and `A` are safe to send or share when Ruby offloads work, and Ruby may
-    // invoke `unblock` with `arg` from another thread while the callback runs.
-    #[cfg(ruby_gte_3_4)]
-    unsafe {
-        rb_sys::rb_nogvl(
-            Some(call::<F, R>),
-            (&raw mut state).cast(),
-            Some(unblock),
-            ptr::from_ref(arg).cast_mut().cast(),
-            (rb_sys::RB_NOGVL_INTR_FAIL | rb_sys::RB_NOGVL_OFFLOAD_SAFE).cast_signed(),
-        );
-    }
-    #[cfg(not(ruby_gte_3_4))]
-    unsafe {
-        rb_sys::rb_thread_call_without_gvl2(
-            Some(call::<F, R>),
-            (&raw mut state).cast(),
-            Some(unblock),
-            ptr::from_ref(arg).cast_mut().cast(),
-        );
-    }
-    match state.result {
-        Some(Ok(result)) => Some(result),
-        Some(Err(panic)) => resume_unwind(panic),
-        None => None,
-    }
-}
-
 enum Outcome {
     Done(Result<(), SearchError>),
     Panicked(Box<dyn std::any::Any + Send>),
@@ -222,70 +164,82 @@ impl ActiveEvent {
 
 struct StreamState {
     events: VecDeque<StreamEvent>,
-    active: Option<ActiveEvent>,
     outcome: Option<Outcome>,
-    interrupted: bool,
 }
 
 enum StreamNext {
-    Item(StreamItem),
+    Event(StreamEvent),
     Outcome(Outcome),
-    Interrupted,
+}
+
+struct StreamSignal {
+    reader: UnixStream,
+    writer: UnixStream,
+}
+
+impl StreamSignal {
+    fn new() -> std::io::Result<Self> {
+        let (reader, writer) = UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        writer.set_nonblocking(true)?;
+        Ok(Self { reader, writer })
+    }
+
+    fn reader_fd(&self) -> RawFd {
+        self.reader.as_raw_fd()
+    }
+
+    fn notify(&self) {
+        drop((&self.writer).write(&[1]));
+    }
+
+    fn drain(&self) {
+        let mut bytes = [0; 64];
+        loop {
+            match (&self.reader).read(&mut bytes) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
 }
 
 impl StreamState {
-    fn take_next(&mut self) -> Option<(StreamNext, bool)> {
-        if std::mem::replace(&mut self.interrupted, false) {
-            return Some((StreamNext::Interrupted, false));
+    fn take_next(&mut self) -> Option<StreamNext> {
+        if let Some(event) = self.events.pop_front() {
+            return Some(StreamNext::Event(event));
         }
 
-        let mut released = false;
-        loop {
-            if let Some(active) = &mut self.active {
-                if let Some(item) = active.next() {
-                    return Some((StreamNext::Item(item), released));
-                }
-                self.active = None;
-            }
-            if let Some(event) = self.events.pop_front() {
-                self.active = Some(event.into());
-                released = true;
-                continue;
-            }
-            return self
-                .outcome
-                .take()
-                .map(|outcome| (StreamNext::Outcome(outcome), released));
-        }
+        self.outcome.take().map(StreamNext::Outcome)
     }
 }
 
 struct StreamSession {
     pid: u32,
     state: Mutex<StreamState>,
-    ready: Condvar,
     space: Condvar,
     cancelled: AtomicBool,
     capacity: usize,
+    signal: StreamSignal,
 }
 
 impl StreamSession {
-    fn new() -> Self {
+    fn new() -> std::io::Result<Self> {
         let capacity = fdr_core::queue_capacity();
 
-        Self {
+        Ok(Self {
             pid: std::process::id(),
             state: Mutex::new(StreamState {
                 events: VecDeque::with_capacity(capacity),
-                active: None,
                 outcome: None,
-                interrupted: false,
             }),
-            ready: Condvar::new(),
             space: Condvar::new(),
             cancelled: AtomicBool::new(false),
             capacity,
-        }
+            signal: StreamSignal::new()?,
+        })
     }
 
     fn inherited(&self) -> bool {
@@ -313,7 +267,7 @@ impl StreamSession {
 
         state.events.push_back(event);
         drop(state);
-        self.ready.notify_one();
+        self.signal();
         true
     }
 
@@ -327,21 +281,7 @@ impl StreamSession {
         }
         state.outcome = Some(outcome);
         drop(state);
-        self.ready.notify_all();
-    }
-
-    fn interrupt(&self) {
-        if self.inherited() {
-            return;
-        }
-
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.interrupted = true;
-        drop(state);
-        self.ready.notify_all();
+        self.signal();
     }
 
     /// Locks before notifying so cancellation cannot race a producer's wait.
@@ -356,15 +296,23 @@ impl StreamSession {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
-                std::mem::take(&mut state.events),
-                state.active.take(),
-                state.outcome.take(),
-            )
+            (std::mem::take(&mut state.events), state.outcome.take())
         };
         drop(payload);
-        self.ready.notify_all();
         self.space.notify_all();
+        self.signal();
+    }
+
+    fn signal(&self) {
+        self.signal.notify();
+    }
+
+    fn signal_fd(&self) -> RawFd {
+        self.signal.reader_fd()
+    }
+
+    fn drain_signal(&self) {
+        self.signal.drain();
     }
 
     fn take_ready(&self) -> Option<StreamNext> {
@@ -376,49 +324,29 @@ impl StreamSession {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (next, released) = state.take_next()?;
+        let next = state.take_next()?;
+        let released = matches!(&next, StreamNext::Event(_));
         drop(state);
         if released {
-            self.space.notify_all();
+            self.space.notify_one();
         }
         Some(next)
     }
 
-    /// Waits without the GVL for a result, completion, or interrupt.
-    fn wait(&self) -> StreamNext {
-        if self.inherited() {
-            return Self::cancelled();
-        }
-
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// Uses Magnus's safe MRI wrapper to wait without blocking other threads.
+    fn wait(&self, ruby: &Ruby) -> Result<StreamNext, Error> {
         loop {
-            if let Some((next, released)) = state.take_next() {
-                drop(state);
-                if released {
-                    self.space.notify_all();
-                }
-                return next;
+            if let Some(next) = self.take_ready() {
+                return Ok(next);
             }
-            state = self
-                .ready
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            self.drain_signal();
+            if let Some(next) = self.take_ready() {
+                return Ok(next);
+            }
+            ruby.thread_wait_fd(&self.signal.reader)?;
         }
     }
-}
-
-#[allow(
-    unsafe_code,
-    reason = "MRI invokes the unblock callback through a raw pointer"
-)]
-unsafe extern "C" fn wake_stream(session: *mut c_void) {
-    // SAFETY: `session` points into an `Arc<StreamSession>` that outlives the
-    // synchronous `without_gvl` call.
-    let session = unsafe { &*session.cast::<StreamSession>() };
-    session.interrupt();
 }
 
 enum StreamConfig {
@@ -451,7 +379,14 @@ impl StreamSource {
     }
 
     fn start(&self, ruby: &Ruby) -> Result<Arc<StreamSession>, Error> {
-        let session = Arc::new(StreamSession::new());
+        let session = Arc::new(StreamSession::new().map_err(|error| {
+            fdr_error(
+                ruby,
+                "IOError",
+                ruby.exception_io_error(),
+                format!("could not create the search signal: {error}"),
+            )
+        })?);
         let worker_session = Arc::clone(&session);
         let config = Arc::clone(&self.config);
 
@@ -788,68 +723,124 @@ fn core_error(ruby: &Ruby, operation: &str, error: &SearchError) -> Error {
     }
 }
 
-fn stream_each(ruby: &Ruby, rb_self: Value) -> Result<Value, Error> {
-    let source: &StreamSource = TryConvert::try_convert(rb_self)?;
-    let operation = source.operation();
-    let session = source.start(ruby)?;
-    let _stop = StopStream(session.as_ref());
-    // Retaining the Arc makes identity safe across batch boundaries.
-    let mut line: Option<(Arc<[u8]>, RString)> = None;
+struct SchedulerWait {
+    scheduler: Value,
+    io: Value,
+}
 
-    loop {
-        let next = session.take_ready().map_or_else(
-            || without_gvl(|| session.wait(), wake_stream, session.as_ref()),
-            Some,
-        );
-        ruby.thread_check_ints()?;
-        let Some(next) = next else {
-            continue;
-        };
+impl SchedulerWait {
+    fn new(ruby: &Ruby, session: &StreamSession, scheduler: Value) -> Result<Self, Error> {
+        let fd = session.signal_fd();
+        let io: Value = ruby
+            .class_io()
+            .funcall("for_fd", (fd, kwargs!(ruby, "autoclose" => false)))?;
+        Ok(Self { scheduler, io })
+    }
 
-        match next {
-            StreamNext::Item(StreamItem::Search(bytes)) => {
-                let path = path_string(ruby, &bytes);
-                drop(bytes);
-                let _: Value = ruby.yield_value(path)?;
-            }
-            StreamNext::Item(StreamItem::Grep(matched)) => {
-                let GrepMatch {
-                    path: path_bytes,
-                    line_number,
-                    position,
-                    text: line_bytes,
-                    utf8,
-                } = matched;
-                let path = path_string(ruby, &path_bytes);
-                let text = match line.as_ref() {
+    fn wait(&self) -> Result<(), Error> {
+        let _: Value = self.scheduler.funcall("io_wait", (self.io, 1))?;
+        Ok(())
+    }
+}
+
+fn yield_stream_item(
+    ruby: &Ruby,
+    item: StreamItem,
+    line: &mut Option<(Arc<[u8]>, RString)>,
+) -> Result<(), Error> {
+    match item {
+        StreamItem::Search(bytes) => {
+            let path = path_string(ruby, &bytes);
+            drop(bytes);
+            let _: Value = ruby.yield_value(path)?;
+        }
+        StreamItem::Grep(matched) => {
+            let GrepMatch {
+                path: path_bytes,
+                line_number,
+                position,
+                text: line_bytes,
+                utf8,
+            } = matched;
+            let path = path_string(ruby, &path_bytes);
+            let text = if position.is_none() {
+                line_string(ruby, line_bytes.as_ref(), utf8)
+            } else {
+                match line.as_ref() {
                     Some((cached, string)) if Arc::ptr_eq(cached, &line_bytes) => *string,
                     _ => {
                         let string = line_string(ruby, line_bytes.as_ref(), utf8);
-                        line = Some((Arc::clone(&line_bytes), string));
+                        *line = Some((Arc::clone(&line_bytes), string));
                         string
                     }
-                };
-                drop(path_bytes);
-                drop(line_bytes);
-                let _: Value = match position {
-                    Some(GrepPosition::Column(column)) => {
-                        ruby.yield_values((path, line_number, column, text))?
-                    }
-                    // A `Range` so `text.byteslice(range)` returns the match,
-                    // with the exclusive end `rg --json` reports.
-                    Some(GrepPosition::ByteRange { offset, length }) => {
-                        let range = ruby.range_new(offset, offset.saturating_add(length), true)?;
-                        ruby.yield_values((path, line_number, range, text))?
-                    }
-                    None => ruby.yield_values((path, line_number, text))?,
-                };
+                }
+            };
+            drop(path_bytes);
+            drop(line_bytes);
+            let _: Value = match position {
+                Some(GrepPosition::Column(column)) => {
+                    ruby.yield_values((path, line_number, column, text))?
+                }
+                // A `Range` so `text.byteslice(range)` returns the match,
+                // with the exclusive end `rg --json` reports.
+                Some(GrepPosition::ByteRange { offset, length }) => {
+                    let range = ruby.range_new(offset, offset.saturating_add(length), true)?;
+                    ruby.yield_values((path, line_number, range, text))?
+                }
+                None => ruby.yield_values((path, line_number, text))?,
+            };
+        }
+    }
+    Ok(())
+}
+
+fn stream_each(ruby: &Ruby, rb_self: Value) -> Result<Value, Error> {
+    let source: &StreamSource = TryConvert::try_convert(rb_self)?;
+    let operation = source.operation();
+    let fiber: Value = ruby.class_object().const_get("Fiber")?;
+    let scheduler: Value = fiber.funcall("scheduler", ())?;
+    let current: Value = fiber.funcall("current", ())?;
+    let scheduler_enabled =
+        !scheduler.is_nil() && !current.funcall::<_, _, bool>("blocking?", ())?;
+    let session = source.start(ruby)?;
+    let scheduler_wait = scheduler_enabled
+        .then(|| SchedulerWait::new(ruby, session.as_ref(), scheduler))
+        .transpose()?;
+    let _stop = StopStream(session.as_ref());
+    // Retaining the Arc makes identity safe across batch boundaries.
+    let mut line: Option<(Arc<[u8]>, RString)> = None;
+    let mut active: Option<ActiveEvent> = None;
+
+    loop {
+        if let Some(item) = active.as_mut().and_then(ActiveEvent::next) {
+            ruby.thread_check_ints()?;
+            yield_stream_item(ruby, item, &mut line)?;
+            continue;
+        }
+        drop(active.take());
+        let next = if let Some(wait) = &scheduler_wait {
+            loop {
+                if let Some(next) = session.take_ready() {
+                    break next;
+                }
+                session.drain_signal();
+                if let Some(next) = session.take_ready() {
+                    break next;
+                }
+                wait.wait()?;
             }
+        } else {
+            session.wait(ruby)?
+        };
+        ruby.thread_check_ints()?;
+
+        match next {
+            StreamNext::Event(event) => active = Some(event.into()),
             StreamNext::Outcome(Outcome::Done(result)) => {
                 result.map_err(|error| core_error(ruby, operation, &error))?;
                 return Ok(ruby.qnil().as_value());
             }
             StreamNext::Outcome(Outcome::Panicked(panic)) => resume_unwind(panic),
-            StreamNext::Interrupted => {}
         }
     }
 }
@@ -939,10 +930,14 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    fn session() -> StreamSession {
+        StreamSession::new().expect("session should initialize")
+    }
+
     #[test]
     fn dropping_a_source_cancels_its_active_session() {
         let source = StreamSource::new(StreamConfig::Search(SearchConfig::default()));
-        let session = Arc::new(StreamSession::new());
+        let session = Arc::new(session());
         source
             .sessions
             .lock()
@@ -960,7 +955,7 @@ mod tests {
         const TRIALS: usize = 2_000;
 
         for trial in 0..TRIALS {
-            let session = Arc::new(StreamSession::new());
+            let session = Arc::new(session());
             for index in 0..session.capacity {
                 assert!(session.push(StreamEvent::Search(vec![index.to_string().into_bytes()])));
             }
@@ -994,24 +989,24 @@ mod tests {
     }
 
     #[test]
-    fn ready_items_keep_event_order() {
-        let session = StreamSession::new();
+    fn ready_events_keep_batch_order() {
+        let session = session();
         assert!(session.push(StreamEvent::Search(vec![b"first".to_vec()])));
         assert!(session.push(StreamEvent::Search(vec![b"second".to_vec()])));
 
         assert!(matches!(
-            session.wait(),
-            StreamNext::Item(StreamItem::Search(path)) if path == b"first"
+            session.take_ready(),
+            Some(StreamNext::Event(StreamEvent::Search(paths))) if paths == [b"first".to_vec()]
         ));
         assert!(matches!(
             session.take_ready(),
-            Some(StreamNext::Item(StreamItem::Search(path))) if path == b"second"
+            Some(StreamNext::Event(StreamEvent::Search(paths))) if paths == [b"second".to_vec()]
         ));
     }
 
     #[test]
-    fn cancellation_drains_queued_and_active_events() {
-        let session = StreamSession::new();
+    fn cancellation_drains_queued_events() {
+        let session = session();
         assert!(session.push(StreamEvent::Search(vec![
             b"first".to_vec(),
             b"second".to_vec(),
@@ -1023,7 +1018,6 @@ mod tests {
 
         let state = session.state.lock().expect("state lock should work");
         assert!(state.events.is_empty());
-        assert!(state.active.is_none());
         drop(state);
     }
 }

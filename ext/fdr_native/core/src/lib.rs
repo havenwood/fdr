@@ -681,10 +681,10 @@ fn parallel_search_required(directories: usize) -> bool {
 }
 
 /// Limits discarded pre-scan work and first-result buffering.
-const SERIAL_PRESCAN_ENTRIES: usize = 512;
+const SERIAL_PRESCAN_ENTRIES: usize = 64;
 
 /// Limits discarded work during serial grep pre-scan.
-const GREP_SERIAL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const GREP_SERIAL_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Bounds what the pre-scan buffers, since one line holds as many occurrences
 /// as bytes and `GREP_SERIAL_MAX_BYTES` alone would allow millions.

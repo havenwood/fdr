@@ -75,19 +75,25 @@ describe "Fdr concurrency" do
     count
   end
 
-  def scheduler_with_worker_pool
+  def scheduler_probe
     Class.new do
-      attr_reader :blocking_operations
+      attr_reader :blocking_operations, :io_waits
 
       def initialize
         @blocking_operations = 0
+        @io_waits = 0
       end
 
       def block(*) = false
       def unblock(*) = nil
       def kernel_sleep(*) = 0
-      def io_wait(*) = 0
       def close = nil
+
+      def io_wait(io, events, timeout = nil)
+        @io_waits += 1
+        IO.select([io], nil, nil, timeout)
+        events
+      end
 
       def fiber(&block)
         Fiber.new(blocking: false, &block).tap(&:resume)
@@ -195,17 +201,16 @@ describe "Fdr concurrency" do
     assert_predicate during, :positive?, "other threads should run during Fdr.grep"
   end
 
-  it "offloads waits through Ruby 3.4's scheduler hook" do
-    skip "requires Ruby 3.4 or newer" if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.4")
-
-    scheduler = scheduler_with_worker_pool
+  it "waits through scheduler-visible IO readiness" do
+    scheduler = scheduler_probe
     Fiber.set_scheduler(scheduler)
     results = nil
     Fiber.schedule { results = Fdr.search(paths: [@dir], type: "f").to_a }
     Fiber.set_scheduler(nil)
 
     assert_equal 200, results.length
-    assert_predicate scheduler.blocking_operations, :positive?
+    assert_predicate scheduler.io_waits, :positive?
+    assert_equal 0, scheduler.blocking_operations
   ensure
     Fiber.set_scheduler(nil) if scheduler && Fiber.scheduler.equal?(scheduler)
   end

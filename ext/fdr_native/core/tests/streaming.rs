@@ -66,6 +66,34 @@ fn search_stream_stops_the_walk_on_an_early_stop() {
 }
 
 #[test]
+fn search_stream_emits_before_finishing_a_large_flat_tree() {
+    let directory = TempDir::new().expect("should create temp directory");
+    let files = 128;
+    for index in 0..files {
+        std::fs::write(directory.path().join(format!("f{index:04}.txt")), "")
+            .expect("should write file");
+    }
+    let config = SearchConfig {
+        paths: vec![directory.path().to_path_buf()],
+        file_type: vec!["f".to_owned()],
+        ..SearchConfig::default()
+    };
+    let emitted = Mutex::new(0_usize);
+
+    search_stream(&config, &AtomicBool::new(false), |paths| {
+        *emitted.lock().expect("emitted lock should work") += paths.len();
+        false
+    })
+    .expect("stopping the stream should succeed");
+
+    let emitted = *emitted.lock().expect("emitted lock should work");
+    assert!(
+        emitted < files,
+        "the first batch cannot wait for all {files} files, got {emitted}"
+    );
+}
+
+#[test]
 fn search_stream_takes_the_serial_path_for_a_small_tree() {
     let directory = TempDir::new().expect("should create temp directory");
     for index in 0..4 {
@@ -164,6 +192,35 @@ fn grep_stream_takes_the_serial_path_for_a_small_tree() {
     .expect("streaming grep should succeed");
 
     assert_eq!(*batches.lock().expect("batches lock should work"), vec![4]);
+}
+
+#[test]
+fn grep_line_stream_emits_before_scanning_an_oversized_file() {
+    let directory = TempDir::new().expect("should create temp directory");
+    let path = directory.path().join("large.txt");
+    let padding = "x".repeat(1024 * 1024);
+    std::fs::write(&path, format!("needle\n{padding}\nneedle\n{padding}"))
+        .expect("should write file");
+    let config = GrepConfig {
+        pattern: "needle".to_owned(),
+        search: SearchConfig {
+            paths: vec![path],
+            ..SearchConfig::default()
+        },
+        ..GrepConfig::default()
+    };
+    let batches = Mutex::new(Vec::with_capacity(1));
+
+    grep_stream(&config, &AtomicBool::new(false), |batch| {
+        batches
+            .lock()
+            .expect("batches lock should work")
+            .push(batch.len());
+        false
+    })
+    .expect("stopping the stream should succeed");
+
+    assert_eq!(*batches.lock().expect("batches lock should work"), vec![1]);
 }
 
 #[test]
