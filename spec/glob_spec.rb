@@ -3,10 +3,10 @@
 require_relative "spec_helper"
 require "tmpdir"
 
-describe "Fdr glob patterns" do
+describe "Seen glob patterns" do
   describe "glob option" do
     it "supports glob patterns when glob option is enabled" do
-      results = search_results(
+      results = path_results(
         pattern: "*.rb",
         paths: ["lib"],
         glob: true,
@@ -18,11 +18,11 @@ describe "Fdr glob patterns" do
     end
 
     it "matches glob patterns case-insensitively by default" do
-      Dir.mktmpdir("fdr-glob-case") do |dir|
+      Dir.mktmpdir("seen-glob-case") do |dir|
         File.write(File.join(dir, "README.MD"), "")
 
-        insensitive = search_results(pattern: "readme.*", paths: [dir], glob: true)
-        sensitive = search_results(pattern: "readme.*", paths: [dir], glob: true, case_sensitive: true)
+        insensitive = path_results(pattern: "readme.*", paths: [dir], glob: true)
+        sensitive = path_results(pattern: "readme.*", paths: [dir], glob: true, case_sensitive: true)
 
         refute_empty insensitive, "glob should ignore case by default"
         assert_empty sensitive, "case_sensitive should apply to glob patterns"
@@ -30,7 +30,7 @@ describe "Fdr glob patterns" do
     end
 
     it "supports wildcard matching with *" do
-      results = search_results(
+      results = path_results(
         pattern: "Cargo.*",
         paths: ["ext"],
         glob: true,
@@ -43,18 +43,18 @@ describe "Fdr glob patterns" do
     end
 
     it "supports question mark wildcards for single characters" do
-      results = search_results(
-        pattern: "fd?.rb",
+      results = path_results(
+        pattern: "s?en.rb",
         paths: ["lib"],
         glob: true,
         max_depth: 1
       )
-      assert(results.any? { |result| result.include?("fdr.rb") },
-        "should find fdr.rb with glob pattern")
+      assert(results.any? { |result| result.include?("seen.rb") },
+        "should find seen.rb with glob pattern")
     end
 
     it "supports bracket expressions for character classes" do
-      results = search_results(
+      results = path_results(
         pattern: "*.[rt][bs]",
         paths: ["ext"],
         glob: true,
@@ -67,7 +67,7 @@ describe "Fdr glob patterns" do
 
   describe "glob vs regex" do
     it "treats pattern as regex by default (not glob)" do
-      regex_results = search_results(
+      regex_results = path_results(
         pattern: '.*\.rb$',
         paths: ["lib"],
         glob: false,
@@ -78,7 +78,7 @@ describe "Fdr glob patterns" do
     end
 
     it "treats pattern as glob when glob option is true" do
-      glob_results = search_results(
+      glob_results = path_results(
         pattern: "*.toml",
         paths: ["ext"],
         glob: true,
@@ -91,17 +91,17 @@ describe "Fdr glob patterns" do
 
     it "glob and regex produce different results for special chars" do
       # Glob `*` is a wildcard, while regex `*` repeats the preceding token.
-      glob_results = search_results(pattern: "dr*", paths: ["lib"], glob: true, max_depth: 1)
-      regex_results = search_results(pattern: "dr*", paths: ["lib"], glob: false, max_depth: 1)
+      glob_results = path_results(pattern: "en*", paths: ["lib"], glob: true, max_depth: 1)
+      regex_results = path_results(pattern: "en*", paths: ["lib"], glob: false, max_depth: 1)
 
-      assert_empty glob_results, "glob must match the whole name, so dr* matches nothing in lib"
-      refute_empty regex_results, "regex matches a substring, so dr* matches fdr files"
+      assert_empty glob_results, "glob must match the whole name, so en* matches nothing in lib"
+      refute_empty regex_results, "regex matches a substring, so en* matches seen files"
     end
   end
 
   describe "complex glob patterns" do
     it "supports nested wildcards with **" do
-      results = search_results(
+      results = path_results(
         pattern: "**/Cargo.toml",
         paths: ["ext"],
         glob: true,
@@ -114,7 +114,7 @@ describe "Fdr glob patterns" do
     end
 
     it "supports multiple extensions with braces" do
-      results = search_results(
+      results = path_results(
         pattern: "*.{toml,lock}",
         paths: ["ext"],
         glob: true,
@@ -128,31 +128,31 @@ describe "Fdr glob patterns" do
 
   describe "glob with full_path" do
     it "applies glob pattern to full path when full_path is true" do
-      results = search_results(
-        pattern: "**/fdr_native*",
+      results = path_results(
+        pattern: "**/seen_native*",
         paths: ["."],
         glob: true,
         full_path: true
       )
-      assert(results.any? { |result| result.include?("fdr_native") },
-        "should match **/fdr_native* pattern in full path")
+      assert(results.any? { |result| result.include?("seen_native") },
+        "should match **/seen_native* pattern in full path")
     end
 
     it "applies glob to full paths under an absolute search root" do
-      Dir.mktmpdir("fdr_glob_full_path_test") do |tmpdir|
+      Dir.mktmpdir("seen_glob_full_path_test") do |tmpdir|
         src = File.join(tmpdir, "src")
         Dir.mkdir(src)
         File.write(File.join(src, "main.rb"), "x")
         File.write(File.join(tmpdir, "other.rb"), "x")
 
-        results = search_results(pattern: "**/src/*.rb", paths: [tmpdir], glob: true, full_path: true)
+        results = path_results(pattern: "**/src/*.rb", paths: [tmpdir], glob: true, full_path: true)
 
         assert_equal [File.join(src, "main.rb")], results
       end
     end
 
     it "matches directory structure with glob and full_path" do
-      results = search_results(
+      results = path_results(
         pattern: "**/Cargo.toml",
         paths: ["."],
         glob: true,

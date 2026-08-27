@@ -1,0 +1,24 @@
+[package]
+name = "seen-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Core fd-style file search library for the seen gem"
+license = "MIT"
+repository = "https://github.com/havenwood/seen"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+globset = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+libc = "0.2"
+regex = "1.12"
+
+[dev-dependencies]
+tempfile = "3.14"

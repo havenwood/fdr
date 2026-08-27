@@ -2,24 +2,24 @@
 
 require_relative "spec_helper"
 
-describe "Fdr::VERSION" do
+describe "Seen::VERSION" do
   it "is defined" do
-    assert defined?(Fdr::VERSION), "Fdr::VERSION should be defined"
+    assert defined?(Seen::VERSION), "Seen::VERSION should be defined"
   end
 
   it "is a String" do
-    assert_kind_of String, Fdr::VERSION
+    assert_kind_of String, Seen::VERSION
   end
 
   it "follows semantic versioning format" do
-    assert_match(/\A\d+\.\d+\.\d+/, Fdr::VERSION)
+    assert_match(/\A\d+\.\d+\.\d+/, Seen::VERSION)
   end
 
   it "is not empty" do
-    refute_empty Fdr::VERSION
+    refute_empty Seen::VERSION
   end
 
   it "is frozen" do
-    assert Fdr::VERSION.frozen?, "VERSION should be frozen"
+    assert Seen::VERSION.frozen?, "VERSION should be frozen"
   end
 end

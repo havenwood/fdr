@@ -1,0 +1,373 @@
+//! Integration tests for search configuration
+
+#[path = "support/grep.rs"]
+pub mod grep_support;
+#[path = "support/search.rs"]
+pub mod search_support;
+
+use seen_core::{GrepConfig, GrepFormat, SearchConfig, SearchError};
+use std::fs;
+use std::path::PathBuf;
+use tempfile::TempDir;
+
+fn lossy(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
+fn search(config: &SearchConfig) -> Result<Vec<String>, SearchError> {
+    Ok(search_support::collect(config, false)?
+        .iter()
+        .map(|path| lossy(path))
+        .collect())
+}
+
+fn grep(config: &GrepConfig) -> Result<Vec<grep_support::GrepResult>, SearchError> {
+    grep_support::collect(config, false)
+}
+
+#[test]
+fn search_config_default_values() {
+    let config = SearchConfig::default();
+
+    assert!(config.pattern.is_none());
+    assert!(config.paths.is_empty());
+    assert!(!config.hidden, "hidden should default to false");
+    assert!(!config.no_ignore, "no_ignore should default to false");
+    assert!(
+        !config.case_sensitive,
+        "case_sensitive should default to false"
+    );
+    assert!(!config.glob, "glob should default to false");
+    assert!(!config.full_path, "full_path should default to false");
+    assert!(config.max_depth.is_none());
+    assert!(config.min_depth.is_none());
+    assert!(config.file_type.is_empty());
+    assert!(config.extension.is_empty());
+    assert!(config.exclude.is_empty());
+    assert!(!config.follow, "follow should default to false");
+}
+
+#[test]
+fn search_with_empty_paths_returns_empty() {
+    let config = SearchConfig {
+        max_depth: Some(1),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(results.is_empty(), "no paths should mean no search roots");
+}
+
+#[test]
+fn grep_with_empty_paths_returns_empty() {
+    let results = grep(&GrepConfig {
+        pattern: ".".to_string(),
+        ..Default::default()
+    })
+    .expect("grep should succeed");
+
+    assert!(results.is_empty(), "no paths should mean no grep roots");
+}
+
+#[test]
+fn grep_rejects_multiple_occurrence_formats() {
+    let error =
+        GrepFormat::from_options(true, true).expect_err("column and byte_range should conflict");
+
+    assert!(matches!(error, SearchError::InvalidInput(message)
+            if message.contains("column and byte_range")));
+}
+
+#[test]
+fn search_and_grep_use_their_own_ignore_files() {
+    let temp_dir = TempDir::new().expect("should create temp dir");
+    let root = temp_dir.path();
+    let inner = root.join("inner");
+    fs::create_dir(root.join(".git")).expect("should create git directory");
+    fs::create_dir(&inner).expect("should create search directory");
+    fs::write(root.join(".fdignore"), "fd.txt\n!shared.txt\n").expect("should write fdignore");
+    fs::write(root.join(".rgignore"), "rg.txt\n!shared.txt\n").expect("should write rgignore");
+    fs::write(inner.join(".gitignore"), "shared.txt\n").expect("should write gitignore");
+    // Also in the search root, so `no_ignore` is not masked by parent suppression.
+    fs::write(inner.join(".fdignore"), "fd.txt\n!shared.txt\n").expect("should write fdignore");
+    fs::write(inner.join(".rgignore"), "rg.txt\n!shared.txt\n").expect("should write rgignore");
+    for name in ["fd.txt", "rg.txt", "shared.txt"] {
+        fs::write(inner.join(name), "needle\n").expect("should write fixture");
+    }
+
+    let path = |name| inner.join(name).to_string_lossy().into_owned();
+    let expected_search = vec![path("rg.txt"), path("shared.txt")];
+    let expected_grep = vec![path("fd.txt"), path("shared.txt")];
+    let expected_all = vec![path("fd.txt"), path("rg.txt"), path("shared.txt")];
+
+    let searched = search(&SearchConfig {
+        paths: vec![inner.clone()],
+        ..Default::default()
+    })
+    .expect("search should succeed");
+    let mut grepped = grep(&GrepConfig {
+        pattern: "needle".to_string(),
+        search: SearchConfig {
+            paths: vec![inner.clone()],
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .expect("grep should succeed")
+    .iter()
+    .map(|result| lossy(&result.path))
+    .collect::<Vec<_>>();
+    grepped.sort_unstable();
+
+    assert_eq!(searched, expected_search);
+    assert_eq!(grepped, expected_grep);
+
+    let searched = search(&SearchConfig {
+        paths: vec![inner.clone()],
+        no_ignore: true,
+        ..Default::default()
+    })
+    .expect("unrestricted search should succeed");
+    let mut grepped = grep(&GrepConfig {
+        pattern: "needle".to_string(),
+        search: SearchConfig {
+            paths: vec![inner],
+            no_ignore: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .expect("unrestricted grep should succeed")
+    .iter()
+    .map(|result| lossy(&result.path))
+    .collect::<Vec<_>>();
+    grepped.sort_unstable();
+
+    assert_eq!(searched, expected_all);
+    assert_eq!(grepped, expected_all);
+}
+
+#[test]
+fn search_with_single_path() {
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(".")],
+        max_depth: Some(1),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(!results.is_empty(), "should search single path");
+}
+
+#[test]
+fn search_with_multiple_paths() {
+    let config = SearchConfig {
+        paths: vec![PathBuf::from("./src"), PathBuf::from("./Cargo.toml")],
+        max_depth: Some(1),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(!results.is_empty(), "should search multiple paths");
+}
+
+#[test]
+fn search_nonexistent_path_returns_empty() {
+    let config = SearchConfig {
+        paths: vec![PathBuf::from("/nonexistent/path/that/does/not/exist/12345")],
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(
+        results.is_empty(),
+        "nonexistent path should return empty results"
+    );
+}
+
+#[test]
+fn search_file_path_returns_that_file() {
+    let config = SearchConfig {
+        paths: vec![PathBuf::from("./Cargo.toml")],
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert_eq!(results.len(), 1, "should return single file");
+    assert!(
+        results
+            .first()
+            .is_some_and(|path| path.ends_with("Cargo.toml")),
+        "should return the specified file"
+    );
+}
+
+#[test]
+fn search_directory_path_returns_contents() {
+    let config = SearchConfig {
+        paths: vec![PathBuf::from("./src")],
+        max_depth: Some(1),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(!results.is_empty(), "should return directory contents");
+}
+
+#[test]
+fn search_with_relative_path() {
+    let config = SearchConfig {
+        paths: vec![PathBuf::from("./src")],
+        max_depth: Some(1),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    for path in &results {
+        assert!(
+            path.starts_with("./src") || path.starts_with("src"),
+            "results should maintain relative path: {path}"
+        );
+    }
+}
+
+#[test]
+fn search_max_depth_zero() {
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(".")],
+        max_depth: Some(0),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(
+        results.len() <= 1,
+        "max_depth 0 should only return root path"
+    );
+}
+
+#[test]
+fn search_min_depth_greater_than_max_depth() {
+    let config = SearchConfig {
+        paths: vec![PathBuf::from(".")],
+        min_depth: Some(5),
+        max_depth: Some(2),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(
+        results.is_empty(),
+        "an empty depth range should match nothing"
+    );
+}
+
+#[test]
+fn grep_min_depth_greater_than_max_depth() {
+    let config = GrepConfig {
+        pattern: ".".to_string(),
+        search: SearchConfig {
+            paths: vec![PathBuf::from(".")],
+            min_depth: Some(5),
+            max_depth: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let results = grep(&config).expect("grep should succeed");
+    assert!(
+        results.is_empty(),
+        "an empty depth range should match nothing"
+    );
+}
+
+#[test]
+fn search_debug_impl_works() {
+    let config = SearchConfig {
+        pattern: Some("test".to_string()),
+        paths: vec![PathBuf::from(".")],
+        hidden: true,
+        ..Default::default()
+    };
+
+    let debug_output = format!("{config:?}");
+    assert!(
+        debug_output.contains("test"),
+        "debug output should contain pattern"
+    );
+    assert!(
+        debug_output.contains("hidden"),
+        "debug output should contain field names"
+    );
+}
+
+#[test]
+fn search_allows_all_options_combined() {
+    let config = SearchConfig {
+        pattern: Some("lib".to_string()),
+        paths: vec![PathBuf::from(".")],
+        strip_cwd_prefix: false,
+        raise_on_error: false,
+        ignore_file: Vec::new(),
+        hidden: true,
+        no_ignore: false,
+        case_sensitive: false,
+        glob: false,
+        full_path: true,
+        max_depth: Some(3),
+        min_depth: Some(1),
+        file_type: vec!["f".to_string()],
+        extension: vec!["rs".to_string()],
+        exclude: vec!["target".to_string()],
+        follow: false,
+        min_size: None,
+        max_size: None,
+        changed_within: None,
+        changed_before: None,
+    };
+
+    let results = search(&config);
+    assert!(results.is_ok(), "should handle all options combined");
+}
+
+#[test]
+fn search_empty_pattern_string_finds_all() {
+    let config = SearchConfig {
+        pattern: Some(String::new()),
+        paths: vec![PathBuf::from(".")],
+        max_depth: Some(1),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(!results.is_empty(), "empty pattern should match all files");
+}
+
+#[test]
+fn search_empty_extension_string() {
+    let config = SearchConfig {
+        extension: vec![String::new()],
+        paths: vec![PathBuf::from(".")],
+        max_depth: Some(1),
+        ..Default::default()
+    };
+
+    let results = search(&config);
+    assert!(results.is_ok(), "should handle empty extension");
+}
+
+#[test]
+fn search_with_dot_in_path() {
+    let config = SearchConfig {
+        paths: vec![PathBuf::from("././.")],
+        max_depth: Some(1),
+        ..Default::default()
+    };
+
+    let results = search(&config).expect("search should succeed");
+    assert!(
+        !results.is_empty(),
+        "should handle paths with multiple dots"
+    );
+}

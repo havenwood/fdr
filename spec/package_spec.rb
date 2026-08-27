@@ -6,33 +6,33 @@ require "rake"
 
 class PackageSpec < Minitest::Test
   def setup
-    @gemspec = Gem::Specification.load(File.expand_path("../fdr.gemspec", __dir__))
+    @gemspec = Gem::Specification.load(File.expand_path("../seen.gemspec", __dir__))
   end
 
   def test_includes_cargo_lock
-    assert_includes @gemspec.files, "ext/fdr_native/Cargo.lock"
+    assert_includes @gemspec.files, "ext/seen_native/Cargo.lock"
   end
 
   def test_includes_native_build_script
-    assert_includes @gemspec.files, "ext/fdr_native/ffi/build.rs"
+    assert_includes @gemspec.files, "ext/seen_native/ffi/build.rs"
   end
 
   def test_native_workers_do_not_call_ruby_gc_via_the_allocator
-    ffi = File.read(File.expand_path("../ext/fdr_native/ffi/src/lib.rs", __dir__))
+    ffi = File.read(File.expand_path("../ext/seen_native/ffi/src/lib.rs", __dir__))
 
     refute_includes ffi, "rb_sys::set_global_tracking_allocator!();"
   end
 
   def test_includes_rbs_signature
-    assert_includes @gemspec.files, "sig/fdr.rbs"
+    assert_includes @gemspec.files, "sig/seen.rbs"
   end
 
   def test_excludes_generated_cargo_files
-    assert_empty @gemspec.files.grep(%r{\Aext/fdr_native/(?:target|tmp)/})
+    assert_empty @gemspec.files.grep(%r{\Aext/seen_native/(?:target|tmp)/})
   end
 
   def test_excludes_rust_tests
-    assert_empty @gemspec.files.grep(%r{\Aext/fdr_native/core/tests/})
+    assert_empty @gemspec.files.grep(%r{\Aext/seen_native/core/tests/})
   end
 
   def test_every_packaged_file_exists

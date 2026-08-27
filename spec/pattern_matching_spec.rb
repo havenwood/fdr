@@ -4,10 +4,10 @@ require_relative "spec_helper"
 require "tmpdir"
 require "fileutils"
 
-describe "Fdr pattern matching" do
+describe "Seen pattern matching" do
   describe "exact filename matching" do
     it "finds files by exact name" do
-      results = search_results(pattern: "Cargo.toml", paths: ["ext"])
+      results = path_results(pattern: "Cargo.toml", paths: ["ext"])
 
       assert(results.any? { |result| result.include?("Cargo.toml") },
         "should find Cargo.toml file")
@@ -16,7 +16,7 @@ describe "Fdr pattern matching" do
     end
 
     it "finds version file by name" do
-      results = search_results(pattern: "version", paths: ["lib"], max_depth: 2)
+      results = path_results(pattern: "version", paths: ["lib"], max_depth: 2)
 
       assert(results.any? { |result| result.include?("version") },
         "should find version file")
@@ -25,7 +25,7 @@ describe "Fdr pattern matching" do
 
   describe "regex patterns" do
     it "supports regex pattern matching with proper regex syntax" do
-      results = search_results(pattern: '.*_spec\.rb', paths: ["spec"], max_depth: 1)
+      results = path_results(pattern: '.*_spec\.rb', paths: ["spec"], max_depth: 1)
 
       assert(results.any? { |result| result.match?(/.*_spec\.rb$/) },
         "should match regex pattern")
@@ -34,8 +34,8 @@ describe "Fdr pattern matching" do
     end
 
     it "matches patterns in filenames only by default (not full path)" do
-      with_full = search_results(pattern: "ext", paths: ["."], max_depth: 2, full_path: true)
-      without_full = search_results(pattern: "ext", paths: ["."], max_depth: 2, full_path: false)
+      with_full = path_results(pattern: "ext", paths: ["."], max_depth: 2, full_path: true)
+      without_full = path_results(pattern: "ext", paths: ["."], max_depth: 2, full_path: false)
 
       assert(with_full.any? { |p| p.include?("ext") },
         "full path should find ext in paths")
@@ -44,7 +44,7 @@ describe "Fdr pattern matching" do
     end
 
     it "supports character class patterns" do
-      results = search_results(pattern: '[a-z]+\.toml', paths: ["ext"], max_depth: 2)
+      results = path_results(pattern: '[a-z]+\.toml', paths: ["ext"], max_depth: 2)
 
       assert(results.any? { |result| result.include?(".toml") },
         "should match character class pattern")
@@ -55,7 +55,7 @@ describe "Fdr pattern matching" do
 
   describe "case sensitivity" do
     before do
-      @tmpdir = Dir.mktmpdir("fdr_case_test")
+      @tmpdir = Dir.mktmpdir("seen_case_test")
       @upper_file = File.join(@tmpdir, "TestFile.txt")
       @lower_file = File.join(@tmpdir, "testfile.txt")
 
@@ -68,8 +68,8 @@ describe "Fdr pattern matching" do
     end
 
     it "is case insensitive by default" do
-      lower = search_results(pattern: "testfile", paths: [@tmpdir], type: "f")
-      upper = search_results(pattern: "TestFile", paths: [@tmpdir], type: "f")
+      lower = path_results(pattern: "testfile", paths: [@tmpdir], type: "f")
+      upper = path_results(pattern: "TestFile", paths: [@tmpdir], type: "f")
 
       assert_equal lower.size, upper.size,
         "case insensitive search should find same number of results"
@@ -77,11 +77,11 @@ describe "Fdr pattern matching" do
     end
 
     it "respects case sensitivity when requested" do
-      insensitive = search_results(pattern: "testfile", paths: [@tmpdir], type: "f",
+      insensitive = path_results(pattern: "testfile", paths: [@tmpdir], type: "f",
         case_sensitive: false)
-      sensitive_lower = search_results(pattern: "testfile", paths: [@tmpdir], type: "f",
+      sensitive_lower = path_results(pattern: "testfile", paths: [@tmpdir], type: "f",
         case_sensitive: true)
-      sensitive_upper = search_results(pattern: "TestFile", paths: [@tmpdir], type: "f",
+      sensitive_upper = path_results(pattern: "TestFile", paths: [@tmpdir], type: "f",
         case_sensitive: true)
 
       assert_operator insensitive.size, ">=", sensitive_lower.size,
@@ -93,8 +93,8 @@ describe "Fdr pattern matching" do
 
   describe "full path matching" do
     it "searches in full path when enabled" do
-      with_full = search_results(pattern: "ext", paths: ["."], full_path: true, max_depth: 2)
-      without_full = search_results(pattern: "ext", paths: ["."], full_path: false, max_depth: 2)
+      with_full = path_results(pattern: "ext", paths: ["."], full_path: true, max_depth: 2)
+      without_full = path_results(pattern: "ext", paths: ["."], full_path: false, max_depth: 2)
 
       assert(with_full.any? { |result| result.include?("ext") },
         "should match pattern in full path")
@@ -103,20 +103,20 @@ describe "Fdr pattern matching" do
     end
 
     it "matches directory names in path with full_path option" do
-      results = search_results(pattern: "fdr_native", paths: ["ext"], full_path: true, max_depth: 3)
+      results = path_results(pattern: "seen_native", paths: ["ext"], full_path: true, max_depth: 3)
 
-      assert(results.any? { |result| result.include?("fdr_native") },
+      assert(results.any? { |result| result.include?("seen_native") },
         "should match directory names in full path")
     end
 
     it "matches full paths under an absolute search root" do
-      Dir.mktmpdir("fdr_full_path_test") do |tmpdir|
+      Dir.mktmpdir("seen_full_path_test") do |tmpdir|
         src = File.join(tmpdir, "src")
         Dir.mkdir(src)
         File.write(File.join(src, "main.rb"), "x")
         File.write(File.join(tmpdir, "other.rb"), "x")
 
-        results = search_results(pattern: "src/main", paths: [tmpdir], full_path: true)
+        results = path_results(pattern: "src/main", paths: [tmpdir], full_path: true)
 
         assert_equal [File.join(src, "main.rb")], results
       end

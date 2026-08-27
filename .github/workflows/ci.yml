@@ -58,4 +58,4 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
 
       - name: Check minimum Rust version
-        run: cargo +1.88.0 check --manifest-path ext/fdr_native/Cargo.toml --locked --workspace --all-targets --all-features
+        run: cargo +1.88.0 check --manifest-path ext/seen_native/Cargo.toml --locked --workspace --all-targets --all-features

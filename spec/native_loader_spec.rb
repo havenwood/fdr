@@ -10,21 +10,21 @@ class NativeLoaderSpec < Minitest::Test
     extension = compiled_extension
     skip "Native extension is not compiled" unless extension
 
-    Dir.mktmpdir("fdr-native-loader") do |directory|
+    Dir.mktmpdir("seen-native-loader") do |directory|
       lib = build_library(directory, extension)
-      stderr, status = load_fdr(lib)
+      stderr, status = load_seen(lib)
 
       assert status.success?, stderr
     end
   end
 
   def test_reports_a_missing_native_extension
-    Dir.mktmpdir("fdr-native-loader") do |directory|
+    Dir.mktmpdir("seen-native-loader") do |directory|
       lib = build_library(directory, nil)
-      stderr, status = load_fdr(lib)
+      stderr, status = load_seen(lib)
 
       refute status.success?, "loading without any native extension should fail"
-      assert_match(/Failed to load the fdr native extension/, stderr)
+      assert_match(/Failed to load the seen native extension/, stderr)
       assert_match(/Install Rust/, stderr)
     end
   end
@@ -32,21 +32,21 @@ class NativeLoaderSpec < Minitest::Test
   private
 
   def compiled_extension
-    Dir[File.expand_path("../lib/fdr/fdr_native.{bundle,so}", __dir__)].first
+    Dir[File.expand_path("../lib/seen/seen_native.{bundle,so}", __dir__)].first
   end
 
   def build_library(directory, extension)
     lib = File.join(directory, "lib")
-    fdr = File.join(lib, "fdr")
-    FileUtils.mkdir_p(fdr)
-    FileUtils.cp(File.expand_path("../lib/fdr.rb", __dir__), lib)
-    FileUtils.cp(File.expand_path("../lib/fdr/version.rb", __dir__), fdr)
-    FileUtils.cp(extension, File.join(fdr, File.basename(extension))) if extension
+    seen = File.join(lib, "seen")
+    FileUtils.mkdir_p(seen)
+    FileUtils.cp(File.expand_path("../lib/seen.rb", __dir__), lib)
+    FileUtils.cp(File.expand_path("../lib/seen/version.rb", __dir__), seen)
+    FileUtils.cp(extension, File.join(seen, File.basename(extension))) if extension
     lib
   end
 
-  def load_fdr(lib)
-    script = "require 'fdr'; results = Fdr.search(paths: [#{lib.inspect}]); abort unless results.is_a?(Enumerator) && results.any?"
+  def load_seen(lib)
+    script = "require 'seen'; results = Seen.each_path(paths: [#{lib.inspect}]); abort unless results.is_a?(Enumerator) && results.any?"
     _, stderr, status = Open3.capture3(
       {"RUBYOPT" => nil, "RUBYLIB" => nil}, Gem.ruby, "--disable-gems", "-I#{lib}", "-e", script
     )

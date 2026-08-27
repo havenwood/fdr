@@ -2,10 +2,10 @@
 
 require_relative "spec_helper"
 
-describe "Fdr.search" do
+describe "Seen.each_path" do
   describe "basic searches" do
     it "finds files with pattern" do
-      results = search_results(pattern: "version", paths: ["lib"], max_depth: 2)
+      results = path_results(pattern: "version", paths: ["lib"], max_depth: 2)
 
       refute_empty results, "should find files matching pattern"
       assert(results.any? { |p| p.include?("version") },
@@ -13,7 +13,7 @@ describe "Fdr.search" do
     end
 
     it "supports type filter" do
-      results = search_results(pattern: "lib", paths: ["."], type: "d", max_depth: 2)
+      results = path_results(pattern: "lib", paths: ["."], type: "d", max_depth: 2)
 
       refute_empty results, "should find directories"
       assert(results.all? { |p| File.directory?(p) },
@@ -21,7 +21,7 @@ describe "Fdr.search" do
     end
 
     it "finds with single path" do
-      results = search_results(pattern: "fdr", paths: ["lib"])
+      results = path_results(pattern: "seen", paths: ["lib"])
 
       refute_empty results, "should find matches in single path"
       assert(results.all? { |p| p.start_with?("lib") },
@@ -31,7 +31,7 @@ describe "Fdr.search" do
 
   describe "edge cases" do
     it "returns all files when no pattern is given" do
-      without_pattern = search_results(paths: ["lib"], max_depth: 1)
+      without_pattern = path_results(paths: ["lib"], max_depth: 1)
 
       refute_empty without_pattern, "should return files when no pattern given"
       assert(without_pattern.all?(String),
@@ -39,21 +39,21 @@ describe "Fdr.search" do
     end
 
     it "handles nonexistent paths gracefully" do
-      results = search_results(paths: ["/nonexistent/path/12345"])
+      results = path_results(paths: ["/nonexistent/path/12345"])
 
       assert_empty results, "should yield nothing for a nonexistent path"
     end
 
     it "accepts empty exclude array" do
-      results_no_exclude = search_results(extension: "rb", paths: ["lib"])
-      results_empty_exclude = search_results(extension: "rb", paths: ["lib"], exclude: [])
+      results_no_exclude = path_results(extension: "rb", paths: ["lib"])
+      results_empty_exclude = path_results(extension: "rb", paths: ["lib"], exclude: [])
 
       assert_equal results_no_exclude.size, results_empty_exclude.size,
         "empty exclude array should not affect results"
     end
 
     it "yields nothing for an impossible filter combination" do
-      results = search_results(
+      results = path_results(
         pattern: "nonexistent_file_xyz_123",
         extension: "xyz",
         paths: ["."]
@@ -64,7 +64,7 @@ describe "Fdr.search" do
 
   describe "combining filters" do
     it "combines pattern and extension filters" do
-      results = search_results(
+      results = path_results(
         pattern: "lib",
         extension: "rs",
         paths: ["ext"],
@@ -81,7 +81,7 @@ describe "Fdr.search" do
     end
 
     it "combines type and extension filters" do
-      results = search_results(
+      results = path_results(
         extension: "rb",
         type: "f",
         paths: ["lib"]
@@ -97,7 +97,7 @@ describe "Fdr.search" do
     end
 
     it "combines pattern, extension and depth filters" do
-      results = search_results(
+      results = path_results(
         pattern: "spec",
         extension: "rb",
         paths: ["spec"],

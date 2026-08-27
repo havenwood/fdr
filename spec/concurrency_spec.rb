@@ -6,9 +6,9 @@ require "open3"
 require "timeout"
 require "tmpdir"
 
-describe "Fdr concurrency" do
+describe "Seen concurrency" do
   before do
-    @dir = Dir.mktmpdir("fdr-concurrency")
+    @dir = Dir.mktmpdir("seen-concurrency")
     10.times do |i|
       subdir = File.join(@dir, "dir#{i}")
       Dir.mkdir(subdir)
@@ -77,17 +77,22 @@ describe "Fdr concurrency" do
 
   def scheduler_probe
     Class.new do
-      attr_reader :blocking_operations, :io_waits
+      attr_reader :blocking_operations, :cooperative_yields, :io_waits
 
       def initialize
         @blocking_operations = 0
+        @cooperative_yields = 0
         @io_waits = 0
       end
 
       def block(*) = false
       def unblock(*) = nil
-      def kernel_sleep(*) = 0
       def close = nil
+
+      def kernel_sleep(duration = nil)
+        @cooperative_yields += 1 if duration == 0
+        0
+      end
 
       def io_wait(io, events, timeout = nil)
         @io_waits += 1
@@ -112,13 +117,13 @@ describe "Fdr concurrency" do
     end.new
   end
 
-  def slow_grep_results
+  def slow_line_results
     path = File.join(@dir, "large.txt")
     chunk = "haystack\n" * (1024 * 1024 / 9)
     File.open(path, "wb") { |file| 16.times { file.write(chunk) } }
     pattern = "(?i:(?:ha|hay|hays|haystac)+z)"
 
-    Fdr.grep(pattern:, paths: [path])
+    Seen.each_line(pattern:, paths: [path])
   end
 
   def forked_iteration_error(results)
@@ -156,11 +161,11 @@ describe "Fdr concurrency" do
 
   def rss_after_abandoning(path, method, count)
     script = <<~'RUBY'
-      require "fdr"
+      require "seen"
 
       path, method, count = ARGV
       Integer(count).times do
-        results = Fdr.grep(pattern: "needle", paths: [path], no_ignore: true)
+        results = Seen.each_line(pattern: "needle", paths: [path], no_ignore: true)
         results.public_send(method)
         results = nil
         4.times do
@@ -192,20 +197,20 @@ describe "Fdr concurrency" do
   end
 
   it "releases the GVL so other threads run during search" do
-    during = ticks_during { Fdr.search(paths: [@dir], hidden: true).to_a }
-    assert_predicate during, :positive?, "other threads should run during Fdr.search"
+    during = ticks_during { Seen.each_path(paths: [@dir], hidden: true).to_a }
+    assert_predicate during, :positive?, "other threads should run during Seen.each_path"
   end
 
   it "releases the GVL so other threads run during grep" do
-    during = ticks_during { Fdr.grep(pattern: "needle", paths: [@dir]).to_a }
-    assert_predicate during, :positive?, "other threads should run during Fdr.grep"
+    during = ticks_during { Seen.each_line(pattern: "needle", paths: [@dir]).to_a }
+    assert_predicate during, :positive?, "other threads should run during Seen.each_line"
   end
 
   it "waits through scheduler-visible IO readiness" do
     scheduler = scheduler_probe
     Fiber.set_scheduler(scheduler)
     results = nil
-    Fiber.schedule { results = Fdr.search(paths: [@dir], type: "f").to_a }
+    Fiber.schedule { results = Seen.each_path(paths: [@dir], type: "f").to_a }
     Fiber.set_scheduler(nil)
 
     assert_equal 200, results.length
@@ -215,20 +220,35 @@ describe "Fdr concurrency" do
     Fiber.set_scheduler(nil) if scheduler && Fiber.scheduler.equal?(scheduler)
   end
 
+  it "cooperatively yields while scheduler results stay ready" do
+    path = File.join(@dir, "dense.txt")
+    File.binwrite(path, "needle\n" * 2048)
+    scheduler = scheduler_probe
+    Fiber.set_scheduler(scheduler)
+    count = nil
+    Fiber.schedule { count = Seen.each_line(pattern: "needle", paths: [path]).count }
+    Fiber.set_scheduler(nil)
+
+    assert_equal 2048, count
+    assert_equal 2, scheduler.cooperative_yields
+  ensure
+    Fiber.set_scheduler(nil) if scheduler && Fiber.scheduler.equal?(scheduler)
+  end
+
   it "can be interrupted by Timeout during search" do
-    results = Fdr.search(paths: Array.new(10_000, @dir), hidden: true)
+    results = Seen.each_path(paths: Array.new(10_000, @dir), hidden: true)
 
     assert_raises(Timeout::Error) do
       Timeout.timeout(0.01) { results.count }
     end
 
     assert_kind_of String, results.first
-    assert_equal 200, Fdr.search(paths: [@dir], type: "f").count
+    assert_equal 200, Seen.each_path(paths: [@dir], type: "f").count
   end
 
   it "cancels workers when consumption stops early" do
     Timeout.timeout(5) do
-      100.times { assert_kind_of String, Fdr.search(paths: [@dir], hidden: true).first }
+      100.times { assert_kind_of String, Seen.each_path(paths: [@dir], hidden: true).first }
     end
   end
 
@@ -249,24 +269,24 @@ describe "Fdr concurrency" do
     seen = []
 
     Timeout.timeout(5) do
-      Fdr.search(paths: [@dir], hidden: true) do |path|
+      Seen.each_path(paths: [@dir], hidden: true) do |path|
         sleep 0.005 if seen.size < 3
         seen << path
       end
     end
 
-    assert_equal Fdr.search(paths: [@dir], hidden: true).to_a.sort, seen.sort
+    assert_equal Seen.each_path(paths: [@dir], hidden: true).to_a.sort, seen.sort
   end
 
   it "consumes the same Enumerator independently" do
     Timeout.timeout(5) do
-      assert_independent_enumerations(Fdr.search(paths: [@dir], type: "f"), 200)
-      assert_independent_enumerations(Fdr.grep(pattern: "needle", paths: [@dir]), 200)
+      assert_independent_enumerations(Seen.each_path(paths: [@dir], type: "f"), 200)
+      assert_independent_enumerations(Seen.each_line(pattern: "needle", paths: [@dir]), 200)
     end
   end
 
   it "keeps external iteration independent of internal iteration" do
-    results = Fdr.search(paths: [@dir], type: "f")
+    results = Seen.each_path(paths: [@dir], type: "f")
 
     assert_kind_of String, results.next
     assert_equal 200, results.count
@@ -274,7 +294,7 @@ describe "Fdr concurrency" do
   end
 
   it "recovers after repeated Timeout interruption while grepping" do
-    results = slow_grep_results
+    results = slow_line_results
 
     3.times do
       assert_raises(Timeout::Error) do
@@ -282,11 +302,11 @@ describe "Fdr concurrency" do
       end
     end
 
-    assert_equal 200, Fdr.grep(pattern: "needle", paths: [@dir]).count
+    assert_equal 200, Seen.each_line(pattern: "needle", paths: [@dir]).count
   end
 
   it "preserves Interrupt while grepping" do
-    results = slow_grep_results
+    results = slow_line_results
     started = Queue.new
     thread = Thread.new do
       started << true
@@ -304,7 +324,7 @@ describe "Fdr concurrency" do
 
     assert_instance_of Interrupt, error
     assert_equal "test interrupt", error.message
-    refute_kind_of Fdr::Error, error
+    refute_kind_of Seen::Error, error
   ensure
     thread&.kill
     thread&.join
@@ -313,10 +333,10 @@ describe "Fdr concurrency" do
   it "searches in a forked child after the parent has searched" do
     skip "fork is unavailable" unless Process.respond_to?(:fork)
 
-    Fdr.search(paths: [@dir], hidden: true).to_a
+    Seen.each_path(paths: [@dir], hidden: true).to_a
     pid = fork do
-      Fdr.search(paths: [@dir], hidden: true).to_a
-      Fdr.grep(pattern: "needle", paths: [@dir]).to_a
+      Seen.each_path(paths: [@dir], hidden: true).to_a
+      Seen.each_line(pattern: "needle", paths: [@dir]).to_a
       exit 0
     end
     _, status = Process.waitpid2(pid)
@@ -330,16 +350,16 @@ describe "Fdr concurrency" do
     path = File.join(@dir, "dir0", "file0.txt")
     paths = Array.new(100_000, path)
 
-    search = Fdr.search(paths:, type: "f", no_ignore: true)
-    assert_equal "RuntimeError: Search interrupted", forked_iteration_error(search)
+    search = Seen.each_path(paths:, type: "f", no_ignore: true)
+    assert_equal "RuntimeError: Path search interrupted", forked_iteration_error(search)
 
-    grep = Fdr.grep(pattern: "needle", paths:, no_ignore: true)
-    assert_equal "RuntimeError: Grep interrupted", forked_iteration_error(grep)
+    grep = Seen.each_line(pattern: "needle", paths:, no_ignore: true)
+    assert_equal "RuntimeError: Line search interrupted", forked_iteration_error(grep)
   end
 
   it "completes despite spurious thread wakeups" do
     thread = Thread.new do
-      Fdr.search(paths: [@dir], hidden: true).to_a
+      Seen.each_path(paths: [@dir], hidden: true).to_a
     rescue => e
       e
     end
@@ -350,14 +370,14 @@ describe "Fdr concurrency" do
     end
 
     assert_kind_of Array, thread.value, "spurious wakeups should not abort the search"
-    assert_equal Fdr.search(paths: [@dir], hidden: true).to_a.sort, thread.value.sort,
+    assert_equal Seen.each_path(paths: [@dir], hidden: true).to_a.sort, thread.value.sort,
       "spurious wakeups should not truncate the search"
   end
 
   it "delivers a timeout despite wakeup pressure" do
     paths = Array.new(1_000, @dir)
     thread = Thread.new do
-      Timeout.timeout(0.04) { Fdr.search(paths:, hidden: true).to_a }
+      Timeout.timeout(0.04) { Seen.each_path(paths:, hidden: true).to_a }
       :completed
     rescue Timeout::Error
       :timed_out
@@ -373,7 +393,7 @@ describe "Fdr concurrency" do
 
   it "completes grep despite spurious thread wakeups" do
     thread = Thread.new do
-      Fdr.grep(pattern: "needle", paths: [@dir]).to_a
+      Seen.each_line(pattern: "needle", paths: [@dir]).to_a
     rescue => e
       e
     end
@@ -384,25 +404,25 @@ describe "Fdr concurrency" do
     end
 
     assert_kind_of Array, thread.value, "spurious wakeups should not abort the grep"
-    assert_equal Fdr.grep(pattern: "needle", paths: [@dir]).to_a.sort, thread.value.sort,
+    assert_equal Seen.each_line(pattern: "needle", paths: [@dir]).to_a.sort, thread.value.sort,
       "spurious wakeups should not truncate the grep"
   end
 
   # Run in a child with YJIT off because it skips Ractor checks for C calls.
   it "searches and greps from Ractors" do
     script = <<~RUBY
-      require "fdr"
+      require "seen"
       Warning[:experimental] = false
       Thread.report_on_exception = false
 
       ractors = Array.new(4) do
         Ractor.new(ARGV[0]) do |path|
-          search = Fdr.search(pattern: "file1", paths: [path], extension: "txt").count
-          grep = Fdr.grep(pattern: "needle", paths: [path]).count
+          search = Seen.each_path(pattern: "file1", paths: [path], extension: "txt").count
+          grep = Seen.each_line(pattern: "needle", paths: [path]).count
           invalid_pattern = begin
-            Fdr.search(pattern: "[", paths: [path]).to_a
+            Seen.each_path(pattern: "[", paths: [path]).to_a
             false
-          rescue Fdr::InvalidPattern
+          rescue Seen::InvalidPattern
             true
           end
           [search, grep, invalid_pattern]

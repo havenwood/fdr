@@ -7,7 +7,7 @@ require "fileutils"
 describe "Size and time filtering" do
   describe "size filtering" do
     before do
-      @tmpdir = Dir.mktmpdir("fdr_size_test")
+      @tmpdir = Dir.mktmpdir("seen_size_test")
       @small_file = File.join(@tmpdir, "small.txt")
       @medium_file = File.join(@tmpdir, "medium.txt")
       @large_file = File.join(@tmpdir, "large.txt")
@@ -22,7 +22,7 @@ describe "Size and time filtering" do
     end
 
     it "filters files by min_size" do
-      results = search_results(min_size: 100, paths: [@tmpdir], type: "f")
+      results = path_results(min_size: 100, paths: [@tmpdir], type: "f")
 
       assert(results.any? { |p| p.include?("medium.txt") },
         "should find file >= min_size")
@@ -33,7 +33,7 @@ describe "Size and time filtering" do
     end
 
     it "filters files by max_size" do
-      results = search_results(max_size: 1000, paths: [@tmpdir], type: "f")
+      results = path_results(max_size: 1000, paths: [@tmpdir], type: "f")
 
       assert(results.any? { |p| p.include?("small.txt") },
         "should find file <= max_size")
@@ -44,13 +44,13 @@ describe "Size and time filtering" do
     end
 
     it "includes files exactly at the size boundaries" do
-      results = search_results(min_size: 500, max_size: 500, paths: [@tmpdir], type: "f")
+      results = path_results(min_size: 500, max_size: 500, paths: [@tmpdir], type: "f")
 
       assert_equal [@medium_file], results
     end
 
     it "sizes a symlink itself but requires its target to be a file" do
-      Dir.mktmpdir("fdr-size-symlink") do |dir|
+      Dir.mktmpdir("seen-size-symlink") do |dir|
         target = File.join(dir, "target.txt")
         File.write(target, "x" * 5_000)
         Dir.mkdir(File.join(dir, "sub"))
@@ -59,7 +59,7 @@ describe "Size and time filtering" do
         File.symlink(File.join(dir, "sub"), File.join(dir, "to_dir"))
         File.symlink(File.join(dir, "gone"), File.join(dir, "broken"))
 
-        results = search_results(paths: [dir], min_size: 20).map { |path| File.basename(path) }
+        results = path_results(paths: [dir], min_size: 20).map { |path| File.basename(path) }
 
         assert_equal %w[target.txt to_file], results,
           "a symlink to a file is measured by its own size; one to a dir or nowhere is not"
@@ -67,7 +67,7 @@ describe "Size and time filtering" do
     end
 
     it "combines size and time filters" do
-      results = search_results(
+      results = path_results(
         min_size: 100,
         max_size: 1_000_000,
         changed_within: 86_400 * 365,
@@ -80,7 +80,7 @@ describe "Size and time filtering" do
 
   describe "time filtering with real file timestamps" do
     before do
-      @tmpdir = Dir.mktmpdir("fdr_time_test")
+      @tmpdir = Dir.mktmpdir("seen_time_test")
 
       @old_file = File.join(@tmpdir, "old_file.txt")
       @recent_file = File.join(@tmpdir, "recent_file.txt")
@@ -106,7 +106,7 @@ describe "Size and time filtering" do
 
     describe "changed_within" do
       it "finds files modified within the last 7 days" do
-        results = search_results(paths: [@tmpdir], changed_within: 604_800, type: "f")
+        results = path_results(paths: [@tmpdir], changed_within: 604_800, type: "f")
 
         assert results.any? { |path| File.basename(path) == "recent_file.txt" }, "should find recent_file.txt"
         assert results.any? { |path| File.basename(path) == "very_recent_file.txt" }, "should find very_recent_file.txt"
@@ -114,7 +114,7 @@ describe "Size and time filtering" do
       end
 
       it "finds files modified within the last 2 days" do
-        results = search_results(paths: [@tmpdir], changed_within: 172_800, type: "f")
+        results = path_results(paths: [@tmpdir], changed_within: 172_800, type: "f")
 
         assert results.any? { |path| File.basename(path) == "very_recent_file.txt" }, "should find very_recent_file.txt"
         refute results.any? { |path| File.basename(path) == "recent_file.txt" }, "should not find recent_file.txt"
@@ -122,7 +122,7 @@ describe "Size and time filtering" do
       end
 
       it "finds all files modified within the last 30 days" do
-        results = search_results(paths: [@tmpdir], changed_within: 2_592_000, type: "f")
+        results = path_results(paths: [@tmpdir], changed_within: 2_592_000, type: "f")
 
         assert results.any? { |path| File.basename(path) == "old_file.txt" }, "should find old_file.txt"
         assert results.any? { |path| File.basename(path) == "recent_file.txt" }, "should find recent_file.txt"
@@ -130,7 +130,7 @@ describe "Size and time filtering" do
       end
 
       it "finds no files with very short time window" do
-        results = search_results(paths: [@tmpdir], changed_within: 3600, type: "f")
+        results = path_results(paths: [@tmpdir], changed_within: 3600, type: "f")
 
         refute(results.any? { |path| File.basename(path) == "old_file.txt" })
         refute(results.any? { |path| File.basename(path) == "recent_file.txt" })
@@ -140,7 +140,7 @@ describe "Size and time filtering" do
 
     describe "changed_before" do
       it "finds files modified more than 7 days ago" do
-        results = search_results(paths: [@tmpdir], changed_before: 604_800, type: "f")
+        results = path_results(paths: [@tmpdir], changed_before: 604_800, type: "f")
 
         assert results.any? { |path| File.basename(path) == "old_file.txt" }, "should find old_file.txt"
         refute results.any? { |path| File.basename(path) == "recent_file.txt" }, "should not find recent_file.txt"
@@ -150,7 +150,7 @@ describe "Size and time filtering" do
       end
 
       it "finds files modified more than 2 days ago" do
-        results = search_results(paths: [@tmpdir], changed_before: 172_800, type: "f")
+        results = path_results(paths: [@tmpdir], changed_before: 172_800, type: "f")
 
         assert results.any? { |path| File.basename(path) == "old_file.txt" }, "should find old_file.txt"
         assert results.any? { |path| File.basename(path) == "recent_file.txt" }, "should find recent_file.txt"
@@ -160,7 +160,7 @@ describe "Size and time filtering" do
       end
 
       it "finds all files when using changed_before: 0" do
-        results = search_results(paths: [@tmpdir], changed_before: 0, type: "f")
+        results = path_results(paths: [@tmpdir], changed_before: 0, type: "f")
 
         assert(results.any? { |path| File.basename(path) == "old_file.txt" })
         assert(results.any? { |path| File.basename(path) == "recent_file.txt" })
@@ -170,7 +170,7 @@ describe "Size and time filtering" do
 
     describe "combining time filters" do
       it "finds files in a specific time range" do
-        results = search_results(
+        results = path_results(
           paths: [@tmpdir],
           changed_before: 172_800,
           changed_within: 604_800,
@@ -187,7 +187,7 @@ describe "Size and time filtering" do
 
     describe "time filters with pattern matching" do
       it "combines time filtering with pattern matching" do
-        results = search_results(
+        results = path_results(
           paths: [@tmpdir],
           pattern: "recent",
           changed_within: 604_800,
@@ -205,7 +205,7 @@ describe "Size and time filtering" do
         rb_time = Time.now - (1 * 24 * 60 * 60)
         File.utime(rb_time, rb_time, rb_file)
 
-        results = search_results(
+        results = path_results(
           paths: [@tmpdir],
           extension: "rb",
           changed_within: 172_800,

@@ -9,10 +9,10 @@ pkg/
 *.dll
 *.dylib
 *.dSYM/
-lib/fdr/fdr_native.bundle
-lib/fdr/fdr_native.so
-ext/fdr_native/target/
-ext/fdr_native/Makefile
-ext/fdr_native/mkmf.log
-ext/fdr_native/tmp/
-ext/fdr_native/.rb-sys/
+lib/seen/seen_native.bundle
+lib/seen/seen_native.so
+ext/seen_native/target/
+ext/seen_native/Makefile
+ext/seen_native/mkmf.log
+ext/seen_native/tmp/
+ext/seen_native/.rb-sys/

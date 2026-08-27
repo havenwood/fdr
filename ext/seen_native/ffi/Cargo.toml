@@ -1,0 +1,24 @@
+[package]
+name = "seen-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Native Ruby extension for the Seen gem that provides Ruby FFI bindings via Magnus"
+license = "MIT"
+repository = "https://github.com/havenwood/seen"
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+name = "seen_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+seen-core = { workspace = true }
+magnus = { version = "0.8", default-features = false, features = ["bytes", "io"] }
+rb-sys = { version = "0.9", features = ["stable-api-compiled-fallback"] }
+
+[build-dependencies]
+rb-sys-env = "0.2"
