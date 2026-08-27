@@ -20,7 +20,7 @@ fn search_stream_emits_matching_paths() {
         extension: vec!["txt".to_owned()],
         ..SearchConfig::default()
     };
-    let results = Mutex::new(Vec::new());
+    let results = Mutex::new(Vec::with_capacity(1));
 
     search_stream(&config, &AtomicBool::new(false), |paths| {
         results
@@ -77,7 +77,7 @@ fn search_stream_takes_the_serial_path_for_a_small_tree() {
         file_type: vec!["f".to_owned()],
         ..SearchConfig::default()
     };
-    let batches = Mutex::new(Vec::new());
+    let batches = Mutex::new(Vec::with_capacity(1));
 
     search_stream(&config, &AtomicBool::new(false), |paths| {
         batches
@@ -104,7 +104,7 @@ fn grep_stream_emits_each_matching_line() {
         },
         ..GrepConfig::default()
     };
-    let matches = Mutex::new(Vec::new());
+    let matches = Mutex::new(Vec::with_capacity(2));
 
     grep_stream(&config, &AtomicBool::new(false), |batch| {
         matches
@@ -152,7 +152,7 @@ fn grep_stream_takes_the_serial_path_for_a_small_tree() {
         },
         ..GrepConfig::default()
     };
-    let batches = Mutex::new(Vec::new());
+    let batches = Mutex::new(Vec::with_capacity(1));
 
     grep_stream(&config, &AtomicBool::new(false), |batch| {
         batches
@@ -276,7 +276,7 @@ fn grep_occurrence_stream_stops_after_the_first_match() {
             },
             ..GrepConfig::default()
         };
-        let batches = Mutex::new(Vec::new());
+        let batches = Mutex::new(Vec::with_capacity(1));
 
         grep_stream(&config, &AtomicBool::new(false), |batch| {
             batches
@@ -305,7 +305,7 @@ fn grep_byte_range_indexes_returned_crlf_text() {
         },
         ..GrepConfig::default()
     };
-    let results = Mutex::new(Vec::new());
+    let results = Mutex::new(Vec::with_capacity(1));
 
     grep_stream(&config, &AtomicBool::new(false), |batch| {
         results

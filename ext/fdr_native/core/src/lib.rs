@@ -718,6 +718,9 @@ impl<'a, T, F: Fn(Vec<T>) -> bool> EmitBatch<'a, T, F> {
     }
 
     fn push_weighted(&mut self, item: T, weight: usize) -> bool {
+        if self.items.is_empty() {
+            self.items.reserve_exact(self.limit);
+        }
         self.items.push(item);
         self.weight = self.weight.saturating_add(weight);
         (self.items.len() < self.limit && self.weight < GREP_STREAM_CHUNK_BYTES) || self.flush()
@@ -737,7 +740,6 @@ impl<'a, T, F: Fn(Vec<T>) -> bool> EmitBatch<'a, T, F> {
         let batch = std::mem::take(&mut self.items);
         self.weight = 0;
         self.limit = self.limit.saturating_mul(2).min(STREAM_CHUNK);
-        self.items.reserve(self.limit);
         if (self.emit)(batch) {
             return true;
         }
@@ -949,7 +951,8 @@ fn line_text(bytes: &[u8]) -> &[u8] {
 }
 
 struct LineEmitter<'a, 'b, F: Fn(Vec<GrepMatch>) -> bool> {
-    path: Arc<[u8]>,
+    path: &'a [u8],
+    shared_path: Option<Arc<[u8]>>,
     cancel: &'a AtomicBool,
     matcher: Option<&'a RegexMatcher>,
     byte_range: bool,
@@ -965,9 +968,10 @@ impl<F: Fn(Vec<GrepMatch>) -> bool> LineEmitter<'_, '_, F> {
         text: Arc<[u8]>,
         weight: usize,
     ) -> bool {
+        let path = Arc::clone(self.shared_path.get_or_insert_with(|| Arc::from(self.path)));
         self.batch.push_weighted(
             GrepMatch {
-                path: Arc::clone(&self.path),
+                path,
                 line_number,
                 position,
                 text,
@@ -1258,7 +1262,8 @@ fn grep_file<F: Fn(Vec<GrepMatch>) -> bool>(
         utf8: &utf8,
     };
     let mut sink = LineEmitter {
-        path: Arc::from(emitted_path(path, filters.strip_cwd_prefix).as_slice()),
+        path: emitted_path(path, filters.strip_cwd_prefix),
+        shared_path: None,
         cancel,
         matcher: config.occurrence_mode().then_some(matcher),
         byte_range: config.format == GrepFormat::ByteRange,
@@ -1457,15 +1462,15 @@ where
 }
 
 /// Raw OS bytes without consuming the path.
-fn emitted_path(path: &Path, strip_cwd_prefix: bool) -> Vec<u8> {
+fn emitted_path(path: &Path, strip_cwd_prefix: bool) -> &[u8] {
     let bytes = path.as_os_str().as_bytes();
     if strip_cwd_prefix
         && let Some(rest) = bytes.strip_prefix(b"./".as_slice())
         && !rest.starts_with(b"-")
     {
-        return rest.to_vec();
+        return rest;
     }
-    bytes.to_vec()
+    bytes
 }
 
 fn path_into_bytes(path: PathBuf, strip_cwd_prefix: bool) -> Vec<u8> {
@@ -1655,7 +1660,8 @@ mod tests {
         let drop_batch = |_: Vec<GrepMatch>| true;
         let mut batch = EmitBatch::new(&drop_batch, &stopped);
         let mut sink = LineEmitter {
-            path: Arc::from(&b"needle.txt"[..]),
+            path: b"needle.txt",
+            shared_path: None,
             cancel: &cancel,
             matcher: None,
             byte_range: false,
@@ -1668,14 +1674,26 @@ mod tests {
             .search_reader(&matcher, reader, &mut sink)
             .expect_err("cancelled reader should stop the search");
 
+        assert!(sink.shared_path.is_none());
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(error.to_string(), "search cancelled");
     }
 
     #[test]
+    fn emit_batch_allocates_only_live_batches() {
+        let stopped = AtomicBool::new(false);
+        let record = |_: Vec<u8>| true;
+        let mut batch = EmitBatch::new(&record, &stopped);
+
+        assert_eq!(batch.items.capacity(), 0);
+        assert!(batch.push(1));
+        assert_eq!(batch.items.capacity(), 0);
+    }
+
+    #[test]
     fn emit_batch_flushes_the_first_result_immediately_then_grows() {
         let stopped = AtomicBool::new(false);
-        let flushed = Mutex::new(Vec::new());
+        let flushed = Mutex::new(Vec::with_capacity(4));
         let record = |batch: Vec<u8>| {
             lock(&flushed).push(batch.len());
             true
@@ -1697,7 +1715,7 @@ mod tests {
     #[test]
     fn emit_batch_flushes_before_huge_lines_fill_a_count_sized_chunk() {
         let stopped = AtomicBool::new(false);
-        let flushed = Mutex::new(Vec::new());
+        let flushed = Mutex::new(Vec::with_capacity(2));
         let record = |batch: Vec<u8>| {
             lock(&flushed).push(batch.len());
             true
@@ -1713,7 +1731,7 @@ mod tests {
     #[test]
     fn emit_batch_flushes_a_partial_batch_a_filter_would_strand() {
         let stopped = AtomicBool::new(false);
-        let flushed = Mutex::new(Vec::new());
+        let flushed = Mutex::new(Vec::with_capacity(1));
         let record = |batch: Vec<u8>| {
             lock(&flushed).push(batch.len());
             true
